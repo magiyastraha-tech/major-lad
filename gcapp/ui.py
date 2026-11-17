@@ -697,7 +697,11 @@ class MainWindow(QMainWindow):
         if self.server.start():
             self.connect_button.setText("Закрыть кабинет")
             self.connect_button.setAccessibleName("Закрыть кабинет")
-        self._append_chat("система", "Кабинет открыт. Жду ученика.")
+            self._append_chat("система", "Кабинет открыт. Жду ученика.")
+            # Звуковой поток открываем сразу, не дожидаясь ученика: иначе
+            # метроном и MIDI-клавиатура молчат, пока никто не подключился.
+            if self._start_audio():
+                self._set_status("Кабинет открыт, звук запущен. Жду ученика.")
 
     def _start_student(self) -> None:
         name = self.cfg.get("name", "").strip()
@@ -708,6 +712,8 @@ class MainWindow(QMainWindow):
             return
         self.name_edit.setText(name)
         self.name_row.setVisible(False)
+        # Свой метроном и своя MIDI-клавиатура должны звучать и до подключения.
+        self._start_audio(local_only=True)
         if self.cfg.get("autoconnect", True):
             self._connect()
 
@@ -770,6 +776,9 @@ class MainWindow(QMainWindow):
                 self.client = None
                 self.engine.stop()
                 self.connected = False
+                # После отключения местный звук остаётся: метроном и MIDI
+                # нужны и для самостоятельной работы.
+                self._start_audio(local_only=True)
                 self._set_status("Отключено.")
             else:
                 self._connect()
@@ -792,30 +801,42 @@ class MainWindow(QMainWindow):
     def _on_peer(self, present: bool) -> None:
         self.connected = bool(present)
         if not present:
-            self.engine.stop()
             self._stop_video()
+            self.engine.student.clear()
             if self.is_teacher:
+                # Кабинет остаётся открытым: местный звук, метроном и MIDI
+                # продолжают работать, пока ждём следующего ученика.
                 self._set_status("Ученик отключился. Кабинет свободен.")
+            else:
+                self.engine.stop()
+                self._start_audio(local_only=True)
             return
         if self.is_teacher:
             self._set_status("Ученик подключился.")
             self._append_chat("система", "Ученик подключился.")
-            self._start_audio()
+            if self.engine.running:
+                self._start_video()
+            else:
+                self._start_audio()
 
-    def _start_audio(self) -> None:
+    def _start_audio(self, local_only: bool = False) -> bool:
+        """Открывает звуковой поток.
+
+        local_only — только свои наушники, без отправки собеседнику: так
+        метроном и MIDI-клавиатура работают до подключения и без сети.
+        """
         cfg_audio = self.cfg["audio"]
-        devices = {}
-        if self.is_teacher:
-            devices = {
-                "in1": cfg_audio.get("device1", ""),
-                "in2": cfg_audio.get("device2", ""),
-                "usb": cfg_audio.get("usb", ""),
-            }
+        devices = {
+            "in1": cfg_audio.get("device1", ""),
+            "in2": cfg_audio.get("device2", ""),
+            "usb": cfg_audio.get("usb", ""),
+        }
         is_server = self.is_teacher
         server_addr = None
-        if not is_server:
-            server_addr = (self.cfg.get("server_ip", "").strip(),
-                           audio.UDP_PORT)
+        if not is_server and not local_only:
+            host = self.cfg.get("server_ip", "").strip()
+            if host:
+                server_addr = (host, audio.UDP_PORT)
         ok, message = self.engine.start(
             is_server=is_server,
             server_addr=server_addr,
@@ -828,9 +849,13 @@ class MainWindow(QMainWindow):
         if ok:
             self._apply_volumes()
             self._apply_metronome()
-            self._start_video()
+            if self.connected:
+                self._start_video()
+        return ok
 
     def _start_video(self) -> None:
+        if self.video_sender is not None:
+            return
         if not self.cfg["video"].get("enabled"):
             return
         self.video_label.setVisible(bool(self.cfg["video"].get("show_remote", True)))
@@ -1014,25 +1039,32 @@ class MainWindow(QMainWindow):
     # -- настройки ----------------------------------------------------------
 
     def open_settings(self) -> None:
+        audio_before = dict(self.cfg["audio"])
         dialog = SettingsDialog(self.cfg, self)
-        if dialog.exec() == QDialog.Accepted:
-            self._apply_volumes()
-            # MIDI применяется сразу: клавиатура начинает играть без
-            # перезапуска кабинета. Аудиоустройства по-прежнему требуют
-            # переподключения — их поток открывается только при старте.
-            if self.engine.running:
-                self.engine.set_midi(bool(self.cfg["audio"].get("midi_enabled")),
-                                     self.cfg["audio"].get("midi_port", ""))
-            appeared = self._refresh_volume_visibility()
-            message = "Настройки сохранены."
-            if appeared:
-                names = ", ".join(self.slider_titles[key] for key in appeared)
-                message += f" На главном экране появился регулятор: {names}."
-            if not self.is_teacher and self.cfg.get("name"):
-                self.name_edit.setText(self.cfg["name"])
-            if self.connected:
-                message += " Перезапустите соединение, чтобы применить аудиоустройства."
-            self._set_status(message)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._apply_volumes()
+        # Смена аудиоустройств применяется сразу: поток переоткрывается сам.
+        device_keys = ("device1", "device2", "usb", "output")
+        devices_changed = any(audio_before.get(key) != self.cfg["audio"].get(key)
+                              for key in device_keys)
+        if self.engine.running and devices_changed:
+            self._start_audio(local_only=not self.connected)
+        elif self.engine.running:
+            # MIDI применяется отдельно: клавиатура начинает играть без
+            # перезапуска кабинета.
+            self.engine.set_midi(bool(self.cfg["audio"].get("midi_enabled")),
+                                 self.cfg["audio"].get("midi_port", ""))
+        appeared = self._refresh_volume_visibility()
+        message = "Настройки сохранены."
+        if devices_changed and self.engine.running:
+            message += " Звук перезапущен с новыми устройствами."
+        if appeared:
+            names = ", ".join(self.slider_titles[key] for key in appeared)
+            message += f" На главном экране появился регулятор: {names}."
+        if not self.is_teacher and self.cfg.get("name"):
+            self.name_edit.setText(self.cfg["name"])
+        self._set_status(message)
 
     def closeEvent(self, event) -> None:
         config.save(self.cfg)

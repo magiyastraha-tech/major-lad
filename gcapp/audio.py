@@ -109,16 +109,32 @@ class Source:
         self.stream = None
 
     def open(self) -> None:
-        self.stream = sd.InputStream(
-            device=self.device_index,
-            channels=1,
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCK,
-            dtype="float32",
-            latency="low",
-            callback=self._callback,
-        )
-        self.stream.start()
+        # Не всякое устройство отдаёт один канал: моно-микрофоны и стерео-
+        # интерфейсы ведут себя по-разному. Пробуем моно, потом стерео.
+        last_error: Exception | None = None
+        for channels in (1, 2):
+            stream = None
+            try:
+                stream = sd.InputStream(
+                    device=self.device_index,
+                    channels=channels,
+                    samplerate=SAMPLE_RATE,
+                    blocksize=BLOCK,
+                    dtype="float32",
+                    latency="low",
+                    callback=self._callback,
+                )
+                stream.start()
+                self.stream = stream
+                return
+            except Exception as exc:
+                last_error = exc
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+        raise last_error if last_error is not None else RuntimeError("вход не открыт")
 
     def _callback(self, indata, frames, time_info, status) -> None:
         self.ring.write(indata[:, 0].copy())
@@ -190,6 +206,7 @@ class AudioEngine:
         self.midi: MidiInput | None = None
         self.metronome = Metronome(SAMPLE_RATE)
         self._out = None
+        self._out_channels = 1
         self._sock: socket.socket | None = None
         self._peer = None
         self._server_addr = None
@@ -235,20 +252,35 @@ class AudioEngine:
                     out_index = default
             except Exception:
                 out_index = None
-        try:
-            self._out = sd.OutputStream(
-                device=out_index,
-                channels=1,
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCK,
-                dtype="float32",
-                latency="low",
-                callback=self._out_callback,
-            )
-            self._out.start()
-        except Exception as exc:
+        # Звуковая карта может не принимать моно: тогда открываем стерео
+        # и дублируем сигнал в оба канала.
+        out_error: Exception | None = None
+        for channels in (1, 2):
+            stream = None
+            try:
+                stream = sd.OutputStream(
+                    device=out_index,
+                    channels=channels,
+                    samplerate=SAMPLE_RATE,
+                    blocksize=BLOCK,
+                    dtype="float32",
+                    latency="low",
+                    callback=self._out_callback,
+                )
+                stream.start()
+                self._out = stream
+                self._out_channels = channels
+                break
+            except Exception as exc:
+                out_error = exc
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+        if self._out is None:
             self.stop()
-            return False, f"Не удалось открыть аудиовыход: {exc}"
+            return False, f"Не удалось открыть аудиовыход: {out_error}"
 
         for key, name in (devices or {}).items():
             if not name:
@@ -362,7 +394,8 @@ class AudioEngine:
             local += synth_out * midi_level
         local += clicks
         np.clip(local, -1.0, 1.0, out=local)
-        outdata[:, 0] = local
+        # Моно и стерео: в стерео потоке сигнал идёт в оба канала.
+        outdata[:] = local[:, None]
 
         # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
         mix = clicks.copy()
