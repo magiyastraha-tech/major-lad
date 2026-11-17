@@ -40,10 +40,16 @@ class Synth:
 
     def __init__(self, sample_rate: int):
         self.sample_rate = sample_rate
+        # Фиксированная громкость: сила нажатия не учитывается, каждая нота
+        # звучит одинаково громко. Нужно, когда важна ровность партии, а не
+        # динамика, и когда клавиатура передаёт velocity неровно.
+        self.fixed_velocity = False
         self._lock = threading.Lock()
         self._voices: dict[int, dict] = {}
 
     def note_on(self, note: int, velocity: int = 100) -> None:
+        if self.fixed_velocity:
+            velocity = 127
         freq = 440.0 * (2.0 ** ((note - 69) / 12.0))
         with self._lock:
             if len(self._voices) >= MAX_VOICES:

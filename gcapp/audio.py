@@ -30,6 +30,13 @@ from .midi_synth import MidiInput, Synth
 
 SAMPLE_RATE = 48000
 BLOCK = 480          # 10 мс
+
+# Сколько звука держим в буфере. Это и есть задержка сверх драйвера:
+# 2 блока — 20 мс запаса на сеть, больше не нужно, на локальной сети хватает
+# и этого. Для входов чуть больше: микрофон и наушники могут тактироваться
+# от разных часов и медленно разъезжаться.
+STUDENT_KEEP = BLOCK * 2
+INPUT_KEEP = BLOCK * 3
 UDP_PORT = 45801
 MAGIC_AUDIO = b"GCA1"
 MAGIC_HELLO = b"GCH1"
@@ -90,6 +97,21 @@ class Ring:
                 self._read = end % self._size
                 self._count -= k
         return out
+
+    def trim(self, keep: int) -> None:
+        """Оставляет в буфере не больше keep отсчётов, старое выбрасывает.
+
+        Буфер сглаживает неровности сети и разницу часов двух устройств, но
+        если он копит больше нужного, задержка растёт и сама уже не падает:
+        читаем мы ровно столько же, сколько приходит. Поэтому перед чтением
+        лишнее выкидываем — лучше одномоментный щелчок раз в минуту, чем
+        секунда задержки, которая только увеличивается.
+        """
+        with self._lock:
+            excess = self._count - keep
+            if excess > 0:
+                self._read = (self._read + excess) % self._size
+                self._count = keep
 
     def clear(self) -> None:
         with self._lock:
@@ -270,7 +292,8 @@ class AudioEngine:
 
     def start(self, is_server: bool, server_addr=None, devices=None,
               output: str = "", midi_enabled: bool = False,
-              midi_port: str = "") -> tuple[bool, str]:
+              midi_port: str = "", midi_fixed_velocity: bool = False
+              ) -> tuple[bool, str]:
         self.stop()
         if sd is None:
             return False, "Не установлен модуль sounddevice — звук недоступен."
@@ -360,13 +383,14 @@ class AudioEngine:
                 self.log(f"Не удалось открыть вход «{name}»: {exc}")
 
         if midi_enabled:
-            self.set_midi(True, midi_port)
+            self.set_midi(True, midi_port, midi_fixed_velocity)
 
         if latency is not None:
             return True, f"Звук запущен. Задержка вывода {latency * 1000:.0f} мс."
         return True, "Звук запущен."
 
-    def set_midi(self, enabled: bool, port: str = "") -> None:
+    def set_midi(self, enabled: bool, port: str = "",
+                 fixed_velocity: bool = False) -> None:
         """Включает или выключает MIDI-вход на работающем движке.
 
         Нужно, чтобы клавиатура начинала играть сразу после сохранения
@@ -380,6 +404,7 @@ class AudioEngine:
             return
         if self.synth is None:
             self.synth = Synth(SAMPLE_RATE)
+        self.synth.fixed_velocity = bool(fixed_velocity)
         midi = MidiInput(self.synth, self.log)
         if not midi.open(port):
             self.log("MIDI-устройство не открыто.")
@@ -454,6 +479,7 @@ class AudioEngine:
         # В наушники: собеседник, своя MIDI-клавиатура и свой метроном.
         # Источники со входов сюда не идут — иначе микрофон поймает колонки
         # и получится эхо.
+        self.student.trim(STUDENT_KEEP)
         local = self.student.read(frames) * self.volumes["student"]
         if synth_out is not None:
             local += synth_out * midi_level
@@ -465,6 +491,7 @@ class AudioEngine:
         # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
         mix = clicks.copy()
         for source in self.sources.values():
+            source.ring.trim(INPUT_KEEP)
             block = source.ring.read(frames)
             if source.volume > 0:
                 mix += block * source.volume

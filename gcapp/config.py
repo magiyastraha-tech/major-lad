@@ -24,6 +24,7 @@ DEFAULTS = {
         "output": "",
         "midi_enabled": False,
         "midi_port": "",
+        "midi_fixed_velocity": False,
         "volumes": {
             "student": 80,
             "in1": 100,

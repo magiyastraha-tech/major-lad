@@ -256,6 +256,16 @@ class SettingsDialog(QDialog):
         index = self.midi_combo.findData(self.cfg["audio"].get("midi_port", ""))
         self.midi_combo.setCurrentIndex(index if index >= 0 else 0)
         midi_form.addRow(label_for("Порт", self.midi_combo), self.midi_combo)
+
+        self.midi_fixed_box = QCheckBox("Всегда полная громкость нот")
+        self.midi_fixed_box.setChecked(
+            bool(self.cfg["audio"].get("midi_fixed_velocity", False)))
+        self.midi_fixed_box.setAccessibleName("Всегда полная громкость нот")
+        self.midi_fixed_box.setAccessibleDescription(
+            "Если включено, сила нажатия клавиши не учитывается: каждая нота "
+            "звучит одинаково громко, на полной velocity."
+        )
+        midi_form.addRow(self.midi_fixed_box)
         tabs.addTab(midi_page, "MIDI-устройства")
 
         self.usb_combo = self._device_combo(
@@ -449,6 +459,7 @@ class SettingsDialog(QDialog):
         cfg["audio"]["output"] = self.out_combo.currentData() or ""
         cfg["audio"]["midi_enabled"] = self.midi_box.isChecked()
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
+        cfg["audio"]["midi_fixed_velocity"] = self.midi_fixed_box.isChecked()
 
         cfg["video"]["enabled"] = self.video_box.isChecked()
         cfg["video"]["camera"] = int(self.cam_spin.value())
@@ -844,6 +855,8 @@ class MainWindow(QMainWindow):
             output=cfg_audio.get("output", ""),
             midi_enabled=bool(cfg_audio.get("midi_enabled", False)),
             midi_port=cfg_audio.get("midi_port", ""),
+            midi_fixed_velocity=bool(
+                cfg_audio.get("midi_fixed_velocity", False)),
         )
         self._set_status(message)
         if ok:
@@ -1053,8 +1066,10 @@ class MainWindow(QMainWindow):
         elif self.engine.running:
             # MIDI применяется отдельно: клавиатура начинает играть без
             # перезапуска кабинета.
-            self.engine.set_midi(bool(self.cfg["audio"].get("midi_enabled")),
-                                 self.cfg["audio"].get("midi_port", ""))
+            self.engine.set_midi(
+                bool(self.cfg["audio"].get("midi_enabled")),
+                self.cfg["audio"].get("midi_port", ""),
+                bool(self.cfg["audio"].get("midi_fixed_velocity", False)))
         appeared = self._refresh_volume_visibility()
         message = "Настройки сохранены."
         if devices_changed and self.engine.running:

@@ -324,6 +324,10 @@ class Client:
             return False
 
         self._sock = sock
+        # Тайм-аут шесть секунд нужен только на подключение и обмен
+        # приветствием. Дальше канал живёт в обычном блокирующем режиме:
+        # с оставшимся тайм-аутом чтение обрывалось через шесть секунд тишины
+        # в чате, хотя соединение было целым — ученика выкидывало из кабинета.
         try:
             send_json(sock, {"type": "hello", "name": self.name}, self._send_lock)
             answer = recv_json(sock)
@@ -331,6 +335,8 @@ class Client:
             self.on_status(f"Сервер не ответил: {exc}")
             self.disconnect()
             return False
+        self._keepalive(sock)
+        sock.settimeout(None)
 
         if answer.get("type") == "busy":
             self.on_busy()
@@ -341,6 +347,34 @@ class Client:
             self.on_ready(str(answer.get("teacher") or "Преподаватель"))
             threading.Thread(target=self._read_loop, daemon=True).start()
         return True
+
+    @staticmethod
+    def _keepalive(sock: socket.socket) -> None:
+        """Держим соединение живым и быстро узнаём, если оно умерло.
+
+        Без этого замолчавший собеседник висит часами: TCP не замечает,
+        что на другом конце никого нет.
+        """
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            return
+        # У Windows свои имена и своя форма вызова, у остальных — опции TCP.
+        if os.name == "nt" and hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            try:
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
+                return
+            except OSError:
+                pass
+        for option, value in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5),
+                              ("TCP_KEEPCNT", 3)):
+            name = getattr(socket, option, None)
+            if name is None:
+                continue
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, name, value)
+            except OSError:
+                pass
 
     def _wait_ready(self) -> None:
         sock = self._sock
