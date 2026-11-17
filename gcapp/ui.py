@@ -31,7 +31,19 @@ VOLUME_KEYS = [
     ("in2", "Аудиоустройство 2", "Громкость второго аудиовхода."),
     ("usb", "USB-устройство", "Громкость звука с USB-устройства, например с камеры."),
     ("midi", "MIDI-устройство", "Громкость MIDI-клавиатуры."),
+    ("metronome", "Громкость метронома",
+     "Громкость щелчков метронома. Появляется, когда метроном включён."),
 ]
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    """Русское согласование: 1 удар, 2 удара, 5 ударов."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
 
 
 def announce(widget: QWidget, text: str) -> None:
@@ -488,6 +500,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._wire_signals()
         self._apply_volumes()
+        self._apply_metronome()
 
         shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
         shortcut.activated.connect(self.open_settings)
@@ -563,6 +576,40 @@ class MainWindow(QMainWindow):
         self._refresh_volume_visibility()
         layout.addWidget(vol_group)
 
+        # Метроном
+        metro_group = QGroupBox("Метроном")
+        metro_group.setAccessibleName("Метроном")
+        metro_layout = QVBoxLayout(metro_group)
+
+        self.metro_button = QPushButton()
+        self.metro_button.setCheckable(True)
+        metro_layout.addWidget(self.metro_button)
+
+        self.metro_row = QWidget()
+        metro_row = QHBoxLayout(self.metro_row)
+        metro_row.setContentsMargins(0, 0, 0, 0)
+        self.bpm_spin = QSpinBox()
+        self.bpm_spin.setRange(30, 300)
+        self.bpm_spin.setAccessibleName("Темп, ударов в минуту")
+        self.bpm_spin.setAccessibleDescription(
+            "Темп метронома. Стрелки вверх и вниз меняют на один удар, "
+            "Page Up и Page Down — на десять. Можно набрать число с клавиатуры."
+        )
+        self.beats_spin = QSpinBox()
+        self.beats_spin.setRange(1, 12)
+        self.beats_spin.setAccessibleName("Ритм, долей в такте")
+        self.beats_spin.setAccessibleDescription(
+            "Сколько долей в такте, например 4. Первая доля звучит выше и громче."
+        )
+        metro_row.addWidget(label_for("Темп, ударов в минуту", self.bpm_spin))
+        metro_row.addWidget(self.bpm_spin)
+        metro_row.addSpacing(16)
+        metro_row.addWidget(label_for("Ритм, долей в такте", self.beats_spin))
+        metro_row.addWidget(self.beats_spin)
+        metro_row.addStretch(1)
+        metro_layout.addWidget(self.metro_row)
+        layout.addWidget(metro_group)
+
         # Имя и подключение (для ученика)
         self.name_row = QWidget()
         name_layout = QHBoxLayout(self.name_row)
@@ -622,6 +669,9 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(self.open_settings)
         self.join_button.clicked.connect(self._join)
         self.connect_button.clicked.connect(self._on_connect_button)
+        self.metro_button.toggled.connect(self._on_metronome_toggle)
+        self.bpm_spin.valueChanged.connect(self._on_metronome_value)
+        self.beats_spin.valueChanged.connect(self._on_metronome_value)
 
     def _wire_signals(self) -> None:
         self.sig_status.connect(self._set_status)
@@ -771,12 +821,13 @@ class MainWindow(QMainWindow):
             server_addr=server_addr,
             devices=devices,
             output=cfg_audio.get("output", ""),
-            midi_enabled=bool(cfg_audio.get("midi_enabled", False)) if self.is_teacher else False,
+            midi_enabled=bool(cfg_audio.get("midi_enabled", False)),
             midi_port=cfg_audio.get("midi_port", ""),
         )
         self._set_status(message)
         if ok:
             self._apply_volumes()
+            self._apply_metronome()
             self._start_video()
 
     def _start_video(self) -> None:
@@ -813,6 +864,75 @@ class MainWindow(QMainWindow):
         for key, slider in self.sliders.items():
             self.engine.set_volume(key, slider.value())
 
+    # -- метроном -----------------------------------------------------------
+
+    def _update_metro_button(self) -> None:
+        """Подпись кнопки, доступное имя и видимость полей темпа и ритма."""
+        enabled = self.metro_button.isChecked()
+        bpm = self.bpm_spin.value()
+        beats = self.beats_spin.value()
+        if enabled:
+            self.metro_button.setText("Выключить метроном")
+            self.metro_button.setAccessibleDescription(
+                f"Метроном включён: {bpm} {_plural(bpm, 'удар', 'удара', 'ударов')} "
+                f"в минуту, {beats} {_plural(beats, 'доля', 'доли', 'долей')} в такте. "
+                "Нажмите, чтобы выключить."
+            )
+        else:
+            self.metro_button.setText("Включить метроном")
+            self.metro_button.setAccessibleDescription(
+                "Нажмите, чтобы включить метроном. Появятся поля темпа и ритма "
+                "и регулятор громкости метронома."
+            )
+        self.metro_button.setAccessibleName(self.metro_button.text())
+        self.metro_row.setVisible(enabled)
+
+    def _apply_metronome(self) -> None:
+        """Приводит кнопку и поля к сохранённым настройкам."""
+        cfg_metro = self.cfg.get("metronome") or {}
+        enabled = bool(cfg_metro.get("enabled"))
+        bpm = int(cfg_metro.get("bpm", 90) or 90)
+        beats = int(cfg_metro.get("beats", 4) or 4)
+        for spin, value in ((self.bpm_spin, bpm), (self.beats_spin, beats)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+        self.metro_button.blockSignals(True)
+        self.metro_button.setChecked(enabled)
+        self.metro_button.blockSignals(False)
+        self._update_metro_button()
+        self.engine.set_metronome(enabled, bpm, beats)
+        self._refresh_volume_visibility()
+
+    def _on_metronome_toggle(self, checked: bool) -> None:
+        cfg_metro = self.cfg.setdefault("metronome", {})
+        cfg_metro["enabled"] = bool(checked)
+        self._update_metro_button()
+        self.engine.set_metronome(checked, self.bpm_spin.value(),
+                                  self.beats_spin.value())
+        config.save(self.cfg)
+        appeared = self._refresh_volume_visibility()
+        if checked:
+            bpm = self.bpm_spin.value()
+            beats = self.beats_spin.value()
+            text = (f"Метроном включён: {bpm} "
+                    f"{_plural(bpm, 'удар', 'удара', 'ударов')} в минуту, "
+                    f"{beats} {_plural(beats, 'доля', 'доли', 'долей')} в такте.")
+        else:
+            text = "Метроном выключен."
+        if "metronome" in appeared:
+            text += " Регулятор громкости метронома появился на главном экране."
+        self._set_status(text)
+
+    def _on_metronome_value(self) -> None:
+        cfg_metro = self.cfg.setdefault("metronome", {})
+        cfg_metro["bpm"] = self.bpm_spin.value()
+        cfg_metro["beats"] = self.beats_spin.value()
+        self._update_metro_button()
+        self.engine.set_metronome(self.metro_button.isChecked(),
+                                  self.bpm_spin.value(), self.beats_spin.value())
+        self._save_timer.start()
+
     def _refresh_volume_visibility(self) -> list[str]:
         """Оставляет на экране только регуляторы выбранных устройств.
 
@@ -827,6 +947,7 @@ class MainWindow(QMainWindow):
             "in2": bool(str(audio_cfg.get("device2") or "").strip()),
             "usb": bool(str(audio_cfg.get("usb") or "").strip()),
             "midi": bool(audio_cfg.get("midi_enabled")),
+            "metronome": bool(self.cfg.get("metronome", {}).get("enabled")),
         }
         appeared: list[str] = []
         for key, row in self.slider_rows.items():
@@ -896,6 +1017,12 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self.cfg, self)
         if dialog.exec() == QDialog.Accepted:
             self._apply_volumes()
+            # MIDI применяется сразу: клавиатура начинает играть без
+            # перезапуска кабинета. Аудиоустройства по-прежнему требуют
+            # переподключения — их поток открывается только при старте.
+            if self.engine.running:
+                self.engine.set_midi(bool(self.cfg["audio"].get("midi_enabled")),
+                                     self.cfg["audio"].get("midi_port", ""))
             appeared = self._refresh_volume_visibility()
             message = "Настройки сохранены."
             if appeared:

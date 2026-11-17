@@ -30,7 +30,13 @@ DEFAULTS = {
             "in2": 100,
             "usb": 100,
             "midi": 80,
+            "metronome": 60,
         },
+    },
+    "metronome": {
+        "enabled": False,
+        "bpm": 90,
+        "beats": 4,
     },
     "video": {
         "enabled": False,

@@ -25,6 +25,7 @@ try:
 except Exception:  # pragma: no cover - без PortAudio модуль всё равно импортируется
     sd = None
 
+from .metronome import Metronome
 from .midi_synth import MidiInput, Synth
 
 SAMPLE_RATE = 48000
@@ -184,9 +185,10 @@ class AudioEngine:
         self.student = Ring(SAMPLE_RATE)
         self.sources: dict[str, Source] = {}
         self.volumes = {"student": 0.8, "in1": 1.0, "in2": 1.0,
-                        "usb": 1.0, "midi": 0.8}
+                        "usb": 1.0, "midi": 0.8, "metronome": 0.6}
         self.synth: Synth | None = None
         self.midi: MidiInput | None = None
+        self.metronome = Metronome(SAMPLE_RATE)
         self._out = None
         self._sock: socket.socket | None = None
         self._peer = None
@@ -263,13 +265,37 @@ class AudioEngine:
                 self.log(f"Не удалось открыть вход «{name}»: {exc}")
 
         if midi_enabled:
-            self.synth = Synth(SAMPLE_RATE)
-            self.midi = MidiInput(self.synth, self.log)
-            if not self.midi.open(midi_port):
-                self.log("MIDI-устройство не открыто.")
-                self.midi = None
+            self.set_midi(True, midi_port)
 
         return True, "Звук запущен."
+
+    def set_midi(self, enabled: bool, port: str = "") -> None:
+        """Включает или выключает MIDI-вход на работающем движке.
+
+        Нужно, чтобы клавиатура начинала играть сразу после сохранения
+        настроек, без закрытия кабинета.
+        """
+        if self.midi is not None:
+            self.midi.close()
+            self.midi = None
+        if not enabled:
+            self.synth = None
+            return
+        if self.synth is None:
+            self.synth = Synth(SAMPLE_RATE)
+        midi = MidiInput(self.synth, self.log)
+        if not midi.open(port):
+            self.log("MIDI-устройство не открыто.")
+            return
+        self.midi = midi
+
+    def set_metronome(self, enabled: bool, bpm: int = 90, beats: int = 4) -> None:
+        self.metronome.configure(enabled, bpm, beats)
+
+    @property
+    def running(self) -> bool:
+        """Открыт ли звуковой поток прямо сейчас."""
+        return self._running
 
     # -- остановка ----------------------------------------------------------
 
@@ -315,17 +341,37 @@ class AudioEngine:
     # -- микшер -------------------------------------------------------------
 
     def _out_callback(self, outdata, frames, time_info, status) -> None:
-        student = self.student.read(frames) * self.volumes["student"]
-        np.clip(student, -1.0, 1.0, out=student)
-        outdata[:, 0] = student
+        # Синтезатор рендерится ровно один раз: у него внутри фаза и огибающие,
+        # второй вызов съел бы часть звука.
+        synth = self.synth
+        synth_out = None
+        if synth is not None:
+            try:
+                synth_out = synth.render(frames)
+            except Exception:
+                synth_out = None
+        midi_level = self.volumes.get("midi", 0.8)
+        metro_level = self.volumes.get("metronome", 0.6)
+        clicks = self.metronome.render(frames) * metro_level
 
-        mix = np.zeros(frames, dtype=np.float32)
+        # В наушники: собеседник, своя MIDI-клавиатура и свой метроном.
+        # Источники со входов сюда не идут — иначе микрофон поймает колонки
+        # и получится эхо.
+        local = self.student.read(frames) * self.volumes["student"]
+        if synth_out is not None:
+            local += synth_out * midi_level
+        local += clicks
+        np.clip(local, -1.0, 1.0, out=local)
+        outdata[:, 0] = local
+
+        # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
+        mix = clicks.copy()
         for source in self.sources.values():
             block = source.ring.read(frames)
             if source.volume > 0:
                 mix += block * source.volume
-        if self.synth is not None:
-            mix += self.synth.render(frames) * self.volumes["midi"]
+        if synth_out is not None:
+            mix += synth_out * midi_level
 
         pcm = (np.clip(mix, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
         try:
