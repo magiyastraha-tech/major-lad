@@ -25,6 +25,7 @@ try:
 except Exception:  # pragma: no cover - без PortAudio модуль всё равно импортируется
     sd = None
 
+from .media import Player
 from .metronome import Metronome
 from .midi_synth import MidiInput, Synth
 
@@ -283,10 +284,13 @@ class AudioEngine:
         self.student = Ring(SAMPLE_RATE)
         self.sources: dict[str, Source] = {}
         self.volumes = {"student": 0.8, "in1": 1.0, "in2": 1.0,
-                        "usb": 1.0, "midi": 0.8, "metronome": 0.6}
+                        "usb": 1.0, "midi": 0.8, "metronome": 0.6,
+                        "player": 0.8}
         self.synth: Synth | None = None
         self.midi: MidiInput | None = None
         self.metronome = Metronome(SAMPLE_RATE)
+        # Трек живёт вне аудиопотока: кнопки двигают позицию, callback читает.
+        self.player = Player(SAMPLE_RATE)
         self._out = None
         self._out_channels = 1
         self._sock: socket.socket | None = None
@@ -485,6 +489,16 @@ class AudioEngine:
         metro_level = self.volumes.get("metronome", 0.6)
         clicks = self.metronome.render(frames) * metro_level
 
+        # Трек рендерится ровно один раз (внутри позиция) и идёт в обе
+        # стороны: в наушники и в поток собеседнику. Поэтому у ученика нет
+        # своего плеера, который надо синхронизировать — он слышит трек в
+        # общем потоке с той же задержкой, что и голос.
+        track_level = self.volumes.get("player", 0.8)
+        track = self.player.render(frames)
+        track_block = None
+        if track is not None and track_level > 0:
+            track_block = track * track_level
+
         # В наушники: собеседник, своя MIDI-клавиатура и свой метроном.
         # Источники со входов сюда не идут — иначе микрофон поймает колонки
         # и получится эхо.
@@ -493,6 +507,8 @@ class AudioEngine:
         if synth_out is not None:
             local += synth_out * midi_level
         local += clicks
+        if track_block is not None:
+            local[:track_block.size] += track_block
         np.clip(local, -1.0, 1.0, out=local)
         # Моно и стерео: в стерео потоке сигнал идёт в оба канала.
         outdata[:] = local[:, None]
@@ -506,6 +522,8 @@ class AudioEngine:
                 mix += block * source.volume
         if synth_out is not None:
             mix += synth_out * midi_level
+        if track_block is not None:
+            mix[:track_block.size] += track_block
 
         pcm = (np.clip(mix, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
         try:

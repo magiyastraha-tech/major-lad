@@ -28,14 +28,14 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --windowed
           --name MajorLad-Teacher --collect-all sounddevice
-          --collect-all rtmidi --collect-all cv2 --exclude-module tkinter
+          --collect-all rtmidi --collect-all cv2 --collect-all soundfile --exclude-module tkinter
           main_teacher.py
 
       - name: Build student exe
         run: >
           python -m PyInstaller --noconfirm --onefile --windowed
           --name MajorLad-Student --collect-all sounddevice
-          --collect-all rtmidi --collect-all cv2 --exclude-module tkinter
+          --collect-all rtmidi --collect-all cv2 --collect-all soundfile --exclude-module tkinter
           main_student.py
 
       - name: Upload exe

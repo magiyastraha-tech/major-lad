@@ -55,7 +55,7 @@ if errorlevel 1 (
 echo Шаг 2 из 3: сборка преподавателя.
 echo. >> "%LOG%"
 echo --- PyInstaller: преподаватель --- >> "%LOG%"
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name MajorLad-Teacher --collect-all sounddevice --collect-all rtmidi --collect-all cv2 --exclude-module tkinter main_teacher.py >> "%LOG%" 2>&1
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name MajorLad-Teacher --collect-all sounddevice --collect-all rtmidi --collect-all cv2 --collect-all soundfile --exclude-module tkinter main_teacher.py >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.
@@ -67,7 +67,7 @@ if not "%RC%"=="0" (
 
 echo Шаг 3 из 3: сборка ученика.
 echo --- PyInstaller: ученик --- >> "%LOG%"
-%PY% -m PyInstaller --noconfirm --onefile --windowed --name MajorLad-Student --collect-all sounddevice --collect-all rtmidi --collect-all cv2 --exclude-module tkinter main_student.py >> "%LOG%" 2>&1
+%PY% -m PyInstaller --noconfirm --onefile --windowed --name MajorLad-Student --collect-all sounddevice --collect-all rtmidi --collect-all cv2 --collect-all soundfile --exclude-module tkinter main_student.py >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.

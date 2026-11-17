@@ -4,3 +4,5 @@ sounddevice>=0.4.6
 python-rtmidi>=1.5
 opencv-python-headless>=4.8
 pyinstaller>=6.3
+soundfile>=0.12.1
+soxr>=0.4

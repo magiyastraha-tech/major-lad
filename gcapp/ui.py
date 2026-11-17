@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, audio, config, updater
+from . import __version__, audio, config, media, updater
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
@@ -33,6 +33,8 @@ VOLUME_KEYS = [
     ("midi", "MIDI-устройство", "Громкость MIDI-клавиатуры."),
     ("metronome", "Громкость метронома",
      "Громкость щелчков метронома. Появляется, когда метроном включён."),
+    ("player", "Громкость трека",
+     "Громкость музыки из плеера. Появляется, когда в папке Media есть треки."),
 ]
 
 
@@ -44,6 +46,12 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
     if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
         return few
     return many
+
+
+def _clock(seconds: float) -> str:
+    """Время трека словами для диктора: 1:05, 12:30."""
+    total = max(0, int(seconds))
+    return f"{total // 60}:{total % 60:02d}"
 
 
 def announce(widget: QWidget, text: str) -> None:
@@ -182,6 +190,20 @@ class SettingsDialog(QDialog):
         self.autoconnect_box.setChecked(bool(self.cfg.get("autoconnect", True)))
         self.autoconnect_box.setAccessibleName("Автоматическое подключение при запуске")
         form.addRow(self.autoconnect_box)
+
+        self.skip_combo = QComboBox()
+        self.skip_combo.setAccessibleName("Шаг перемотки плеера")
+        self.skip_combo.setAccessibleDescription(
+            "На сколько секунд перематывают кнопки Назад и Вперёд в плеере. "
+            "Стрелки переключают значение."
+        )
+        for seconds in (5, 10, 20):
+            self.skip_combo.addItem(f"{seconds} секунд", seconds)
+        saved_skip = int((self.cfg.get("player") or {}).get("skip", 5) or 5)
+        skip_index = self.skip_combo.findData(saved_skip)
+        self.skip_combo.setCurrentIndex(skip_index if skip_index >= 0 else 0)
+        form.addRow(label_for("Шаг перемотки плеера", self.skip_combo),
+                    self.skip_combo)
 
         version_row = QHBoxLayout()
         self.version_label = QLabel(f"Версия {__version__}")
@@ -452,6 +474,8 @@ class SettingsDialog(QDialog):
         cfg["server_ip"] = self.ip_edit.text().strip()
         cfg["server_port"] = int(self.port_spin.value())
         cfg["autoconnect"] = self.autoconnect_box.isChecked()
+        player_cfg = cfg.setdefault("player", {})
+        player_cfg["skip"] = int(self.skip_combo.currentData() or 5)
 
         cfg["audio"]["device1"] = self.dev1_combo.currentData() or ""
         cfg["audio"]["device2"] = self.dev2_combo.currentData() or ""
@@ -488,6 +512,8 @@ class MainWindow(QMainWindow):
     sig_video = Signal(object)
     sig_join_request = Signal(object)
     sig_ended = Signal(str)
+    sig_track_ready = Signal(str, object)
+    sig_track_error = Signal(str)
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -503,6 +529,11 @@ class MainWindow(QMainWindow):
         self._join_dialog_open = False
         self.video_sender: VideoSender | None = None
         self.connected = False
+        # Плеер: есть ли треки в Media и не идёт ли сейчас загрузка файла.
+        self._tracks_available = False
+        self._loading_track = False
+        # Подписи кнопок плеера переставляются только при смене состояния.
+        self._player_button_state: tuple[bool, int] = (False, 0)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
@@ -516,6 +547,14 @@ class MainWindow(QMainWindow):
         self._wire_signals()
         self._apply_volumes()
         self._apply_metronome()
+        self._refresh_tracks()
+
+        # Позиция трека и «трек закончился» читаются опросом: сам плеер
+        # живёт в аудиопотоке и в интерфейс не стучится.
+        self._player_timer = QTimer(self)
+        self._player_timer.setInterval(400)
+        self._player_timer.timeout.connect(self._tick_player)
+        self._player_timer.start()
 
         shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
         shortcut.activated.connect(self.open_settings)
@@ -625,6 +664,60 @@ class MainWindow(QMainWindow):
         metro_layout.addWidget(self.metro_row)
         layout.addWidget(metro_group)
 
+        # Плеер
+        player_group = QGroupBox("Плеер")
+        player_group.setAccessibleName("Плеер")
+        player_layout = QVBoxLayout(player_group)
+
+        track_row = QHBoxLayout()
+        self.track_combo = QComboBox()
+        self.track_combo.setAccessibleName("Трек")
+        self.track_combo.setAccessibleDescription(
+            "Список треков из папки Media рядом с программой. "
+            "Стрелки вверх и вниз перебирают список."
+        )
+        track_row.addWidget(label_for("Трек", self.track_combo))
+        track_row.addWidget(self.track_combo, 1)
+        self.add_track_button = QPushButton("Добавить трек")
+        self.add_track_button.setAccessibleName("Добавить трек")
+        self.add_track_button.setAccessibleDescription(
+            "Копирует выбранный mp3 или wav в папку Media рядом с программой. "
+            "Все треки из неё видны в списке."
+        )
+        track_row.addWidget(self.add_track_button)
+        player_layout.addLayout(track_row)
+
+        self.player_buttons_row = QWidget()
+        buttons_row = QHBoxLayout(self.player_buttons_row)
+        buttons_row.setContentsMargins(0, 0, 0, 0)
+        self.play_button = QPushButton("Играть")
+        self.play_button.setAccessibleName("Играть трек")
+        self.back_button = QPushButton("Назад на 5 секунд")
+        self.back_button.setAccessibleName("Назад на 5 секунд")
+        self.forward_button = QPushButton("Вперёд на 5 секунд")
+        self.forward_button.setAccessibleName("Вперёд на 5 секунд")
+        self.delete_track_button = QPushButton("Удалить трек")
+        self.delete_track_button.setAccessibleName("Удалить трек")
+        self.delete_track_button.setAccessibleDescription(
+            "Удаляет выбранный трек из папки Media. Спросит подтверждение."
+        )
+        buttons_row.addWidget(self.play_button)
+        buttons_row.addWidget(self.back_button)
+        buttons_row.addWidget(self.forward_button)
+        buttons_row.addWidget(self.delete_track_button)
+        buttons_row.addStretch(1)
+        player_layout.addWidget(self.player_buttons_row)
+
+        self.track_position_label = QLabel("")
+        self.track_position_label.setAccessibleName("Позиция трека")
+        self.track_position_label.setAccessibleDescription(
+            "Где сейчас играет трек: сколько прошло и сколько всего."
+        )
+        player_layout.addWidget(self.track_position_label)
+        self.player_buttons_row.setVisible(False)
+        self.track_position_label.setVisible(False)
+        layout.addWidget(player_group)
+
         # Имя и подключение (для ученика)
         self.name_row = QWidget()
         name_layout = QHBoxLayout(self.name_row)
@@ -687,9 +780,17 @@ class MainWindow(QMainWindow):
         self.metro_button.toggled.connect(self._on_metronome_toggle)
         self.bpm_spin.valueChanged.connect(self._on_metronome_value)
         self.beats_spin.valueChanged.connect(self._on_metronome_value)
+        self.add_track_button.clicked.connect(self._add_track)
+        self.track_combo.currentIndexChanged.connect(self._on_track_changed)
+        self.play_button.clicked.connect(self._toggle_play)
+        self.back_button.clicked.connect(lambda: self._seek(-1))
+        self.forward_button.clicked.connect(lambda: self._seek(1))
+        self.delete_track_button.clicked.connect(self._delete_track)
 
     def _wire_signals(self) -> None:
         self.sig_status.connect(self._set_status)
+        self.sig_track_ready.connect(self._on_track_ready)
+        self.sig_track_error.connect(self._on_track_error)
         self.sig_chat.connect(self._append_chat)
         self.sig_peer.connect(self._on_peer)
         self.sig_ready.connect(self._on_ready)
@@ -1044,6 +1145,227 @@ class MainWindow(QMainWindow):
                                   self.bpm_spin.value(), self.beats_spin.value())
         self._save_timer.start()
 
+    # -- плеер ---------------------------------------------------------------
+
+    def _skip_seconds(self) -> int:
+        try:
+            return int((self.cfg.get("player") or {}).get("skip", 5) or 5)
+        except (TypeError, ValueError):
+            return 5
+
+    def _selected_track(self) -> str:
+        data = self.track_combo.currentData()
+        return str(data) if data else ""
+
+    def _refresh_tracks(self, select: str | None = None) -> list[str]:
+        """Перечитывает папку Media и прячет кнопки, если треков нет."""
+        tracks = media.list_tracks()
+        wanted = select or self._selected_track() or str(
+            (self.cfg.get("player") or {}).get("last", ""))
+        self.track_combo.blockSignals(True)
+        self.track_combo.clear()
+        for path in tracks:
+            self.track_combo.addItem(path.name, str(path))
+        index = self.track_combo.findData(wanted)
+        if index < 0 and tracks:
+            index = 0
+        self.track_combo.setCurrentIndex(index)
+        self.track_combo.blockSignals(False)
+        self._tracks_available = bool(tracks)
+        self.player_buttons_row.setVisible(self._tracks_available)
+        self.track_position_label.setVisible(self._tracks_available)
+        if not self._tracks_available:
+            self.track_position_label.setText("")
+        self._update_player_buttons()
+        if tracks and index >= 0:
+            self.cfg.setdefault("player", {})["last"] = self.track_combo.itemData(index)
+            self._save_timer.start()
+        return self._refresh_volume_visibility()
+
+    def _on_track_changed(self, index: int) -> None:
+        player = self.engine.player
+        if player.playing:
+            player.stop()
+            self._set_status("Воспроизведение остановлено: выбран другой трек.")
+        self.cfg.setdefault("player", {})["last"] = self._selected_track()
+        self._save_timer.start()
+        self._update_player_buttons()
+
+    def _add_track(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Добавить трек", str(media.media_dir()),
+            "Аудио (*.mp3 *.wav *.flac *.ogg)")
+        if not paths:
+            return
+        added: list[Path] = []
+        errors: list[str] = []
+        for path in paths:
+            try:
+                added.append(media.add_track(path))
+            except Exception as exc:
+                errors.append(f"{Path(path).name}: {exc}")
+        if not added:
+            self._set_status("Не удалось добавить файл. " + "; ".join(errors))
+            return
+        appeared = self._refresh_tracks(select=str(added[-1]))
+        last = added[-1].name
+        if len(added) == 1:
+            text = (f"Трек добавлен: {last}. "
+                    "Он лежит в папке Media рядом с программой.")
+        else:
+            text = f"Добавлено треков: {len(added)}. Выбран последний: {last}."
+        if "player" in appeared:
+            text += " Появились кнопки плеера и регулятор громкости трека."
+        if self.engine.player.playing:
+            # Список теперь показывает новый трек — старый дальше не играет.
+            self.engine.player.stop()
+            self._update_player_buttons()
+            text += " Воспроизведение остановлено — выбран новый трек."
+        if errors:
+            text += " Не получилось добавить: " + "; ".join(errors)
+        self._set_status(text)
+
+    def _delete_track(self) -> None:
+        path = self._selected_track()
+        if not path:
+            return
+        name = Path(path).name
+        box = QMessageBox(self)
+        box.setWindowTitle("Удалить трек")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Удалить трек {name} из папки Media?")
+        box.setAccessibleName("Удаление трека")
+        delete = box.addButton("Удалить", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Отмена", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not delete:
+            self._set_status("Удаление отменено.")
+            return
+        player = self.engine.player
+        if player.path == path:
+            player.clear()
+        try:
+            Path(path).unlink()
+        except OSError as exc:
+            self._set_status(f"Не удалось удалить трек: {exc}")
+            return
+        self._refresh_tracks()
+        self._update_player_buttons()
+        self._set_status(f"Трек удалён: {name}")
+
+    def _toggle_play(self) -> None:
+        player = self.engine.player
+        if player.playing:
+            player.stop()
+            self._update_player_buttons()
+            self._set_status("Трек остановлен.")
+            return
+        path = self._selected_track()
+        if not path:
+            self._set_status("Сначала добавьте трек кнопкой Добавить трек.")
+            return
+        if not self.engine.running:
+            self._set_status("Звук не запущен. Откройте кабинет или "
+                             "подключитесь, потом включайте трек.")
+            return
+        if player.path == path and player.has_track:
+            if player.play():
+                self._update_player_buttons()
+                self._set_status(f"Играет: {Path(path).name}")
+            return
+        self._load_and_play(path)
+
+    def _load_and_play(self, path: str) -> None:
+        if self._loading_track:
+            self._set_status("Трек уже загружается, подождите.")
+            return
+        self._loading_track = True
+        self._set_status(f"Загружаю трек {Path(path).name}…")
+        threading.Thread(target=self._load_track_worker, args=(path,),
+                         daemon=True).start()
+
+    def _load_track_worker(self, path: str) -> None:
+        try:
+            data = media.load_track(path)
+        except Exception as exc:
+            self.sig_track_error.emit(f"Не удалось открыть трек: {exc}")
+            return
+        self.sig_track_ready.emit(path, data)
+
+    def _on_track_ready(self, path: str, data) -> None:
+        self._loading_track = False
+        player = self.engine.player
+        player.set_track(path, data)
+        player.play()
+        self._update_player_buttons()
+        duration = _clock(player.duration())
+        self.track_position_label.setText(f"0:00 из {duration}")
+        self._set_status(f"Играет: {player.name}. Позиция 0:00 из {duration}.")
+
+    def _on_track_error(self, text: str) -> None:
+        self._loading_track = False
+        self._set_status(text)
+
+    def _seek(self, direction: int) -> None:
+        player = self.engine.player
+        path = self._selected_track()
+        if not path:
+            return
+        if not (player.path == path and player.has_track):
+            self._set_status("Сначала нажмите Играть: трек загрузится, "
+                             "и перемотка станет доступна.")
+            return
+        step = self._skip_seconds()
+        position = player.seek(direction * step)
+        # Перемотка за конец — это не «доиграл», отдельного объявления не надо.
+        player.take_finished()
+        duration = _clock(player.duration())
+        self.track_position_label.setText(f"{_clock(position)} из {duration}")
+        self._update_player_buttons()
+        word = "Назад" if direction < 0 else "Вперёд"
+        self._set_status(f"{word} на {step} секунд. "
+                         f"Позиция {_clock(position)} из {duration}.")
+
+    def _tick_player(self) -> None:
+        player = self.engine.player
+        if player.take_finished() and not player.playing:
+            self._update_player_buttons()
+            self._set_status(f"Трек закончился: {player.name or 'трек'}.")
+        if not player.has_track:
+            return
+        text = f"{_clock(player.position())} из {_clock(player.duration())}"
+        if self.track_position_label.text() != text:
+            self.track_position_label.setText(text)
+        self._update_player_buttons()
+
+    def _update_player_buttons(self) -> None:
+        """Подписи кнопок плеера под текущее состояние и шаг перемотки."""
+        playing = self.engine.player.playing
+        skip = self._skip_seconds()
+        if (playing, skip) == self._player_button_state:
+            return
+        self._player_button_state = (playing, skip)
+        play_text = "Стоп" if playing else "Играть"
+        self.play_button.setText(play_text)
+        self.play_button.setAccessibleName(
+            "Остановить трек" if playing else "Играть трек")
+        self.play_button.setAccessibleDescription(
+            "Трек играет. Нажмите, чтобы остановить — ученик перестанет его слышать."
+            if playing else
+            "Включает выбранный трек. Его слышат и вы, и ученик."
+        )
+        back = f"Назад на {skip} секунд"
+        forward = f"Вперёд на {skip} секунд"
+        self.back_button.setText(back)
+        self.back_button.setAccessibleName(back)
+        self.back_button.setAccessibleDescription(
+            f"Возвращает трек на {skip} секунд назад.")
+        self.forward_button.setText(forward)
+        self.forward_button.setAccessibleName(forward)
+        self.forward_button.setAccessibleDescription(
+            f"Перематывает трек на {skip} секунд вперёд.")
+
     def _refresh_volume_visibility(self) -> list[str]:
         """Оставляет на экране только регуляторы выбранных устройств.
 
@@ -1059,6 +1381,7 @@ class MainWindow(QMainWindow):
             "usb": bool(str(audio_cfg.get("usb") or "").strip()),
             "midi": bool(audio_cfg.get("midi_enabled")),
             "metronome": bool(self.cfg.get("metronome", {}).get("enabled")),
+            "player": bool(self._tracks_available),
         }
         appeared: list[str] = []
         for key, row in self.slider_rows.items():
@@ -1130,6 +1453,8 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return
         self._apply_volumes()
+        # Новый шаг перемотки из настроек — на кнопках плеера.
+        self._update_player_buttons()
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.
         device_keys = ("device1", "device2", "usb", "output")
         devices_changed = any(audio_before.get(key) != self.cfg["audio"].get(key)

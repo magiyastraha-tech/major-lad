@@ -32,7 +32,12 @@ DEFAULTS = {
             "usb": 100,
             "midi": 80,
             "metronome": 60,
+            "player": 80,
         },
+    },
+    "player": {
+        "skip": 5,
+        "last": "",
     },
     "metronome": {
         "enabled": False,
