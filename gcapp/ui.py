@@ -486,6 +486,8 @@ class MainWindow(QMainWindow):
     sig_ready = Signal(str)
     sig_busy = Signal()
     sig_video = Signal(object)
+    sig_join_request = Signal(object)
+    sig_ended = Signal(str)
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -497,6 +499,8 @@ class MainWindow(QMainWindow):
         self.engine.on_video = self.reassembler.feed
         self.server: Server | None = None
         self.client: Client | None = None
+        self._join_queue: list = []
+        self._join_dialog_open = False
         self.video_sender: VideoSender | None = None
         self.connected = False
         self._save_timer = QTimer(self)
@@ -691,6 +695,8 @@ class MainWindow(QMainWindow):
         self.sig_ready.connect(self._on_ready)
         self.sig_busy.connect(self._on_busy)
         self.sig_video.connect(self._on_video_frame)
+        self.sig_join_request.connect(self._on_join_request)
+        self.sig_ended.connect(self._on_ended)
 
     # -- запуск ролей -------------------------------------------------------
 
@@ -703,6 +709,7 @@ class MainWindow(QMainWindow):
             on_file=lambda who, path: self.sig_chat.emit(
                 "система", f"{who} прислал файл: {os.path.basename(path)}"),
             on_peer=self.sig_peer.emit,
+            on_join_request=self.sig_join_request.emit,
             port=int(self.cfg.get("server_port", 45800)),
         )
         if self.server.start():
@@ -752,6 +759,7 @@ class MainWindow(QMainWindow):
             on_ready=self.sig_ready.emit,
             on_busy=self.sig_busy.emit,
             on_peer=self.sig_peer.emit,
+            on_ended=self.sig_ended.emit,
         )
         self._set_status(f"Подключаюсь к {host}…")
         # connect() может ждать до шести секунд — не держим интерфейс.
@@ -783,7 +791,7 @@ class MainWindow(QMainWindow):
                 self._start_teacher()
         else:
             if self.client is not None:
-                self.client.disconnect()
+                self.client.stop()
                 self.client = None
                 self.engine.stop()
                 self.connected = False
@@ -803,11 +811,72 @@ class MainWindow(QMainWindow):
         self._start_audio()
 
     def _on_busy(self) -> None:
-        self._set_status("Кабинет пока занят. Немного подождите.")
-        self._append_chat("система", "Кабинет пока занят. Немного подождите.")
-        announce(self.status_label, "Кабинет пока занят. Немного подождите.")
-        QMessageBox.information(self, "Кабинет занят",
-                                "Кабинет пока занят. Немного подождите.")
+        # Кабинет занят: программа уже спросила преподавателя. Окно не
+        # открываем — ответ может прийти и через минуту, а модальное окно
+        # держало бы ученика и мешало ему работать.
+        text = "Идёт урок с другим учеником. Спросил преподавателя, жду ответа."
+        self._set_status(text)
+        self._append_chat("система", text)
+        announce(self.status_label, text)
+
+    def _on_join_request(self, session) -> None:
+        """Второй ученик просит подключиться — решает преподаватель."""
+        if self.server is None:
+            return
+        self._join_queue.append(session)
+        if self._join_dialog_open:
+            # Окошко уже открыто: покажем это сразу после текущего.
+            return
+        self._join_dialog_open = True
+        try:
+            while self._join_queue and self.server is not None:
+                self._ask_join(self._join_queue.pop(0))
+        finally:
+            self._join_dialog_open = False
+
+    def _ask_join(self, session) -> None:
+        name = getattr(session, "name", "") or "Второй ученик"
+        current = self.server.active_name
+        if current:
+            text = (f"{name} просит подключиться. Сейчас в кабинете {current}. "
+                    f"Подключить {name}? Тогда урок с {current} закончится, "
+                    f"и ему придёт сообщение об окончании.")
+        else:
+            text = f"{name} просит подключиться. Подключить его?"
+        self._append_chat("система", text)
+        announce(self.status_label, text)
+        box = QMessageBox(self)
+        box.setWindowTitle("Второй ученик")
+        box.setIcon(QMessageBox.Question)
+        box.setText(text)
+        box.setAccessibleName("Второй ученик просит подключиться")
+        accept = box.addButton("Подключить второго", QMessageBox.AcceptRole)
+        cancel = box.addButton("Отменить", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        accepted = box.clickedButton() is accept
+        if self.server is not None:
+            self.server.decide(session, accepted)
+
+    def _on_ended(self, reason: str) -> None:
+        """Ученику сообщаем, почему урок закончился."""
+        if self.is_teacher:
+            return
+        texts = {
+            "closed": "Урок завершён: преподаватель закрыл кабинет.",
+            "replaced": "Урок завершён: преподаватель подключил другого ученика.",
+            "rejected": "Извините, идёт урок с другим учеником. Попробуйте позже.",
+            "lost": "Связь с преподавателем прервалась. Проверьте, открыт ли кабинет.",
+        }
+        text = texts.get(reason, texts["lost"])
+        self.client = None
+        self.connected = False
+        self.connect_button.setText("Подключиться")
+        self.connect_button.setAccessibleName("Подключиться")
+        self._set_status(text)
+        self._append_chat("система", text)
+        announce(self.status_label, text)
 
     def _on_peer(self, present: bool) -> None:
         self.connected = bool(present)
@@ -817,7 +886,11 @@ class MainWindow(QMainWindow):
             if self.is_teacher:
                 # Кабинет остаётся открытым: местный звук, метроном и MIDI
                 # продолжают работать, пока ждём следующего ученика.
-                self._set_status("Ученик отключился. Кабинет свободен.")
+                # Если кабинет уже закрыт, это запоздалый сигнал от
+                # закрытого соединения — он не должен перебивать «Кабинет
+                # закрыт».
+                if self.server is not None:
+                    self._set_status("Ученик отключился. Кабинет свободен.")
             else:
                 self.engine.stop()
                 self._start_audio(local_only=True)
@@ -1088,5 +1161,5 @@ class MainWindow(QMainWindow):
         if self.server is not None:
             self.server.stop()
         if self.client is not None:
-            self.client.disconnect()
+            self.client.stop()
         super().closeEvent(event)

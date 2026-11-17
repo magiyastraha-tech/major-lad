@@ -31,12 +31,16 @@ from .midi_synth import MidiInput, Synth
 SAMPLE_RATE = 48000
 BLOCK = 480          # 10 мс
 
-# Сколько звука держим в буфере. Это и есть задержка сверх драйвера:
-# 2 блока — 20 мс запаса на сеть, больше не нужно, на локальной сети хватает
-# и этого. Для входов чуть больше: микрофон и наушники могут тактироваться
-# от разных часов и медленно разъезжаться.
-STUDENT_KEEP = BLOCK * 2
-INPUT_KEEP = BLOCK * 3
+# Сколько звука держим в буфере. Это и есть задержка сверх драйвера.
+# Рабочая цель — 4 блока, 40 мс: на локальной сети этого с запасом хватает
+# на дрожание пакетов. Режем буфер только когда он вырос выше 8 блоков,
+# 80 мс, и режем сразу до рабочей цели. Держать буфер ровно на минимуме
+# нельзя: звуковая карта отдаёт данные пачками, и между пачками буфер
+# успевает опустеть — в наушниках это слышно как хрипы и обрывки.
+STUDENT_KEEP = BLOCK * 4
+STUDENT_MAX = BLOCK * 8
+INPUT_KEEP = BLOCK * 4
+INPUT_MAX = BLOCK * 8
 UDP_PORT = 45801
 MAGIC_AUDIO = b"GCA1"
 MAGIC_HELLO = b"GCH1"
@@ -98,20 +102,25 @@ class Ring:
                 self._count -= k
         return out
 
-    def trim(self, keep: int) -> None:
-        """Оставляет в буфере не больше keep отсчётов, старое выбрасывает.
+    def trim(self, keep: int, max_keep: int | None = None) -> None:
+        """Держит буфер в разумных пределах, но не на самом минимуме.
 
-        Буфер сглаживает неровности сети и разницу часов двух устройств, но
-        если он копит больше нужного, задержка растёт и сама уже не падает:
-        читаем мы ровно столько же, сколько приходит. Поэтому перед чтением
-        лишнее выкидываем — лучше одномоментный щелчок раз в минуту, чем
-        секунда задержки, которая только увеличивается.
+        Буфер сглаживает неровности сети, разницу часов устройств и то, что
+        драйвер отдаёт звук пачками. Если он копит больше нужного, задержка
+        растёт и сама уже не падает: читаем ровно столько же, сколько
+        приходит. Поэтому лишнее выбрасываем — но только когда его накопилось
+        заметно больше цели: режем от max_keep до keep. Так работает
+        гистерезис: обычные всплески буфер переживает молча, а не опускается
+        каждый раз до голодного минимума, от которого в наушниках слышны
+        хрипы. Без max_keep поведение прежнее — резать всё выше keep.
         """
+        limit = keep if max_keep is None else max_keep
         with self._lock:
+            if self._count <= limit:
+                return
             excess = self._count - keep
-            if excess > 0:
-                self._read = (self._read + excess) % self._size
-                self._count = keep
+            self._read = (self._read + excess) % self._size
+            self._count = keep
 
     def clear(self) -> None:
         with self._lock:
@@ -479,7 +488,7 @@ class AudioEngine:
         # В наушники: собеседник, своя MIDI-клавиатура и свой метроном.
         # Источники со входов сюда не идут — иначе микрофон поймает колонки
         # и получится эхо.
-        self.student.trim(STUDENT_KEEP)
+        self.student.trim(STUDENT_KEEP, STUDENT_MAX)
         local = self.student.read(frames) * self.volumes["student"]
         if synth_out is not None:
             local += synth_out * midi_level
@@ -491,7 +500,7 @@ class AudioEngine:
         # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
         mix = clicks.copy()
         for source in self.sources.values():
-            source.ring.trim(INPUT_KEEP)
+            source.ring.trim(INPUT_KEEP, INPUT_MAX)
             block = source.ring.read(frames)
             if source.volume > 0:
                 mix += block * source.volume

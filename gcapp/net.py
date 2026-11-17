@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import json
 import os
-import select
 import socket
 import struct
 import threading
+import time
 from pathlib import Path
 
 APP_PORT = 45800
 UDP_PORT = 45801
+# Сколько ждём решения преподавателя, если место занято. Дольше держать
+# ученика в неведении нечестно: он лучше узнает ответ и попробует позже.
+WAIT_DECISION = 120
 SAVE_DIR = Path(__file__).resolve().parent.parent / "received"
 
 
@@ -82,13 +85,16 @@ class Server:
     """Кабинет преподавателя. Один активный ученик, остальные ждут."""
 
     def __init__(self, name: str, on_status=None, on_chat=None, on_file=None,
-                 on_peer=None, port: int = APP_PORT):
+                 on_peer=None, on_join_request=None, port: int = APP_PORT):
         self.name = name
         self.port = port
         self.on_status = on_status or (lambda *a: None)
         self.on_chat = on_chat or (lambda *a: None)
         self.on_file = on_file or (lambda *a: None)
         self.on_peer = on_peer or (lambda *a: None)
+        # Второй ученик не входит молча и не висит в очереди: преподаватель
+        # решает сам — заменить текущего или отказать.
+        self.on_join_request = on_join_request or (lambda *a: None)
         self._sock: socket.socket | None = None
         self._active: "_Session | None" = None
         self._waiting: list["_Session"] = []
@@ -123,32 +129,74 @@ class Server:
             sessions = list(self._waiting)
             if self._active:
                 sessions.append(self._active)
+            # Кабинет закрыт: выходящие соединения уже не должны сообщать
+            # «ученик отключился» — это перебило бы «Кабинет закрыт».
+            self._active = None
+            self._waiting.clear()
+        # Сначала прощаемся, потом закрываем: иначе ученик видит только
+        # оборванную связь и не понимает, что урок закончился.
         for session in sessions:
-            session.close()
+            session.end("closed")
 
     # -- очередь ------------------------------------------------------------
 
     def join(self, session: "_Session") -> bool:
+        """Занять свободный кабинет. Если занят — False, без очереди."""
         with self._lock:
             if self._active is None:
                 self._active = session
                 return True
-            self._waiting.append(session)
             return False
 
+    @property
+    def active_name(self) -> str:
+        """Имя ученика, который сейчас в кабинете. Пусто — кабинет свободен."""
+        with self._lock:
+            return self._active.name if self._active is not None else ""
+
+    def request_join(self, session: "_Session") -> None:
+        """Спросить преподавателя, пускать ли второго ученика."""
+        with self._lock:
+            if session not in self._waiting:
+                self._waiting.append(session)
+        self.on_join_request(session)
+
+    def cancel_wait(self, session: "_Session") -> None:
+        with self._lock:
+            if session in self._waiting:
+                self._waiting.remove(session)
+
+    def decide(self, session: "_Session", accept: bool) -> None:
+        """Ответ преподавателя на второй вход."""
+        self.cancel_wait(session)
+        if not accept:
+            session.refuse()
+            self.on_status(f"{session.name} не подключён: идёт урок.")
+            return
+        with self._lock:
+            previous = self._active
+            self._active = session
+        # Текущего ученика отпускаем отдельно: его собственный выход из
+        # чата уже не тронет кабинет, место занято новым.
+        if previous is not None:
+            previous.end("replaced")
+            self.on_peer(False)
+        session.promote()
+
     def leave(self, session: "_Session") -> None:
-        promoted = None
+        ask = None
         with self._lock:
             if session is self._active:
                 self._active = None
                 self.on_peer(False)
+                # Кабинет освободился. Если кто-то уже просится, спрашиваем
+                # преподавателя заново — теперь про свободное место.
                 if self._waiting:
-                    promoted = self._waiting.pop(0)
-                    self._active = promoted
+                    ask = self._waiting[0]
             elif session in self._waiting:
                 self._waiting.remove(session)
-        if promoted is not None:
-            promoted.promote()
+        if ask is not None:
+            self.on_join_request(ask)
 
     def current(self) -> "_Session | None":
         with self._lock:
@@ -190,6 +238,7 @@ class _Session:
         self.name = "Ученик"
         self._send_lock = threading.Lock()
         self._promoted = threading.Event()
+        self._refused = threading.Event()
         self._closed = False
 
     def send_json(self, obj: dict) -> bool:
@@ -206,6 +255,17 @@ class _Session:
             self.server.on_peer(True)
             self.server.on_status(f"Ученик в кабинете: {self.name}")
 
+    def refuse(self) -> None:
+        """Вежливо отказываем: место занято."""
+        self._refused.set()
+        self.send_json({"type": "rejected"})
+        self.close()
+
+    def end(self, reason: str) -> None:
+        """Сообщаем, что урок закончен, и закрываем канал."""
+        self.send_json({"type": "ended", "reason": reason})
+        self.close()
+
     def run(self) -> None:
         try:
             hello = recv_json(self.conn)
@@ -220,19 +280,22 @@ class _Session:
             self.server.on_peer(True)
             self.server.on_status(f"Ученик в кабинете: {self.name}")
         else:
-            self.send_json({"type": "busy"})
-            self.server.on_status(f"{self.name} ждёт: кабинет пока занят.")
-            while not self._promoted.wait(0.5):
-                try:
-                    ready, _, _ = select.select([self.conn], [], [], 0)
-                    if ready:
-                        peek = self.conn.recv(1, socket.MSG_PEEK)
-                        if not peek:
-                            raise ConnectionError("клиент ушёл")
-                except Exception:
-                    self.server.leave(self)
-                    self.close()
+            # Место занято: спрашиваем преподавателя, а не ставим молча
+            # в очередь. Ученик в это время видит «ждёт решения».
+            self.send_json({"type": "waiting"})
+            self.server.request_join(self)
+            self.server.on_status(f"{self.name} просит подключиться.")
+            deadline = time.monotonic() + WAIT_DECISION
+            while time.monotonic() < deadline:
+                if self._promoted.is_set():
+                    break
+                if self._refused.is_set():
                     return
+                time.sleep(0.1)
+            else:
+                self.server.cancel_wait(self)
+                self.refuse()
+                return
             if self._closed:
                 return
 
@@ -300,7 +363,8 @@ class Client:
 
     def __init__(self, name: str, host: str, port: int = APP_PORT,
                  on_status=None, on_chat=None, on_file=None,
-                 on_ready=None, on_busy=None, on_peer=None):
+                 on_ready=None, on_busy=None, on_peer=None,
+                 on_ended=None):
         self.name = name
         self.host = host
         self.port = port
@@ -310,9 +374,15 @@ class Client:
         self.on_ready = on_ready or (lambda *a: None)
         self.on_busy = on_busy or (lambda *a: None)
         self.on_peer = on_peer or (lambda *a: None)
+        # Код окончания: closed — кабинет закрыли, replaced — подключили
+        # другого ученика, rejected — не пустили, lost — связь оборвалась.
+        self.on_ended = on_ended or (lambda *a: None)
         self._sock: socket.socket | None = None
         self._send_lock = threading.Lock()
         self._connected = False
+        # Выход по кнопке «Отключиться»: это не окончание урока, и объявлять
+        # о нём как о разрыве связи не нужно.
+        self._user_closed = False
 
     def connect(self) -> bool:
         self.disconnect()
@@ -338,7 +408,7 @@ class Client:
         self._keepalive(sock)
         sock.settimeout(None)
 
-        if answer.get("type") == "busy":
+        if answer.get("type") in ("busy", "waiting"):
             self.on_busy()
             threading.Thread(target=self._wait_ready, daemon=True).start()
         else:
@@ -378,22 +448,39 @@ class Client:
 
     def _wait_ready(self) -> None:
         sock = self._sock
+        reason = "lost"
         try:
             while True:
                 answer = recv_json(sock)
-                if answer.get("type") == "ready":
+                kind = answer.get("type")
+                if kind == "ready":
                     break
+                if kind == "rejected":
+                    reason = "rejected"
+                    break
+                if kind == "ended":
+                    reason = "closed"
+                    break
+            else:  # pragma: no cover - цикл выходит только через break
+                pass
         except Exception:
-            self.on_status("Соединение с преподавателем потеряно.")
-            self.disconnect()
-            return
-        self._connected = True
-        self.on_peer(True)
-        self.on_ready("Преподаватель")
-        self._read_loop()
+            pass
+        else:
+            if reason == "lost":
+                self._connected = True
+                self.on_peer(True)
+                self.on_ready("Преподаватель")
+                self._read_loop()
+                return
+        user = self._user_closed
+        self.disconnect()
+        self.on_peer(False)
+        if not user:
+            self.on_ended(reason)
 
     def _read_loop(self) -> None:
         sock = self._sock
+        reason = "lost"
         try:
             while True:
                 msg = recv_json(sock)
@@ -408,11 +495,19 @@ class Client:
                     path = save_received(str(msg.get("name") or "файл"), data)
                     self.on_file("Преподаватель", path)
                     self.on_chat("система", f"Файл получен: {os.path.basename(path)}")
+                elif kind == "ended":
+                    reason = str(msg.get("reason") or "closed")
+                    break
         except Exception:
-            self.on_status("Соединение с преподавателем закрыто.")
+            pass
         finally:
+            user = self._user_closed
             self.disconnect()
             self.on_peer(False)
+            # Код окончания идёт последним: обработчик ставит финальный
+            # статус, и местный звук не перебивает его своим сообщением.
+            if not user:
+                self.on_ended(reason)
 
     def send_chat(self, text: str) -> bool:
         sock = self._sock
@@ -443,6 +538,11 @@ class Client:
         except OSError:
             self.disconnect()
             return False
+
+    def stop(self) -> None:
+        """Отключение по кнопке. Звонок об окончании урока не приходит."""
+        self._user_closed = True
+        self.disconnect()
 
     def disconnect(self) -> None:
         self._connected = False
