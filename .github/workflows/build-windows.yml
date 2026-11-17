@@ -1,0 +1,46 @@
+name: Build Windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build teacher exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name MajorLad-Teacher --collect-all sounddevice
+          --collect-all rtmidi --collect-all cv2 --exclude-module tkinter
+          main_teacher.py
+
+      - name: Build student exe
+        run: >
+          python -m PyInstaller --noconfirm --onefile --windowed
+          --name MajorLad-Student --collect-all sounddevice
+          --collect-all rtmidi --collect-all cv2 --exclude-module tkinter
+          main_student.py
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: major-lad-windows
+          path: dist/*.exe
+          if-no-files-found: error

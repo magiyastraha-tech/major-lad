@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+*.json
+!requirements.json
+*_log.txt
+run_log.txt
+build_log.txt
+check_log.txt
+received/
+.secrets
+.env
+.venv/
+venv/
