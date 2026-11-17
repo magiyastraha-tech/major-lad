@@ -168,6 +168,13 @@ class Server:
 
     def decide(self, session: "_Session", accept: bool) -> None:
         """Ответ преподавателя на второй вход."""
+        with self._lock:
+            still_waiting = session in self._waiting
+        if not still_waiting or session._closed:
+            # Пока решали, ученик отключился или истекло время ожидания.
+            # Принимать его некуда — и выгонять за него текущего нельзя.
+            self.on_status(f"{session.name} уже не ждёт ответа.")
+            return
         self.cancel_wait(session)
         if not accept:
             session.refuse()
