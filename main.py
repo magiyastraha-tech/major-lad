@@ -6,12 +6,52 @@
 from __future__ import annotations
 
 import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QVBoxLayout,
+)
 
-from gcapp import __version__, config
+from gcapp import __version__, config, updater
 from gcapp.ui import MainWindow
+
+
+def _error_log_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent / "error_log.txt"
+    return Path(__file__).resolve().parent / "error_log.txt"
+
+
+def _install_error_handler() -> None:
+    """Показывает ошибку и пишет её в error_log.txt.
+
+    В собранной программе окна консоли нет: без этого обработчика любая
+    ошибка внутри обработчика кнопки исчезает молча, и человек видит только,
+    что кнопка «не работает».
+    """
+    def hook(exc_type, exc, tb) -> None:
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            with open(_error_log_path(), "a", encoding="utf-8") as fh:
+                fh.write(f"\n{datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
+        except Exception:
+            pass
+        try:
+            QMessageBox.critical(
+                None, "Мажорный лад",
+                "Что-то пошло не так.\n\n"
+                f"{exc_type.__name__}: {exc}\n\n"
+                "Программа продолжает работать. Подробности записаны "
+                "в файл error_log.txt рядом с программой.",
+            )
+        except Exception:
+            pass
+
+    sys.excepthook = hook
 
 
 class RoleDialog(QDialog):
@@ -66,6 +106,10 @@ def main(forced_role: str | None = None) -> int:
     app.setApplicationName("Мажорный лад")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("Мажорный лад")
+    _install_error_handler()
+
+    # Файл прошлой версии после обновления больше не нужен.
+    updater.cleanup_backup()
 
     cfg = config.load()
 

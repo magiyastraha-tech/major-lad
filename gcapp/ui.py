@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, audio, config
+from . import __version__, audio, config, updater
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
@@ -45,6 +45,19 @@ def announce(widget: QWidget, text: str) -> None:
         pass
 
 
+def _explain(exc: Exception) -> str:
+    """Переводит сетевую ошибку на понятный язык."""
+    text = str(exc)
+    lowered = text.lower()
+    if "urlopen error" in lowered or "timed out" in lowered or "getaddrinfo" in lowered:
+        return "нет связи с сервером обновлений. Проверьте интернет и попробуйте ещё раз."
+    if "403" in text:
+        return "сервер обновлений слишком часто спрашивали. Попробуйте позже."
+    if "404" in text:
+        return "на сервере обновлений нет подходящего файла."
+    return text or exc.__class__.__name__
+
+
 def label_for(text: str, buddy: QWidget | None = None, description: str = "") -> QLabel:
     lbl = QLabel(text)
     lbl.setAccessibleName(text)
@@ -58,9 +71,17 @@ def label_for(text: str, buddy: QWidget | None = None, description: str = "") ->
 class SettingsDialog(QDialog):
     """Настройки. Открывается по Control+P, дерево на четыре раздела."""
 
+    sig_update = Signal(dict)
+    sig_progress = Signal(int)
+    sig_download = Signal(dict)
+
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self.cfg = cfg
+        self._downloading = False
+        self.sig_update.connect(self._on_update_result)
+        self.sig_progress.connect(self._on_progress)
+        self.sig_download.connect(self._on_download_done)
         self.setWindowTitle("Настройки")
         self.setAccessibleName("Настройки «Мажорный лад»")
         self.resize(720, 520)
@@ -82,7 +103,7 @@ class SettingsDialog(QDialog):
         ]
         for title, page in sections:
             item = QTreeWidgetItem([title])
-            item.setAccessibleText(0, title)
+            item.setData(0, Qt.ItemDataRole.AccessibleTextRole, title)
             self.tree.addTopLevelItem(item)
             self.stack.addWidget(page)
         self.tree.currentItemChanged.connect(self._on_section)
@@ -149,6 +170,25 @@ class SettingsDialog(QDialog):
         self.autoconnect_box.setChecked(bool(self.cfg.get("autoconnect", True)))
         self.autoconnect_box.setAccessibleName("Автоматическое подключение при запуске")
         form.addRow(self.autoconnect_box)
+
+        version_row = QHBoxLayout()
+        self.version_label = QLabel(f"Версия {__version__}")
+        self.version_label.setAccessibleName(f"Версия программы {__version__}")
+        self.update_button = QPushButton("Проверить обновления")
+        self.update_button.setAccessibleName("Проверить обновления")
+        self.update_button.setAccessibleDescription(
+            "Проверяет, не вышла ли новая версия программы. "
+            "Если вышла, её можно скачать и установить прямо здесь."
+        )
+        self.update_button.clicked.connect(self._check_updates)
+        version_row.addWidget(self.version_label, 1)
+        version_row.addWidget(self.update_button)
+        form.addRow(version_row)
+
+        self.update_status = QLabel("")
+        self.update_status.setWordWrap(True)
+        self.update_status.setAccessibleName("Состояние обновления")
+        form.addRow(self.update_status)
 
         return page
 
@@ -292,9 +332,97 @@ class SettingsDialog(QDialog):
 
         return page
 
+    # -- обновления ---------------------------------------------------------
+
+    def _check_updates(self) -> None:
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Проверяю…")
+        self._set_update_status("Проверяю обновления, подождите.")
+        threading.Thread(target=self._check_worker, daemon=True).start()
+
+    def _check_worker(self) -> None:
+        try:
+            info = updater.latest_release(self.cfg.get("role", "teacher"), __version__)
+        except Exception as exc:
+            self.sig_update.emit({"error": _explain(exc)})
+            return
+        self.sig_update.emit(info)
+
+    def _on_update_result(self, info: dict) -> None:
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Проверить обновления")
+        if info.get("error"):
+            self._set_update_status(f"Проверить обновления не удалось: {info['error']}")
+            return
+        if info.get("none"):
+            self._set_update_status(f"У вас последняя версия, {__version__}.")
+            return
+        version = info.get("version", "")
+        answer = QMessageBox.question(
+            self, "Доступно обновление",
+            f"Вышла версия {version}. Скачать и установить сейчас?\n\n"
+            "Программа закроется, заменит свой файл и запустится заново. "
+            "Настройки и имя сохранятся.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            self._set_update_status(f"Доступна версия {version}. Скачать можно позже.")
+            return
+        self._start_download(info.get("url", ""))
+
+    def _start_download(self, url: str) -> None:
+        self._downloading = True
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Скачиваю…")
+        self._set_update_status(
+            "Скачиваю обновление. Это займёт несколько минут, окно закроется само."
+        )
+        threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
+
+    def _download_worker(self, url: str) -> None:
+        try:
+            path = updater.download(url, progress=self.sig_progress.emit)
+        except Exception as exc:
+            self.sig_download.emit({"error": _explain(exc)})
+            return
+        self.sig_download.emit({"path": str(path)})
+
+    def _on_progress(self, percent: int) -> None:
+        self.update_status.setText(f"Скачиваю обновление: {percent} процентов.")
+
+    def _on_download_done(self, info: dict) -> None:
+        self._downloading = False
+        if info.get("error"):
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Проверить обновления")
+            self._set_update_status(f"Скачать обновление не удалось: {info['error']}")
+            return
+        self._set_update_status("Обновление скачано. Перезапускаю программу.")
+        ok, error = updater.install_and_restart(Path(info.get("path", "")))
+        if not ok:
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Проверить обновления")
+            self._set_update_status(error)
+            return
+        config.save(self.cfg)
+        app = QApplication.instance()
+        self.reject()
+        if app is not None:
+            QTimer.singleShot(300, app.quit)
+
+    def _set_update_status(self, text: str) -> None:
+        self.update_status.setText(text)
+        announce(self.update_status, text)
+
     # -- сохранение ---------------------------------------------------------
 
     def _apply(self) -> None:
+        if self._downloading:
+            QMessageBox.information(
+                self, "Обновление",
+                "Скачивание обновления ещё идёт. Подождите: программа закроется сама."
+            )
+            return
         cfg = self.cfg
         new_name = self.name_edit.text().strip()
         if new_name:
@@ -354,7 +482,7 @@ class MainWindow(QMainWindow):
         self._save_timer.timeout.connect(lambda: config.save(self.cfg))
 
         self.setWindowTitle(f"Мажорный лад {__version__}")
-        self.resize(900, 760)
+        self.resize(900, 680)
         self.setAccessibleName("Мажорный лад, главное окно")
 
         self._build_ui()
@@ -396,10 +524,16 @@ class MainWindow(QMainWindow):
         vol_layout = QVBoxLayout(vol_group)
         self.sliders: dict[str, QSlider] = {}
         self.slider_values: dict[str, QLabel] = {}
+        self.slider_rows: dict[str, QWidget] = {}
+        self.slider_titles: dict[str, str] = {}
         for key, title, description in VOLUME_KEYS:
             if key == "student":
                 title = "Звук ученика" if self.is_teacher else "Звук преподавателя"
-            row = QHBoxLayout()
+            self.slider_titles[key] = title
+            row_widget = QWidget()
+            row_widget.setAccessibleName(title)
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
             name_label = QLabel(title)
             name_label.setMinimumWidth(180)
             name_label.setAccessibleName(title)
@@ -419,12 +553,14 @@ class MainWindow(QMainWindow):
             row.addWidget(name_label)
             row.addWidget(slider, 1)
             row.addWidget(value_label)
-            vol_layout.addLayout(row)
+            vol_layout.addWidget(row_widget)
             self.sliders[key] = slider
             self.slider_values[key] = value_label
+            self.slider_rows[key] = row_widget
             slider.valueChanged.connect(
                 lambda value, k=key, t=title: self._on_volume(k, t, value)
             )
+        self._refresh_volume_visibility()
         layout.addWidget(vol_group)
 
         # Имя и подключение (для ученика)
@@ -677,6 +813,29 @@ class MainWindow(QMainWindow):
         for key, slider in self.sliders.items():
             self.engine.set_volume(key, slider.value())
 
+    def _refresh_volume_visibility(self) -> list[str]:
+        """Оставляет на экране только регуляторы выбранных устройств.
+
+        Громкость собеседника есть всегда. Остальные регуляторы появляются,
+        когда устройство выбрано в настройках, и прячутся, когда его убрали.
+        Возвращает ключи регуляторов, которые только что появились.
+        """
+        audio_cfg = self.cfg.get("audio", {})
+        active = {
+            "student": True,
+            "in1": bool(str(audio_cfg.get("device1") or "").strip()),
+            "in2": bool(str(audio_cfg.get("device2") or "").strip()),
+            "usb": bool(str(audio_cfg.get("usb") or "").strip()),
+            "midi": bool(audio_cfg.get("midi_enabled")),
+        }
+        appeared: list[str] = []
+        for key, row in self.slider_rows.items():
+            visible = active.get(key, True)
+            if visible and row.isHidden():
+                appeared.append(key)
+            row.setVisible(visible)
+        return appeared
+
     # -- чат и файлы --------------------------------------------------------
 
     def _send_message(self) -> None:
@@ -737,12 +896,16 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self.cfg, self)
         if dialog.exec() == QDialog.Accepted:
             self._apply_volumes()
-            self._set_status("Настройки сохранены.")
+            appeared = self._refresh_volume_visibility()
+            message = "Настройки сохранены."
+            if appeared:
+                names = ", ".join(self.slider_titles[key] for key in appeared)
+                message += f" На главном экране появился регулятор: {names}."
             if not self.is_teacher and self.cfg.get("name"):
                 self.name_edit.setText(self.cfg["name"])
             if self.connected:
-                self._set_status("Настройки сохранены. Перезапустите соединение, "
-                                 "чтобы применить аудиоустройства.")
+                message += " Перезапустите соединение, чтобы применить аудиоустройства."
+            self._set_status(message)
 
     def closeEvent(self, event) -> None:
         config.save(self.cfg)
