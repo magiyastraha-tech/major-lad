@@ -101,9 +101,12 @@ class Ring:
 # ---------------------------------------------------------------------------
 
 class Source:
-    def __init__(self, key: str, device_index: int):
+    def __init__(self, key: str, device_indices: list[int] | int):
+        if isinstance(device_indices, int):
+            device_indices = [device_indices]
         self.key = key
-        self.device_index = device_index
+        self.device_indices = list(device_indices)
+        self.device_index = self.device_indices[0] if self.device_indices else -1
         self.ring = Ring(SAMPLE_RATE)
         self.volume = 1.0
         self.stream = None
@@ -111,29 +114,33 @@ class Source:
     def open(self) -> None:
         # Не всякое устройство отдаёт один канал: моно-микрофоны и стерео-
         # интерфейсы ведут себя по-разному. Пробуем моно, потом стерео.
+        # Индексы идут в порядке предпочтения драйверов (WASAPI первым):
+        # если один драйвер не открылся, пробуем следующий.
         last_error: Exception | None = None
-        for channels in (1, 2):
-            stream = None
-            try:
-                stream = sd.InputStream(
-                    device=self.device_index,
-                    channels=channels,
-                    samplerate=SAMPLE_RATE,
-                    blocksize=BLOCK,
-                    dtype="float32",
-                    latency="low",
-                    callback=self._callback,
-                )
-                stream.start()
-                self.stream = stream
-                return
-            except Exception as exc:
-                last_error = exc
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
+        for index in self.device_indices:
+            self.device_index = index
+            for channels in (1, 2):
+                stream = None
+                try:
+                    stream = sd.InputStream(
+                        device=index,
+                        channels=channels,
+                        samplerate=SAMPLE_RATE,
+                        blocksize=BLOCK,
+                        dtype="float32",
+                        latency="low",
+                        callback=self._callback,
+                    )
+                    stream.start()
+                    self.stream = stream
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
         raise last_error if last_error is not None else RuntimeError("вход не открыт")
 
     def _callback(self, indata, frames, time_info, status) -> None:
@@ -172,22 +179,66 @@ def list_output_devices() -> list[str]:
         return []
 
 
-def find_device(name: str, kind: str) -> int | None:
-    """Ищет устройство по имени. Имена переживают перезапуск, индексы — нет."""
+# Одно и то же устройство Windows показывает под несколькими драйверами:
+# MME, DirectSound, WASAPI, WDM-KS. Имя у них одинаковое, а задержка разная —
+# MME тянет больше сотни миллисекунд, WASAPI в режиме низкой задержки даёт
+# десятки. Поэтому из совпадений по имени выбираем WASAPI, а MME оставляем
+# последним: он годится только если остальное не открылось.
+HOSTAPI_PREFERENCE = ("wasapi", "wdm-ks", "directsound", "mme")
+
+
+def _hostapi_rank(device: dict, hostapis: list) -> int:
+    try:
+        name = str(hostapis[device["hostapi"]]["name"]).lower()
+    except Exception:
+        name = ""
+    for rank, pref in enumerate(HOSTAPI_PREFERENCE):
+        if pref in name:
+            return rank
+    return len(HOSTAPI_PREFERENCE)
+
+
+def find_devices(name: str, kind: str) -> list[int]:
+    """Все устройства с этим именем, лучший драйвер первым.
+
+    Имена переживают перезапуск, индексы — нет, поэтому в настройках хранится
+    имя, а индекс ищем каждый раз заново.
+    """
     if sd is None or not name:
-        return None
+        return []
     try:
         devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
     except Exception:
-        return None
+        return []
+    found: list[tuple[int, int]] = []
     for index, dev in enumerate(devices):
         if dev["name"] != name:
             continue
-        if kind == "input" and dev["max_input_channels"] > 0:
-            return index
-        if kind == "output" and dev["max_output_channels"] > 0:
-            return index
-    return None
+        if kind == "input" and dev["max_input_channels"] <= 0:
+            continue
+        if kind == "output" and dev["max_output_channels"] <= 0:
+            continue
+        found.append((_hostapi_rank(dev, hostapis), index))
+    found.sort()
+    return [index for _, index in found]
+
+
+def find_device(name: str, kind: str) -> int | None:
+    """Лучшее устройство с этим именем или None."""
+    found = find_devices(name, kind)
+    return found[0] if found else None
+
+
+def _stream_latency(stream) -> float | None:
+    """Задержка потока в секундах. У дуплексного потока она приходит парой."""
+    try:
+        value = stream.latency
+        if isinstance(value, (tuple, list)):
+            value = value[-1]
+        return float(value)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -244,52 +295,64 @@ class AudioEngine:
         threading.Thread(target=self._udp_loop, daemon=True).start()
         threading.Thread(target=self._send_loop, daemon=True).start()
 
-        out_index = find_device(output, "output") if output else None
-        if out_index is None:
+        out_indices = find_devices(output, "output") if output else []
+        if not out_indices:
             try:
                 default = sd.default.device[1]
                 if isinstance(default, int) and default >= 0:
-                    out_index = default
+                    out_indices = [default]
             except Exception:
-                out_index = None
+                out_indices = []
         # Звуковая карта может не принимать моно: тогда открываем стерео
-        # и дублируем сигнал в оба канала.
+        # и дублируем сигнал в оба канала. Драйверы перебираем от быстрого
+        # к медленному — WASAPI первым, MME последним.
         out_error: Exception | None = None
-        for channels in (1, 2):
-            stream = None
-            try:
-                stream = sd.OutputStream(
-                    device=out_index,
-                    channels=channels,
-                    samplerate=SAMPLE_RATE,
-                    blocksize=BLOCK,
-                    dtype="float32",
-                    latency="low",
-                    callback=self._out_callback,
-                )
-                stream.start()
-                self._out = stream
-                self._out_channels = channels
+        for index in out_indices:
+            for channels in (1, 2):
+                stream = None
+                try:
+                    stream = sd.OutputStream(
+                        device=index,
+                        channels=channels,
+                        samplerate=SAMPLE_RATE,
+                        blocksize=BLOCK,
+                        dtype="float32",
+                        latency="low",
+                        callback=self._out_callback,
+                    )
+                    stream.start()
+                    self._out = stream
+                    self._out_channels = channels
+                    latency = _stream_latency(stream)
+                    detail = f", задержка {latency:.3f} с" if latency is not None else ""
+                    self.log(f"Аудиовыход открыт: {output or index}, "
+                             f"{channels} кан.{detail}")
+                    break
+                except Exception as exc:
+                    out_error = exc
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+            if self._out is not None:
                 break
-            except Exception as exc:
-                out_error = exc
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
         if self._out is None:
             self.stop()
             return False, f"Не удалось открыть аудиовыход: {out_error}"
+        latency = _stream_latency(self._out)
+        if latency is not None and latency > 0.06:
+            self.log(f"Внимание: задержка вывода {latency:.3f} с — "
+                     f"похоже, выбран медленный драйвер (MME).")
 
         for key, name in (devices or {}).items():
             if not name:
                 continue
-            index = find_device(name, "input")
-            if index is None:
+            indices = find_devices(name, "input")
+            if not indices:
                 self.log(f"Вход не найден: {name}")
                 continue
-            source = Source(key, index)
+            source = Source(key, indices)
             try:
                 source.open()
                 self.sources[key] = source
@@ -299,6 +362,8 @@ class AudioEngine:
         if midi_enabled:
             self.set_midi(True, midi_port)
 
+        if latency is not None:
+            return True, f"Звук запущен. Задержка вывода {latency * 1000:.0f} мс."
         return True, "Звук запущен."
 
     def set_midi(self, enabled: bool, port: str = "") -> None:
