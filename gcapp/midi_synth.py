@@ -42,7 +42,6 @@ class Synth:
         self.sample_rate = sample_rate
         self._lock = threading.Lock()
         self._voices: dict[int, dict] = {}
-        self._phase = 0.0
 
     def note_on(self, note: int, velocity: int = 100) -> None:
         freq = 440.0 * (2.0 ** ((note - 69) / 12.0))
@@ -55,6 +54,9 @@ class Synth:
                 "level": max(0.05, min(1.0, velocity / 127.0)) * 0.25,
                 "age": 0,
                 "released": False,
+                # Фаза живёт внутри голоса: на стыке блоков она должна
+                # продолжаться, иначе волна рвётся и слышен хрип.
+                "phase": 0.0,
             }
 
     def note_off(self, note: int) -> None:
@@ -79,12 +81,14 @@ class Synth:
                         finished.append(note)
                         continue
                     voice["level"] = float(amp)
-                wave = np.sin(2.0 * math.pi * voice["freq"] * t + self._phase)
+                phase = voice["phase"]
+                wave = np.sin(2.0 * math.pi * voice["freq"] * t + phase)
                 out += (wave * amp).astype(np.float32)
+                voice["phase"] = (phase
+                                  + 2.0 * math.pi * voice["freq"] * frames
+                                  / self.sample_rate) % (2.0 * math.pi)
             for note in finished:
                 del self._voices[note]
-        # Фаза общая — так соседние блоки не дают щелчков на стыке.
-        self._phase = (self._phase + 2.0 * math.pi * 440.0 * frames / self.sample_rate) % (2.0 * math.pi)
         return out
 
 
