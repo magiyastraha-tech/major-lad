@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import __version__, audio, config, effects, history, media, runlog, updater
+from . import (__version__, audio, config, effects, history, media, runlog,
+               sounds, updater)
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
@@ -74,9 +75,61 @@ def _pitch_word(semitones: int) -> str:
             f"на {n} {_plural(n, 'полутон', 'полутона', 'полутонов')}")
 
 
+def _duration_word(seconds: float) -> str:
+    """Длительность урока словами: 1 час 5 минут 3 секунды."""
+    total = max(0, int(round(seconds)))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} {_plural(hours, 'час', 'часа', 'часов')}")
+    if minutes:
+        parts.append(f"{minutes} {_plural(minutes, 'минута', 'минуты', 'минут')}")
+    if secs or not parts:
+        parts.append(f"{secs} {_plural(secs, 'секунда', 'секунды', 'секунд')}")
+    return " ".join(parts)
+
+
+# Строка, через которую программа говорит с экранным диктором. Одна на
+# приложение: создаётся в главном окне и живёт, пока оно открыто.
+_announcer: "Announcer | None" = None
+
+
+class Announcer(QLabel):
+    """Невидимая строка для объявлений экранному диктору.
+
+    Диктор Windows читает событие «тревога» по доступному имени объекта.
+    У списка чата имя постоянное — «История чата», поэтому новые сообщения
+    через него не озвучивались. Эта строка размером 1×1: текст сообщения
+    кладётся в её доступное имя, и диктор читает уже его.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(1, 1)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAccessibleName("Объявления программы")
+
+    def say(self, text: str) -> None:
+        if not text:
+            return
+        self.setAccessibleName(text)
+        self.setAccessibleDescription(text)
+        try:
+            QAccessible.updateAccessibility(
+                QAccessibleEvent(self, QAccessible.Event.Alert)
+            )
+        except Exception:
+            pass
+
+
 def announce(widget: QWidget, text: str) -> None:
     """Объявляет изменение экранному диктору. Ошибки не критичны."""
     widget.setAccessibleDescription(text)
+    if _announcer is not None:
+        _announcer.say(text)
+        return
     try:
         QAccessible.updateAccessibility(
             QAccessibleEvent(widget, QAccessible.Event.Alert)
@@ -627,6 +680,10 @@ class MainWindow(QMainWindow):
         self._loading_history = False
         self.video_sender: VideoSender | None = None
         self.connected = False
+        # Начало текущего урока: от него считается длительность, которая
+        # потом ложится строкой в чат и в историю ученика.
+        self._lesson_start: datetime | None = None
+        self._lesson_student = ""
         # Плеер: есть ли треки в Media и не идёт ли сейчас загрузка файла.
         self._tracks_available = False
         self._loading_track = False
@@ -663,6 +720,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Мажорный лад {__version__}")
         self.resize(900, 680)
         self.setAccessibleName("Мажорный лад, главное окно")
+
+        # Папка Sound и звуки по умолчанию. Свои файлы владелец кладёт туда
+        # же — существующие не перезаписываются.
+        sounds.ensure()
 
         self._build_ui()
         self._wire_signals()
@@ -709,6 +770,13 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         self.status_label.setAccessibleName("Состояние")
         layout.addWidget(self.status_label)
+
+        # Через эту строку идут все объявления диктору: у неё в доступном
+        # имени лежит сам текст, поэтому диктор читает сообщение целиком.
+        self.announcer = Announcer(central)
+        layout.addWidget(self.announcer)
+        global _announcer
+        _announcer = self.announcer
 
         # Видео собеседника
         self.video_label = QLabel()
@@ -1078,6 +1146,9 @@ class MainWindow(QMainWindow):
     def _on_connect_button(self) -> None:
         if self.is_teacher:
             if self.server is not None:
+                # Кабинет закрывают посреди урока: фиксируем длительность,
+                # пока история ученика ещё открыта.
+                self._lesson_finish()
                 self.server.stop()
                 self.server = None
                 self.engine.stop()
@@ -1106,8 +1177,40 @@ class MainWindow(QMainWindow):
             else:
                 self._connect()
 
+    # -- длительность урока --------------------------------------------------
+
+    def _lesson_begin(self, student: str = "") -> None:
+        """Запоминает начало урока. Повторный сигнал время не сдвигает."""
+        if self._lesson_start is not None:
+            return
+        self._lesson_start = datetime.now()
+        self._lesson_student = str(student or "")
+
+    def _lesson_finish(self) -> None:
+        """Пишет в чат и в историю, что урок закончился и сколько длился."""
+        started = self._lesson_start
+        if started is None:
+            return
+        self._lesson_start = None
+        length = _duration_word((datetime.now() - started).total_seconds())
+        name = self._lesson_student or self._history_student_name()
+        self._lesson_student = ""
+        if name:
+            text = (f"Урок закончен. Ученик: {name}. "
+                    f"Длительность: {length}.")
+        else:
+            text = f"Урок закончен. Длительность: {length}."
+        # Номер постоянный: заметку видно и в истории ученика, и после
+        # перезапуска программы.
+        self._append_chat("система", text,
+                          mid=f"note-{uuid.uuid4().hex}", keep=True, owner=name)
+        sounds.play("disconnect")
+
     def _on_ready(self, teacher: str) -> None:
         self._set_status(f"Соединение установлено: {teacher}.")
+        if not self.is_teacher:
+            self._lesson_begin(teacher)
+            sounds.play("connect")
         if self.client is not None and not self.is_teacher:
             # Переписка прошлых занятий приходит от преподавателя заново.
             # Строки от прошлого подключения надо убрать: иначе новая
@@ -1132,6 +1235,7 @@ class MainWindow(QMainWindow):
         # открываем — ответ может прийти и через минуту, а модальное окно
         # держало бы ученика и мешало ему работать.
         text = "Идёт урок с другим учеником. Спросил преподавателя, жду ответа."
+        sounds.play("busy")
         self._set_status(text)
         self._append_chat("система", text)
         announce(self.status_label, text)
@@ -1160,6 +1264,7 @@ class MainWindow(QMainWindow):
                     f"и ему придёт сообщение об окончании.")
         else:
             text = f"{name} просит подключиться. Подключить его?"
+        sounds.play("busy")
         self._append_chat("система", text)
         announce(self.status_label, text)
         box = QMessageBox(self)
@@ -1187,6 +1292,15 @@ class MainWindow(QMainWindow):
             "lost": "Связь с преподавателем прервалась. Проверьте, открыт ли кабинет.",
         }
         text = texts.get(reason, texts["lost"])
+        if self._lesson_start is not None:
+            # Ученик видит, сколько шёл урок, — та же строка уходит
+            # в переписку преподавателя.
+            length = _duration_word(
+                (datetime.now() - self._lesson_start).total_seconds())
+            self._lesson_start = None
+            self._lesson_student = ""
+            text = f"{text} Урок длился {length}."
+        sounds.play("disconnect")
         self.client = None
         self.connected = False
         self._stop_video()
@@ -1210,12 +1324,19 @@ class MainWindow(QMainWindow):
                 # закрытого соединения — он не должен перебивать «Кабинет
                 # закрыт».
                 if self.server is not None:
+                    self._lesson_finish()
                     self._set_status("Ученик отключился. Кабинет свободен.")
             else:
                 self.engine.stop()
                 self._start_audio(local_only=True)
             return
         if self.is_teacher:
+            # Если прошлый урок ещё не закрыт отдельным сигналом (ученика
+            # заменили), фиксируем его до начала нового.
+            self._lesson_finish()
+            self._lesson_begin(
+                getattr(self.server, "active_name", "") if self.server else "")
+            sounds.play("connect")
             self._set_status("Ученик подключился.")
             self._append_chat("система", "Ученик подключился.")
             if self.engine.running:
@@ -1972,28 +2093,39 @@ class MainWindow(QMainWindow):
             self.chat_list.insertItem(row, item)
         return item
 
-    def _append_chat(self, sender: str, text: str, mid: str = "") -> None:
+    def _append_chat(self, sender: str, text: str, mid: str = "",
+                     keep: bool = False, owner: str = "") -> None:
         """Добавляет строку в чат.
 
         У каждой строки есть номер отправителя и время. Время пишется после
         сообщения; у первого сообщения нового дня перед временем стоит дата,
-        чтобы было понятно, в какой день шёл разговор.
+        чтобы было понятно, в какой день шёл разговор. keep — строку надо
+        сохранить в историю, даже если это заметка программы (конец урока).
+        owner — в файл какого ученика её писать, если кабинет уже перешёл
+        к следующему.
         """
         self._add_chat_item(sender, text, mid)
-        self._record_history(sender, text, mid)
+        self._record_history(sender, text, mid, keep=keep, owner=owner)
         self._refresh_chat()
         self.chat_list.scrollToBottom()
+        if sender in ("система", "вы"):
+            return
+        # Настоящее входящее сообщение: звук и озвучка диктором. Свои
+        # реплики и строки состояния читать вслух не нужно.
+        sounds.play("message")
         announce(self.chat_list, f"Новое сообщение от {sender}: {text}")
 
-    def _record_history(self, sender: str, text: str, mid: str) -> None:
+    def _record_history(self, sender: str, text: str, mid: str,
+                        keep: bool = False, owner: str = "") -> None:
         """Запоминает сообщение переписки и сохраняет файл ученика.
 
-        В историю идут только настоящие сообщения: строки состояния и
-        подсказки программы разговором не считаются.
+        В историю идут настоящие сообщения. Строки состояния и подсказки
+        программы разговором не считаются — исключение keep: заметки
+        вроде окончания урока владелец потом просматривает.
         """
         if not self.is_teacher or not mid or mid.startswith("local-"):
             return
-        if sender == "система":
+        if sender == "система" and not keep:
             return
         # «вы» — подпись на экране преподавателя. В файле это должно быть
         # его имя: ученик прочтёт «вы» как себя самого.
@@ -2008,7 +2140,7 @@ class MainWindow(QMainWindow):
         if len(self._history) > history.MAX_MESSAGES:
             # Режем на месте: у сервера тот же список, его нельзя заменять.
             del self._history[:len(self._history) - history.MAX_MESSAGES]
-        student = self._history_student_name()
+        student = owner or self._history_student_name()
         if student:
             history.save(self._history, student)
 
@@ -2338,6 +2470,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         config.save(self.cfg)
         if self.is_teacher:
+            # Урок мог идти в момент закрытия: сначала заметка о конце,
+            # потом файл — она должна попасть в историю.
+            self._lesson_finish()
             # История пишется и по ходу разговора, но при закрытии сохраняем
             # ещё раз: так в файле точно последнее состояние. Папка History
             # и файл ученика — только у преподавателя.
