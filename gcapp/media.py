@@ -166,6 +166,25 @@ class Player:
             self.path = str(path)
             self.name = Path(path).name
 
+    def replace(self, data: np.ndarray, position: float | None = None) -> None:
+        """Подменяет звук, например после смены скорости или тона.
+
+        position — новое место в секундах; без него сохраняется прежняя
+        относительная позиция трека.
+        """
+        with self._lock:
+            old_size = self._data.size
+            old_pos = self._pos
+            self._data = np.ascontiguousarray(data, dtype=np.float32)
+            if position is not None:
+                self._pos = int(max(0.0, position) * self.rate)
+            elif old_size:
+                self._pos = int(self._data.size * (old_pos / old_size))
+            if self._pos >= self._data.size:
+                self._pos = self._data.size
+                self._playing = False
+                self._finished = True
+
     def clear(self) -> None:
         with self._lock:
             self._data = np.zeros(0, dtype=np.float32)

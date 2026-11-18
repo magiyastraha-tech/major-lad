@@ -25,9 +25,15 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import __version__, audio, config, history, media, runlog, updater
+from . import __version__, audio, config, effects, history, media, runlog, updater
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
+
+# Эффекты плеера: шаг скорости и её границы, предел сдвига тона.
+_SPEED_STEP = 0.1
+_SPEED_MIN = 0.5
+_SPEED_MAX = 1.5
+_PITCH_LIMIT = 6
 
 VOLUME_KEYS = [
     ("student", "Звук ученика"),
@@ -54,6 +60,18 @@ def _clock(seconds: float) -> str:
     """Время трека словами для диктора: 1:05, 12:30."""
     total = max(0, int(seconds))
     return f"{total // 60}:{total % 60:02d}"
+
+
+def _percent(speed: float) -> str:
+    """Скорость трека словами: 90 процентов."""
+    return f"{int(round(speed * 100))} процентов"
+
+
+def _pitch_word(semitones: int) -> str:
+    """Сдвиг тона словами: тон выше на 2 полутона."""
+    n = abs(int(semitones))
+    return (f"тон {'выше' if semitones > 0 else 'ниже'} "
+            f"на {n} {_plural(n, 'полутон', 'полутона', 'полутонов')}")
 
 
 def announce(widget: QWidget, text: str) -> None:
@@ -573,6 +591,8 @@ class MainWindow(QMainWindow):
     sig_ended = Signal(str)
     sig_track_ready = Signal(str, object)
     sig_track_error = Signal(str)
+    sig_effects_ready = Signal(object)
+    sig_effects_error = Signal(str)
     sig_media_list = Signal(object)
     sig_media_saved = Signal(str)
     sig_peer_video = Signal(bool)
@@ -612,6 +632,21 @@ class MainWindow(QMainWindow):
         self._loading_track = False
         # Подписи кнопок плеера переставляются только при смене состояния.
         self._player_button_state: tuple[bool, int] = (False, 0)
+        # Скорость и тон трека. Трек пересчитывается в фоне от исходного
+        # звука, который хранится в _track_source: так несколько нажатий
+        # подряд не накапливают искажения.
+        self._speed = 1.0
+        self._pitch = 0
+        self._track_source = None
+        self._effects_shown = False
+        self._effects_busy = False
+        self._effects_dirty = False
+        self._effects_key: tuple[float, int] = (1.0, 0)
+        self._effects_path = ""
+        # Скорость, с которой сейчас звучит загруженный трек.
+        self._effects_applied_speed = 1.0
+        # Что сказать диктору о кнопках сброса при следующем отчёте.
+        self._effects_hint = ""
         # Какую сторону регулируют ползунки: local — что слышу я,
         # peer — что слышит собеседник.
         self.volume_mode = str(cfg["audio"].get("volume_mode") or "local")
@@ -653,6 +688,10 @@ class MainWindow(QMainWindow):
             app.installEventFilter(self._shortcut_filter)
 
         if self.is_teacher:
+            # Общий History.txt из версий до 0.2.5 переезжает в папку
+            # History: переписка не теряется, а рядом с программой
+            # не остаётся файла, который больше ни к чему не относится.
+            history.retire_legacy_file()
             # Чат при запуске пустой: переписка появляется, когда вошёл
             # ученик, — у каждого своя.
             self._start_teacher()
@@ -788,12 +827,49 @@ class MainWindow(QMainWindow):
         self.forward_button.setAccessibleName("Вперёд")
         self.delete_track_button = QPushButton("Удалить трек")
         self.delete_track_button.setAccessibleName("Удалить трек")
+        self.effects_button = QPushButton("Эффекты")
+        self.effects_button.setAccessibleName("Эффекты")
         buttons_row.addWidget(self.play_button)
         buttons_row.addWidget(self.back_button)
         buttons_row.addWidget(self.forward_button)
         buttons_row.addWidget(self.delete_track_button)
+        buttons_row.addWidget(self.effects_button)
         buttons_row.addStretch(1)
         player_layout.addWidget(self.player_buttons_row)
+
+        # Кнопки эффектов прячутся за кнопкой «Эффекты»: в обычной работе
+        # они не нужны и только удлиняют обход. Внизу — сбросы, они
+        # появляются, только когда скорость или тон действительно изменены.
+        self.effects_row = QWidget()
+        effects_layout = QVBoxLayout(self.effects_row)
+        effects_layout.setContentsMargins(0, 0, 0, 0)
+        change_row = QHBoxLayout()
+        self.slow_button = QPushButton("Замедлить на 10%")
+        self.slow_button.setAccessibleName("Замедлить на 10%")
+        self.fast_button = QPushButton("Убыстрить на 10%")
+        self.fast_button.setAccessibleName("Убыстрить на 10%")
+        self.lower_button = QPushButton("Опустить на 1 полутон")
+        self.lower_button.setAccessibleName("Опустить на 1 полутон")
+        self.raise_button = QPushButton("Поднять на 1 полутон")
+        self.raise_button.setAccessibleName("Поднять на 1 полутон")
+        for button in (self.slow_button, self.fast_button,
+                       self.lower_button, self.raise_button):
+            change_row.addWidget(button)
+        change_row.addStretch(1)
+        reset_row = QHBoxLayout()
+        self.speed_reset_button = QPushButton("Сброс скорости")
+        self.speed_reset_button.setAccessibleName("Сброс скорости")
+        self.pitch_reset_button = QPushButton("Сброс тона")
+        self.pitch_reset_button.setAccessibleName("Сброс тона")
+        self.speed_reset_button.setVisible(False)
+        self.pitch_reset_button.setVisible(False)
+        reset_row.addWidget(self.speed_reset_button)
+        reset_row.addWidget(self.pitch_reset_button)
+        reset_row.addStretch(1)
+        effects_layout.addLayout(change_row)
+        effects_layout.addLayout(reset_row)
+        player_layout.addWidget(self.effects_row)
+        self.effects_row.setVisible(False)
 
         self.track_position_label = QLabel("")
         self.track_position_label.setAccessibleName("Позиция трека")
@@ -874,11 +950,20 @@ class MainWindow(QMainWindow):
         self.back_button.clicked.connect(lambda: self._seek(-1))
         self.forward_button.clicked.connect(lambda: self._seek(1))
         self.delete_track_button.clicked.connect(self._delete_track)
+        self.effects_button.clicked.connect(self._toggle_effects)
+        self.slow_button.clicked.connect(lambda: self._change_speed(-1))
+        self.fast_button.clicked.connect(lambda: self._change_speed(1))
+        self.lower_button.clicked.connect(lambda: self._change_pitch(-1))
+        self.raise_button.clicked.connect(lambda: self._change_pitch(1))
+        self.speed_reset_button.clicked.connect(self._reset_speed)
+        self.pitch_reset_button.clicked.connect(self._reset_pitch)
 
     def _wire_signals(self) -> None:
         self.sig_status.connect(self._set_status)
         self.sig_track_ready.connect(self._on_track_ready)
         self.sig_track_error.connect(self._on_track_error)
+        self.sig_effects_ready.connect(self._on_effects_ready)
+        self.sig_effects_error.connect(self._on_effects_error)
         self.sig_chat.connect(self._append_chat)
         self.sig_chat_delete.connect(self._on_chat_delete)
         self.sig_chat_edit.connect(self._on_chat_edit)
@@ -1434,6 +1519,7 @@ class MainWindow(QMainWindow):
         self._tracks_available = bool(tracks)
         self.player_buttons_row.setVisible(self._tracks_available)
         self.track_position_label.setVisible(self._tracks_available)
+        self.effects_row.setVisible(self._tracks_available and self._effects_shown)
         if not self._tracks_available:
             self.track_position_label.setText("")
         self._update_player_buttons()
@@ -1505,6 +1591,8 @@ class MainWindow(QMainWindow):
         player = self.engine.player
         if player.path == path:
             player.clear()
+            self._track_source = None
+            self._effects_applied_speed = 1.0
         try:
             Path(path).unlink()
         except OSError as exc:
@@ -1555,17 +1643,211 @@ class MainWindow(QMainWindow):
 
     def _on_track_ready(self, path: str, data) -> None:
         self._loading_track = False
+        # Исходный звук храним отдельно: скорость и тон всегда считаются
+        # от него, а не от уже обработанного варианта.
+        self._track_source = data
+        self._effects_path = path
+        if self._effects_active():
+            self._set_status("Применяю эффект…")
+            self._start_effects_worker()
+            return
+        self._start_playing_loaded(path, data)
+
+    def _start_playing_loaded(self, path: str, data, prefix: str = "",
+                              applied_speed: float = 1.0) -> None:
         player = self.engine.player
         player.set_track(path, data)
+        self._effects_applied_speed = applied_speed
         player.play()
         self._update_player_buttons()
         duration = _clock(player.duration())
         self.track_position_label.setText(f"0:00 из {duration}")
-        self._set_status(f"Играет: {player.name}. Позиция 0:00 из {duration}.")
+        text = f"Играет: {player.name}. Позиция 0:00 из {duration}."
+        self._set_status(f"{prefix} {text}" if prefix else text)
 
     def _on_track_error(self, text: str) -> None:
         self._loading_track = False
         self._set_status(text)
+
+    # -- эффекты плеера ------------------------------------------------------
+
+    def _toggle_effects(self) -> None:
+        """Показывает и прячет кнопки скорости и тона."""
+        self._effects_shown = not self._effects_shown
+        self.effects_row.setVisible(self._effects_shown and self._tracks_available)
+        if self._effects_shown:
+            text = f"Эффекты показаны. {self._effects_word().capitalize()}."
+            hint = self._resets_word()
+            self._set_status(f"{text} {hint}" if hint else text)
+        else:
+            self._set_status("Эффекты скрыты.")
+
+    def _effects_word(self) -> str:
+        parts = []
+        if abs(self._speed - 1.0) > 1e-6:
+            parts.append(f"скорость {_percent(self._speed)}")
+        if self._pitch:
+            parts.append(_pitch_word(self._pitch))
+        return ", ".join(parts) if parts else "обычные скорость и тон"
+
+    def _resets_word(self) -> str:
+        """Подсказка про кнопки сброса для диктора."""
+        speed = abs(self._speed - 1.0) > 1e-6
+        pitch = self._pitch != 0
+        if speed and pitch:
+            return "Доступны кнопки Сброс скорости и Сброс тона."
+        if speed:
+            return "Доступна кнопка Сброс скорости."
+        if pitch:
+            return "Доступна кнопка Сброс тона."
+        return ""
+
+    def _effects_active(self) -> bool:
+        return abs(self._speed - 1.0) > 1e-6 or self._pitch != 0
+
+    def _change_speed(self, direction: int) -> None:
+        old = self._speed
+        new = round(min(_SPEED_MAX, max(_SPEED_MIN,
+                                        old + direction * _SPEED_STEP)), 2)
+        if abs(new - old) < 1e-6:
+            self._set_status(
+                ("Быстрее" if direction > 0 else "Медленнее")
+                + f" уже нельзя: скорость {_percent(old)}.")
+            return
+        self._speed = new
+        self._apply_effects()
+
+    def _change_pitch(self, direction: int) -> None:
+        old = self._pitch
+        new = max(-_PITCH_LIMIT, min(_PITCH_LIMIT, old + direction))
+        if new == old:
+            self._set_status(
+                ("Выше" if direction > 0 else "Ниже")
+                + f" уже нельзя: {_pitch_word(old)}.")
+            return
+        self._pitch = new
+        self._apply_effects()
+
+    def _reset_speed(self) -> None:
+        if abs(self._speed - 1.0) < 1e-6:
+            return
+        self._speed = 1.0
+        self._apply_effects()
+
+    def _reset_pitch(self) -> None:
+        if not self._pitch:
+            return
+        self._pitch = 0
+        self._apply_effects()
+
+    def _update_effects_buttons(self) -> str:
+        """Кнопки сброса появляются, только когда есть что сбрасывать.
+
+        Возвращает фразу для диктора: появление и исчезновение кнопки
+        само по себе не проговаривается, а знать о ней нужно.
+        """
+        speed = abs(self._speed - 1.0) > 1e-6
+        pitch = self._pitch != 0
+        notes = []
+        if speed != (not self.speed_reset_button.isHidden()):
+            self.speed_reset_button.setVisible(speed)
+            notes.append("Появилась кнопка Сброс скорости." if speed
+                         else "Кнопка Сброс скорости убрана.")
+        if pitch != (not self.pitch_reset_button.isHidden()):
+            self.pitch_reset_button.setVisible(pitch)
+            notes.append("Появилась кнопка Сброс тона." if pitch
+                         else "Кнопка Сброс тона убрана.")
+        return " ".join(notes)
+
+    def _apply_effects(self) -> None:
+        """Пересчитывает трек под текущие скорость и тон."""
+        hint = self._update_effects_buttons()
+        self._effects_hint = hint
+        player = self.engine.player
+        path = self._selected_track()
+        if self._track_source is None or not (
+                player.has_track and player.path == path):
+            if self._effects_active():
+                text = (f"{self._effects_word().capitalize()}. "
+                        "Эффект применится, когда включите трек.")
+            else:
+                text = "Эффекты вернулись к обычным."
+            self._set_status(f"{text} {hint}" if hint else text)
+            return
+        self._effects_path = path
+        if self._effects_busy:
+            # Считается прошлый вариант. Когда закончит, увидит, что
+            # настройки уже другие, и пересчитает ещё раз.
+            self._effects_dirty = True
+            return
+        self._set_status("Применяю эффект…")
+        self._start_effects_worker()
+
+    def _start_effects_worker(self) -> None:
+        source = self._track_source
+        if source is None:
+            return
+        self._effects_busy = True
+        self._effects_dirty = False
+        self._effects_key = (self._speed, self._pitch)
+        threading.Thread(
+            target=self._effects_worker,
+            args=(source, self.engine.player.rate, self._speed, self._pitch),
+            daemon=True).start()
+
+    def _effects_worker(self, source, rate, speed, pitch) -> None:
+        try:
+            data = effects.apply(source, rate, speed, pitch)
+        except Exception as exc:
+            self.sig_effects_error.emit(
+                f"Не удалось применить эффект: {_explain(exc)}")
+            return
+        self.sig_effects_ready.emit(data)
+
+    def _on_effects_ready(self, data) -> None:
+        self._effects_busy = False
+        if self._effects_dirty or self._effects_key != (self._speed, self._pitch):
+            # Настройки поменялись, пока считали: устаревший вариант не
+            # ставим, считаем сразу новый.
+            self._start_effects_worker()
+            return
+        path = self._effects_path
+        if not path or path != self._selected_track():
+            # Трек успели сменить или удалить — результат уже не нужен.
+            return
+        player = self.engine.player
+        hint = self._effects_hint
+        self._effects_hint = ""
+        speed_used = self._effects_key[0]
+        if not (player.has_track and player.path == path):
+            # Трек ещё не был загружен: включаем сразу с эффектом.
+            prefix = f"{self._effects_word().capitalize()}."
+            if hint:
+                prefix = f"{prefix} {hint}"
+            self._start_playing_loaded(path, data, prefix=prefix,
+                                       applied_speed=speed_used)
+            return
+        was_playing = player.playing
+        # Место в исходном треке: текущая позиция умножается на скорость,
+        # с которой звучит загруженный вариант.
+        source_pos = player.position() * self._effects_applied_speed
+        player.replace(data, position=source_pos / speed_used)
+        if was_playing and player.position() < player.duration():
+            player.play()
+        self._effects_applied_speed = speed_used
+        self._update_player_buttons()
+        duration = _clock(player.duration())
+        position = player.position()
+        self.track_position_label.setText(f"{_clock(position)} из {duration}")
+        text = (f"{self._effects_word().capitalize()}. "
+                f"Позиция {_clock(position)} из {duration}.")
+        self._set_status(f"{text} {hint}" if hint else text)
+
+    def _on_effects_error(self, text: str) -> None:
+        self._effects_busy = False
+        hint = self._effects_hint
+        self._effects_hint = ""
+        self._set_status(f"{text} {hint}" if hint else text)
 
     def _seek(self, direction: int) -> None:
         player = self.engine.player

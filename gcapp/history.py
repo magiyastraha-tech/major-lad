@@ -143,6 +143,43 @@ def save(messages: list[dict], student: str) -> None:
     save_file(messages, file_for(student))
 
 
+# Имя, под которым старый общий файл переезжает в папку History. Версия
+# в имени — последняя, где такой файл писался: если папку откроют через
+# месяц, сразу понятно, откуда это взялось.
+_LEGACY_NAME = "Переписка до 0.2.5.txt"
+
+
+def retire_legacy_file() -> Path | None:
+    """Убирает старый общий History.txt, перенося его в папку History.
+
+    До версии 0.2.5 вся переписка лежала одним файлом рядом с программой.
+    Теперь она разложена по ученикам, и общий файл только мешает — его
+    переносим целиком, ничего не теряя. Возвращает новый путь, если файл
+    был, иначе None.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).resolve().parent.parent
+    legacy = base / "History.txt"
+    if not legacy.is_file():
+        return None
+    folder = history_dir()
+    target = folder / _LEGACY_NAME
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        i = 1
+        while target.exists():
+            target = folder / f"{Path(_LEGACY_NAME).stem} ({i}).txt"
+            i += 1
+        os.replace(legacy, target)
+    except OSError as exc:
+        runlog.write(f"Старый History.txt не удалось перенести: {exc}")
+        return None
+    runlog.write(f"Старый History.txt перенесён в History/{target.name}")
+    return target
+
+
 def page(messages: list[dict], before_id: str = "",
          limit: int = 50) -> tuple[list[dict], bool]:
     """Возвращает порцию истории и признак «раньше есть ещё».
