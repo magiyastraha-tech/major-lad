@@ -1779,6 +1779,9 @@ class MainWindow(QMainWindow):
             "replaced": "Урок завершён: преподаватель подключил другого ученика.",
             "rejected": "Извините, идёт урок с другим учеником. Попробуйте позже.",
             "lost": "Связь с преподавателем прервалась. Проверьте, открыт ли кабинет.",
+            "refused": "Подождите, кабинет пока закрыт. Преподаватель скоро его откроет.",
+            "timeout": "Преподаватель не отвечает. Проверьте адрес в настройках, "
+                       "Control+P.",
         }
         text = texts.get(reason, texts["lost"])
         if self._lesson_start is not None:
@@ -1789,7 +1792,10 @@ class MainWindow(QMainWindow):
             self._lesson_start = None
             self._lesson_student = ""
             text = f"{text} Урок длился {length}."
-        sounds.play("disconnect")
+        # «Кабинет закрыт» — не разрыв урока, а первая попытка подключиться:
+        # звук отключения там только пугает.
+        if reason not in ("refused", "timeout"):
+            sounds.play("disconnect")
         self.client = None
         self.connected = False
         self._stop_video()
@@ -1980,7 +1986,14 @@ class MainWindow(QMainWindow):
             self._set_status("Запрашиваю у преподавателя список треков.")
 
     def _on_media_list(self, tracks) -> None:
-        names = [str(t.get("name", "")) for t in (tracks or []) if t.get("name")]
+        # Сеть присылает уже готовые имена, но старые сборки могли отдавать
+        # словари — принимаем оба вида, чтобы импорт не падал с
+        # «'str' object has no attribute 'get'».
+        names = []
+        for t in (tracks or []):
+            name = str(t.get("name") or "") if isinstance(t, dict) else str(t or "")
+            if name:
+                names.append(name)
         if not names:
             self._set_status("У преподавателя нет треков в папке Media.")
             return

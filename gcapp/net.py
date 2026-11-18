@@ -34,6 +34,20 @@ def _chat_id() -> str:
     return uuid.uuid4().hex
 
 
+def _is_refused(exc: OSError) -> bool:
+    """Кабинет закрыт: на том конце никто не слушает порт.
+
+    У Windows это WinError 10061, у остальных — ECONNREFUSED."""
+    return getattr(exc, "winerror", None) == 10061 or getattr(
+        exc, "errno", None) in (111, 61)
+
+
+def _is_timeout(exc: OSError) -> bool:
+    """Сервер не ответил за отведённое время."""
+    return isinstance(exc, TimeoutError) or getattr(
+        exc, "winerror", None) == 10060 or getattr(exc, "errno", None) == 110
+
+
 # ---------------------------------------------------------------------------
 # Кадрирование сообщений: 4 байта длины + JSON в UTF-8.
 # ---------------------------------------------------------------------------
@@ -553,11 +567,25 @@ class Client:
 
     def connect(self) -> bool:
         self.disconnect()
+        # Новое подключение — новое отношение к разрыву: прошлое «Отключиться»
+        # больше не действует.
+        self._user_closed = False
         try:
             sock = socket.create_connection((self.host, self.port), timeout=6)
         except OSError as exc:
-            self.on_status(f"Не удалось подключиться к {self.host}: {exc}")
             self.on_peer(False)
+            # Кабинет закрыт — это не поломка, а обычная ситуация: ученик
+            # запустил программу раньше преподавателя. Технический текст
+            # ошибки человеку ничего не говорит.
+            if _is_refused(exc):
+                self.on_status("Кабинет пока закрыт. Подождите преподавателя.")
+                self.on_ended("refused")
+            elif _is_timeout(exc):
+                self.on_status("Преподаватель не отвечает. Проверьте, "
+                               "открыт ли кабинет и совпадает ли адрес.")
+                self.on_ended("timeout")
+            else:
+                self.on_status(f"Не удалось подключиться к {self.host}: {exc}")
             return False
 
         self._sock = sock
@@ -570,7 +598,7 @@ class Client:
             answer = recv_json(sock)
         except Exception as exc:
             self.on_status(f"Сервер не ответил: {exc}")
-            self.disconnect()
+            self.disconnect(sock)
             return False
         self._keepalive(sock)
         sock.settimeout(None)
@@ -637,16 +665,19 @@ class Client:
                 self._connected = True
                 self.on_peer(True)
                 self.on_ready("Преподаватель")
-                self._read_loop()
+                self._read_loop(sock)
                 return
         user = self._user_closed
-        self.disconnect()
-        self.on_peer(False)
-        if not user:
-            self.on_ended(reason)
+        self.disconnect(sock)
+        # Пока ждали ответа, могли подключиться заново: тогда это старое
+        # соединение, и трогать состояние нового нельзя.
+        if self._sock is None:
+            self.on_peer(False)
+            if not user:
+                self.on_ended(reason)
 
-    def _read_loop(self) -> None:
-        sock = self._sock
+    def _read_loop(self, sock: socket.socket | None = None) -> None:
+        sock = sock or self._sock
         reason = "lost"
         try:
             while True:
@@ -701,12 +732,15 @@ class Client:
             pass
         finally:
             user = self._user_closed
-            self.disconnect()
-            self.on_peer(False)
-            # Код окончания идёт последним: обработчик ставит финальный
-            # статус, и местный звук не перебивает его своим сообщением.
-            if not user:
-                self.on_ended(reason)
+            self.disconnect(sock)
+            # Старый поток чтения не должен объявлять о разрыве поверх
+            # нового подключения.
+            if self._sock is None:
+                self.on_peer(False)
+                # Код окончания идёт последним: обработчик ставит финальный
+                # статус, и местный звук не перебивает его своим сообщением.
+                if not user:
+                    self.on_ended(reason)
 
     def send_chat(self, text: str) -> str | None:
         """Возвращает номер сообщения или None, если отправить не вышло."""
@@ -824,9 +858,20 @@ class Client:
         self._user_closed = True
         self.disconnect()
 
-    def disconnect(self) -> None:
-        self._connected = False
-        sock, self._sock = self._sock, None
+    def disconnect(self, sock: socket.socket | None = None) -> None:
+        """Закрывает соединение.
+
+        sock — то соединение, которое завершилось само (поток чтения или
+        ожидания). Если к этому моменту уже подключились заново, новый сокет
+        трогать нельзя: иначе свежее подключение закрывалось старым потоком
+        и программа падала с WinError 10038 «операция на не-сокете».
+        """
+        current = self._sock
+        if sock is None:
+            sock = current
+        if current is not None and sock is current:
+            self._sock = None
+            self._connected = False
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)

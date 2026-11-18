@@ -5,7 +5,10 @@
 """
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -100,7 +103,61 @@ class RoleDialog(QDialog):
         self.accept()
 
 
+def _take_wait_pid() -> int | None:
+    """Вынимает из аргументов номер процесса, которого нужно дождаться.
+
+    Новая копия после обновления запускается сразу, ещё при работающей
+    старой, и ждёт здесь её выхода: иначе две копии на секунду подерутся
+    за порты и вторая может не открыть кабинет.
+    """
+    argv = list(sys.argv)
+    try:
+        index = argv.index("--wait-pid")
+    except ValueError:
+        return None
+    pid = None
+    if index + 1 < len(argv):
+        try:
+            pid = int(argv[index + 1])
+        except ValueError:
+            pid = None
+    del argv[index:index + 2]
+    sys.argv[:] = argv
+    return pid
+
+
+def _process_alive(pid: int) -> bool:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=flags,
+        )
+        return str(pid) in (out.stdout or "")
+    except Exception:
+        # Не смогли проверить — не держим человека: пусть открывается.
+        return False
+
+
+def _wait_previous(pid: int, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_alive(pid):
+            return
+        time.sleep(0.25)
+
+
 def main(forced_role: str | None = None) -> int:
+    wait_pid = _take_wait_pid()
+    if wait_pid:
+        _wait_previous(wait_pid)
     app = QApplication(sys.argv)
     app.setApplicationName("Мажорный лад")
     app.setApplicationVersion(__version__)

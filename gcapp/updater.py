@@ -109,50 +109,55 @@ def backup_path() -> Path | None:
 
 
 def cleanup_backup() -> None:
-    """Убирает файл предыдущей версии, оставшийся после обновления."""
+    """Убирает всё, что осталось от прошлого обновления.
+
+    После установки рядом с программой оставался .old.exe, а в Temp —
+    скачанный файл и папка обновления. Теперь они удаляются при первом
+    запуске новой версии.
+    """
     backup = backup_path()
-    if backup is None or not backup.exists():
+    if backup is None:
         return
     try:
-        backup.unlink()
+        if backup.exists():
+            backup.unlink()
+    except Exception:
+        pass
+    # Bat-файл старого способа перезапуска: он больше не нужен.
+    try:
+        bat = backup.with_name("restart_majorlad.bat")
+        if bat.exists():
+            bat.unlink()
+    except Exception:
+        pass
+    # Скачанный exe уже перенесён на место, папка обновления пуста.
+    try:
+        shutil.rmtree(Path(tempfile.gettempdir()) / "majorlad-update",
+                      ignore_errors=True)
     except Exception:
         pass
 
 
 def _start_later(exe: Path) -> bool:
-    """Запускает новый exe после того, как завершится текущий процесс.
+    """Запускает новую копию, которая сама дождётся выхода старой.
 
-    Если запустить сразу, две копии на секунду подерутся за порты, и новая
-    может не открыть кабинет. Поэтому рядом с программой кладётся короткий
-    bat-файл: он ждёт исчезновения процесса и только потом запускает
-    программу. Имя exe латинское, поэтому кодировка bat ни на что не влияет.
+    Раньше рядом клался bat-файл с ожиданием PID. На компьютерах с
+    кириллицей и пробелами в пути он срабатывал через раз: программа
+    закрывалась и не открывалась заново. Теперь новая копия стартует сразу
+    с номером старого процесса и ждёт его в main() до открытия окна —
+    так ей достаются свободные порты, и никакой bat не нужен.
     """
-    bat = exe.with_name("restart_majorlad.bat")
-    script = (
-        "@echo off\r\n"
-        ":wait\r\n"
-        f'tasklist /FI "PID eq {os.getpid()}" 2>nul | find "{os.getpid()}" >nul\r\n'
-        "if errorlevel 1 goto run\r\n"
-        "set /a tries+=1\r\n"
-        "if %tries% geq 60 goto run\r\n"
-        "timeout /t 1 /nobreak >nul\r\n"
-        "goto wait\r\n"
-        ":run\r\n"
-        f'start "" "%~dp0{exe.name}"\r\n'
-        'del /f /q "%~f0" >nul 2>&1\r\n'
-    )
     try:
-        bat.write_text(script, encoding="ascii")
-    except Exception:
-        return False
-    try:
+        args = [str(exe)]
+        if os.name == "nt":
+            args += ["--wait-pid", str(os.getpid())]
         flags = 0
         if os.name == "nt":
             flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
                 subprocess, "CREATE_NO_WINDOW", 0
             )
-        subprocess.Popen(["cmd", "/c", str(bat)], cwd=str(exe.parent),
-                         close_fds=True, creationflags=flags)
+        subprocess.Popen(args, cwd=str(exe.parent), close_fds=True,
+                         creationflags=flags)
     except Exception:
         return False
     return True
