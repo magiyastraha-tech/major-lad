@@ -2738,6 +2738,11 @@ class MainWindow(QMainWindow):
         self._update_mic_button()
         self._update_cam_button()
 
+    def _focus_message_edit(self) -> None:
+        """Ставит курсор в поле сообщения, не трогая уже набранный текст."""
+        self.message_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        announce(self.message_edit, "Поле сообщения")
+
     def _run_shortcut(self, action_id: str) -> None:
         """Выполняет действие, назначенное на сочетание клавиш."""
         if action_id.startswith("volume_"):
@@ -2769,6 +2774,7 @@ class MainWindow(QMainWindow):
             "speed_reset": self._reset_speed,
             "pitch_reset": self._reset_pitch,
             "join": self._join,
+            "chat_focus": self._focus_message_edit,
             "send": self._send_message,
             "send_file": self._send_file,
             "settings": self.open_settings,
