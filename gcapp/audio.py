@@ -283,9 +283,12 @@ class AudioEngine:
         self.on_video = on_video
         self.student = Ring(SAMPLE_RATE)
         self.sources: dict[str, Source] = {}
+        # Две независимые громкости: что слышу я и что слышит собеседник.
         self.volumes = {"student": 0.8, "in1": 1.0, "in2": 1.0,
                         "usb": 1.0, "midi": 0.8, "metronome": 0.6,
                         "player": 0.8}
+        self.volumes_peer = dict(self.volumes)
+        self.mic_muted = False
         self.synth: Synth | None = None
         self.midi: MidiInput | None = None
         self.metronome = Metronome(SAMPLE_RATE)
@@ -466,12 +469,20 @@ class AudioEngine:
 
     # -- громкость ----------------------------------------------------------
 
-    def set_volume(self, key: str, value_0_100: int) -> None:
+    def set_volume(self, key: str, value_0_100: int,
+                   peer: bool = False) -> None:
+        """peer=True — громкость на стороне собеседника, иначе своя."""
         level = max(0, min(100, int(value_0_100))) / 100.0
-        self.volumes[key] = level
-        source = self.sources.get(key)
-        if source is not None:
-            source.volume = level
+        target = self.volumes_peer if peer else self.volumes
+        target[key] = level
+        if peer:
+            source = self.sources.get(key)
+            if source is not None:
+                source.volume = level
+
+    def set_mic_muted(self, muted: bool) -> None:
+        """Микрофон выключен: входы не попадают в поток собеседнику."""
+        self.mic_muted = bool(muted)
 
     # -- микшер -------------------------------------------------------------
 
@@ -485,19 +496,23 @@ class AudioEngine:
                 synth_out = synth.render(frames)
             except Exception:
                 synth_out = None
-        midi_level = self.volumes.get("midi", 0.8)
-        metro_level = self.volumes.get("metronome", 0.6)
-        clicks = self.metronome.render(frames) * metro_level
+        midi_local = self.volumes.get("midi", 0.8)
+        midi_peer = self.volumes_peer.get("midi", 0.8)
+        metro_local = self.volumes.get("metronome", 0.6)
+        metro_peer = self.volumes_peer.get("metronome", 0.6)
+        clicks = self.metronome.render(frames)
 
         # Трек рендерится ровно один раз (внутри позиция) и идёт в обе
         # стороны: в наушники и в поток собеседнику. Поэтому у ученика нет
         # своего плеера, который надо синхронизировать — он слышит трек в
         # общем потоке с той же задержкой, что и голос.
-        track_level = self.volumes.get("player", 0.8)
         track = self.player.render(frames)
-        track_block = None
-        if track is not None and track_level > 0:
-            track_block = track * track_level
+        track_local = track_peer = None
+        if track is not None:
+            if self.volumes.get("player", 0.8) > 0:
+                track_local = track * self.volumes["player"]
+            if self.volumes_peer.get("player", 0.8) > 0:
+                track_peer = track * self.volumes_peer["player"]
 
         # В наушники: собеседник, своя MIDI-клавиатура и свой метроном.
         # Источники со входов сюда не идут — иначе микрофон поймает колонки
@@ -505,25 +520,29 @@ class AudioEngine:
         self.student.trim(STUDENT_KEEP, STUDENT_MAX)
         local = self.student.read(frames) * self.volumes["student"]
         if synth_out is not None:
-            local += synth_out * midi_level
-        local += clicks
-        if track_block is not None:
-            local[:track_block.size] += track_block
+            local += synth_out * midi_local
+        local += clicks * metro_local
+        if track_local is not None:
+            local[:track_local.size] += track_local
         np.clip(local, -1.0, 1.0, out=local)
         # Моно и стерео: в стерео потоке сигнал идёт в оба канала.
         outdata[:] = local[:, None]
 
         # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
-        mix = clicks.copy()
+        # Входы читаем всегда, даже при выключенном микрофоне: иначе буфер
+        # копил бы звук и после включения выплюнул старую задержку.
+        mix = clicks * metro_peer
         for source in self.sources.values():
             source.ring.trim(INPUT_KEEP, INPUT_MAX)
             block = source.ring.read(frames)
+            if self.mic_muted:
+                continue
             if source.volume > 0:
                 mix += block * source.volume
         if synth_out is not None:
-            mix += synth_out * midi_level
-        if track_block is not None:
-            mix[:track_block.size] += track_block
+            mix += synth_out * midi_peer
+        if track_peer is not None:
+            mix[:track_peer.size] += track_peer
 
         pcm = (np.clip(mix, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
         try:

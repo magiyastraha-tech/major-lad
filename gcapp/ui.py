@@ -11,14 +11,14 @@ import os
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAccessible, QAccessibleEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QSlider, QSpinBox, QSplitter,
-    QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-    QWidget,
+    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+    QPushButton, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
+    QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import __version__, audio, config, media, updater
@@ -26,15 +26,13 @@ from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
 VOLUME_KEYS = [
-    ("student", "Звук ученика", "Громкость звука, приходящего от собеседника."),
-    ("in1", "Аудиоустройство 1", "Громкость первого аудиовхода."),
-    ("in2", "Аудиоустройство 2", "Громкость второго аудиовхода."),
-    ("usb", "USB-устройство", "Громкость звука с USB-устройства, например с камеры."),
-    ("midi", "MIDI-устройство", "Громкость MIDI-клавиатуры."),
-    ("metronome", "Громкость метронома",
-     "Громкость щелчков метронома. Появляется, когда метроном включён."),
-    ("player", "Громкость трека",
-     "Громкость музыки из плеера. Появляется, когда в папке Media есть треки."),
+    ("student", "Звук ученика"),
+    ("in1", "Аудиоустройство 1"),
+    ("in2", "Аудиоустройство 2"),
+    ("usb", "USB-устройство"),
+    ("midi", "MIDI-устройство"),
+    ("metronome", "Громкость метронома"),
+    ("player", "Громкость трека"),
 ]
 
 
@@ -78,14 +76,51 @@ def _explain(exc: Exception) -> str:
     return text or exc.__class__.__name__
 
 
-def label_for(text: str, buddy: QWidget | None = None, description: str = "") -> QLabel:
+def label_for(text: str, buddy: QWidget | None = None) -> QLabel:
     lbl = QLabel(text)
     lbl.setAccessibleName(text)
-    if description:
-        lbl.setAccessibleDescription(description)
     if buddy is not None:
         lbl.setBuddy(buddy)
     return lbl
+
+
+class _ShortcutFilter(QObject):
+    """Control+A и Control+V на главном окне: микрофон и камера.
+
+    В полях ввода сочетания остаются своими: там Control+A выделяет
+    текст, а Control+V вставляет. В читаемом чате они работают как
+    глобальные — там выделять нечего.
+    """
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__(window)
+        self.window = window
+
+    @staticmethod
+    def _is_editable_field(focus) -> bool:
+        if isinstance(focus, (QLineEdit, QAbstractSpinBox)):
+            return True
+        if isinstance(focus, (QPlainTextEdit, QTextEdit)):
+            return not focus.isReadOnly()
+        return False
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() != QEvent.KeyPress:
+            return False
+        if event.isAutoRepeat() or not self.window.isActiveWindow():
+            return False
+        if not (event.modifiers() & Qt.ControlModifier):
+            return False
+        key = event.key()
+        if key not in (Qt.Key_A, Qt.Key_V):
+            return False
+        if self._is_editable_field(QApplication.focusWidget()):
+            return False
+        if key == Qt.Key_A:
+            self.window._toggle_mic()
+        else:
+            self.window._toggle_camera()
+        return True
 
 
 class SettingsDialog(QDialog):
@@ -109,9 +144,6 @@ class SettingsDialog(QDialog):
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setAccessibleName("Разделы настроек")
-        self.tree.setAccessibleDescription(
-            "Дерево из четырёх разделов. Стрелки вверх и вниз переключают раздел."
-        )
         self.stack = QStackedWidget()
         self.stack.setAccessibleName("Содержимое раздела")
 
@@ -166,17 +198,11 @@ class SettingsDialog(QDialog):
 
         self.name_edit = QLineEdit(self.cfg.get("name", ""))
         self.name_edit.setAccessibleName("Ваше имя")
-        self.name_edit.setAccessibleDescription(
-            "Это имя видит собеседник. Ученик может изменить его здесь в любой момент."
-        )
         self.name_edit.setPlaceholderText("Ваше имя")
         form.addRow(label_for("Имя", self.name_edit), self.name_edit)
 
         self.ip_edit = QLineEdit(self.cfg.get("server_ip", ""))
         self.ip_edit.setAccessibleName("Адрес преподавателя")
-        self.ip_edit.setAccessibleDescription(
-            "IP-адрес компьютера преподавателя. Заполняется учеником один раз."
-        )
         self.ip_edit.setPlaceholderText("например 192.168.1.100")
         form.addRow(label_for("Адрес преподавателя", self.ip_edit), self.ip_edit)
 
@@ -193,10 +219,6 @@ class SettingsDialog(QDialog):
 
         self.skip_combo = QComboBox()
         self.skip_combo.setAccessibleName("Шаг перемотки плеера")
-        self.skip_combo.setAccessibleDescription(
-            "На сколько секунд перематывают кнопки Назад и Вперёд в плеере. "
-            "Стрелки переключают значение."
-        )
         for seconds in (5, 10, 20):
             self.skip_combo.addItem(f"{seconds} секунд", seconds)
         saved_skip = int((self.cfg.get("player") or {}).get("skip", 5) or 5)
@@ -210,10 +232,6 @@ class SettingsDialog(QDialog):
         self.version_label.setAccessibleName(f"Версия программы {__version__}")
         self.update_button = QPushButton("Проверить обновления")
         self.update_button.setAccessibleName("Проверить обновления")
-        self.update_button.setAccessibleDescription(
-            "Проверяет, не вышла ли новая версия программы. "
-            "Если вышла, её можно скачать и установить прямо здесь."
-        )
         self.update_button.clicked.connect(self._check_updates)
         version_row.addWidget(self.version_label, 1)
         version_row.addWidget(self.update_button)
@@ -226,11 +244,10 @@ class SettingsDialog(QDialog):
 
         return page
 
-    def _device_combo(self, current: str, name: str, description: str) -> QComboBox:
+    def _device_combo(self, current: str, name: str) -> QComboBox:
         combo = QComboBox()
         combo.setEditable(False)
         combo.setAccessibleName(name)
-        combo.setAccessibleDescription(description)
         combo.addItem("Не выбрано", "")
         for dev in audio.list_input_devices():
             combo.addItem(dev, dev)
@@ -245,19 +262,13 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.setAccessibleName("Вкладки аудиовходов")
-        tabs.setAccessibleDescription(
-            "Четыре вкладки: аудиоустройство 1, аудиоустройство 2, MIDI-устройства, USB-устройство. "
-            "Переключаются Control+Tab."
-        )
 
         self.dev1_combo = self._device_combo(
-            self.cfg["audio"].get("device1", ""), "Аудиоустройство 1",
-            "Основная звуковая карта. Для гитары или микрофона.")
+            self.cfg["audio"].get("device1", ""), "Аудиоустройство 1")
         tabs.addTab(self._device_tab(self.dev1_combo), "Аудиоустройство 1")
 
         self.dev2_combo = self._device_combo(
-            self.cfg["audio"].get("device2", ""), "Аудиоустройство 2",
-            "Вторая звуковая карта или второй вход первой карты.")
+            self.cfg["audio"].get("device2", ""), "Аудиоустройство 2")
         tabs.addTab(self._device_tab(self.dev2_combo), "Аудиоустройство 2")
 
         midi_page = QWidget()
@@ -265,9 +276,6 @@ class SettingsDialog(QDialog):
         self.midi_box = QCheckBox("Использовать MIDI-клавиатуру")
         self.midi_box.setChecked(bool(self.cfg["audio"].get("midi_enabled", False)))
         self.midi_box.setAccessibleName("Использовать MIDI-клавиатуру")
-        self.midi_box.setAccessibleDescription(
-            "Включает встроенный синтезатор: нажатые ноты слышит и ученик."
-        )
         midi_form.addRow(self.midi_box)
 
         self.midi_combo = QComboBox()
@@ -283,16 +291,11 @@ class SettingsDialog(QDialog):
         self.midi_fixed_box.setChecked(
             bool(self.cfg["audio"].get("midi_fixed_velocity", False)))
         self.midi_fixed_box.setAccessibleName("Всегда полная громкость нот")
-        self.midi_fixed_box.setAccessibleDescription(
-            "Если включено, сила нажатия клавиши не учитывается: каждая нота "
-            "звучит одинаково громко, на полной velocity."
-        )
         midi_form.addRow(self.midi_fixed_box)
         tabs.addTab(midi_page, "MIDI-устройства")
 
         self.usb_combo = self._device_combo(
-            self.cfg["audio"].get("usb", ""), "USB-устройство",
-            "Звук с USB-камеры или другого USB-устройства.")
+            self.cfg["audio"].get("usb", ""), "USB-устройство")
         tabs.addTab(self._device_tab(self.usb_combo), "USB-устройство")
 
         layout.addWidget(tabs)
@@ -308,8 +311,7 @@ class SettingsDialog(QDialog):
     def _device_tab(self, combo: QComboBox) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
-        combo_label = label_for("Устройство", combo,
-                                "Стрелки вверх и вниз перебирают устройства.")
+        combo_label = label_for("Устройство", combo)
         form.addRow(combo_label, combo)
         return page
 
@@ -319,9 +321,6 @@ class SettingsDialog(QDialog):
         form = QFormLayout(page)
         self.out_combo = QComboBox()
         self.out_combo.setAccessibleName("Устройство вывода")
-        self.out_combo.setAccessibleDescription(
-            "Куда выводится звук: наушники, колонки, звуковая карта."
-        )
         self.out_combo.addItem("Системное по умолчанию", "")
         for dev in audio.list_output_devices():
             self.out_combo.addItem(dev, dev)
@@ -351,7 +350,6 @@ class SettingsDialog(QDialog):
         self.cam_spin.setRange(0, 9)
         self.cam_spin.setValue(int(self.cfg["video"].get("camera", 0)))
         self.cam_spin.setAccessibleName("Номер камеры")
-        self.cam_spin.setAccessibleDescription("Ноль — первая камера в системе.")
         form.addRow(label_for("Номер камеры", self.cam_spin), self.cam_spin)
 
         self.fps_spin = QSpinBox()
@@ -364,9 +362,6 @@ class SettingsDialog(QDialog):
         self.quality_spin.setRange(20, 95)
         self.quality_spin.setValue(int(self.cfg["video"].get("quality", 60)))
         self.quality_spin.setAccessibleName("Качество видео")
-        self.quality_spin.setAccessibleDescription(
-            "Чем выше, тем чётче картинка, но тем больше нагрузка на канал."
-        )
         form.addRow(label_for("Качество", self.quality_spin), self.quality_spin)
 
         self.show_remote_box = QCheckBox("Показывать видео собеседника")
@@ -514,6 +509,9 @@ class MainWindow(QMainWindow):
     sig_ended = Signal(str)
     sig_track_ready = Signal(str, object)
     sig_track_error = Signal(str)
+    sig_media_list = Signal(object)
+    sig_media_saved = Signal(str)
+    sig_peer_video = Signal(bool)
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -534,6 +532,14 @@ class MainWindow(QMainWindow):
         self._loading_track = False
         # Подписи кнопок плеера переставляются только при смене состояния.
         self._player_button_state: tuple[bool, int] = (False, 0)
+        # Какую сторону регулируют ползунки: local — что слышу я,
+        # peer — что слышит собеседник.
+        self.volume_mode = str(cfg["audio"].get("volume_mode") or "local")
+        if self.volume_mode not in ("local", "peer"):
+            self.volume_mode = "local"
+        self._mic_muted = bool(getattr(self.engine, "mic_muted", False))
+        self._cam_on = False
+        self._shortcut_filter: _ShortcutFilter | None = None
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
@@ -558,6 +564,13 @@ class MainWindow(QMainWindow):
 
         shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
         shortcut.activated.connect(self.open_settings)
+
+        # Control+A и Control+V — микрофон и камера. Фильтр стоит на
+        # приложении: в полях ввода он уступает выделению и вставке.
+        self._shortcut_filter = _ShortcutFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._shortcut_filter)
 
         if self.is_teacher:
             self._start_teacher()
@@ -589,11 +602,19 @@ class MainWindow(QMainWindow):
         vol_group = QGroupBox("Громкость")
         vol_group.setAccessibleName("Регуляторы громкости")
         vol_layout = QVBoxLayout(vol_group)
+        # Переключатель сторон: ползунки показывают либо мою громкость,
+        # либо громкость, которую получает собеседник.
+        self.volume_mode_button = QPushButton()
+        self.volume_mode_button.setCheckable(True)
+        self.volume_mode_button.setChecked(self.volume_mode == "peer")
+        self.volume_mode_button.clicked.connect(self._toggle_volume_mode)
+        vol_layout.addWidget(self.volume_mode_button)
         self.sliders: dict[str, QSlider] = {}
         self.slider_values: dict[str, QLabel] = {}
         self.slider_rows: dict[str, QWidget] = {}
         self.slider_titles: dict[str, str] = {}
-        for key, title, description in VOLUME_KEYS:
+        bus = self._volume_bus()
+        for key, title in VOLUME_KEYS:
             if key == "student":
                 title = "Звук ученика" if self.is_teacher else "Звук преподавателя"
             self.slider_titles[key] = title
@@ -606,13 +627,10 @@ class MainWindow(QMainWindow):
             name_label.setAccessibleName(title)
             slider = QSlider(Qt.Horizontal)
             slider.setRange(0, 100)
-            slider.setValue(int(self.cfg["audio"]["volumes"].get(key, 100)))
+            slider.setValue(int(bus.get(key, 100)))
             slider.setTickPosition(QSlider.TicksBelow)
             slider.setTickInterval(10)
             slider.setAccessibleName(title)
-            slider.setAccessibleDescription(
-                description + " Стрелки влево и вправо меняют громкость, Home и End — до предела."
-            )
             name_label.setBuddy(slider)
             value_label = QLabel(f"{slider.value()} процентов")
             value_label.setMinimumWidth(110)
@@ -627,7 +645,7 @@ class MainWindow(QMainWindow):
             slider.valueChanged.connect(
                 lambda value, k=key, t=title: self._on_volume(k, t, value)
             )
-        self._refresh_volume_visibility()
+        self._refresh_volume_mode()
         layout.addWidget(vol_group)
 
         # Метроном
@@ -645,16 +663,9 @@ class MainWindow(QMainWindow):
         self.bpm_spin = QSpinBox()
         self.bpm_spin.setRange(30, 300)
         self.bpm_spin.setAccessibleName("Темп, ударов в минуту")
-        self.bpm_spin.setAccessibleDescription(
-            "Темп метронома. Стрелки вверх и вниз меняют на один удар, "
-            "Page Up и Page Down — на десять. Можно набрать число с клавиатуры."
-        )
         self.beats_spin = QSpinBox()
         self.beats_spin.setRange(1, 12)
         self.beats_spin.setAccessibleName("Ритм, долей в такте")
-        self.beats_spin.setAccessibleDescription(
-            "Сколько долей в такте, например 4. Первая доля звучит выше и громче."
-        )
         metro_row.addWidget(label_for("Темп, ударов в минуту", self.bpm_spin))
         metro_row.addWidget(self.bpm_spin)
         metro_row.addSpacing(16)
@@ -672,19 +683,16 @@ class MainWindow(QMainWindow):
         track_row = QHBoxLayout()
         self.track_combo = QComboBox()
         self.track_combo.setAccessibleName("Трек")
-        self.track_combo.setAccessibleDescription(
-            "Список треков из папки Media рядом с программой. "
-            "Стрелки вверх и вниз перебирают список."
-        )
         track_row.addWidget(label_for("Трек", self.track_combo))
         track_row.addWidget(self.track_combo, 1)
         self.add_track_button = QPushButton("Добавить трек")
         self.add_track_button.setAccessibleName("Добавить трек")
-        self.add_track_button.setAccessibleDescription(
-            "Копирует выбранный mp3 или wav в папку Media рядом с программой. "
-            "Все треки из неё видны в списке."
-        )
         track_row.addWidget(self.add_track_button)
+        # Ученик забирает треки из кабинета преподавателя в свою Media.
+        self.import_button = QPushButton("Импортировать аудио")
+        self.import_button.setAccessibleName("Импортировать аудио")
+        self.import_button.setVisible(not self.is_teacher)
+        track_row.addWidget(self.import_button)
         player_layout.addLayout(track_row)
 
         self.player_buttons_row = QWidget()
@@ -698,9 +706,6 @@ class MainWindow(QMainWindow):
         self.forward_button.setAccessibleName("Вперёд на 5 секунд")
         self.delete_track_button = QPushButton("Удалить трек")
         self.delete_track_button.setAccessibleName("Удалить трек")
-        self.delete_track_button.setAccessibleDescription(
-            "Удаляет выбранный трек из папки Media. Спросит подтверждение."
-        )
         buttons_row.addWidget(self.play_button)
         buttons_row.addWidget(self.back_button)
         buttons_row.addWidget(self.forward_button)
@@ -710,9 +715,6 @@ class MainWindow(QMainWindow):
 
         self.track_position_label = QLabel("")
         self.track_position_label.setAccessibleName("Позиция трека")
-        self.track_position_label.setAccessibleDescription(
-            "Где сейчас играет трек: сколько прошло и сколько всего."
-        )
         player_layout.addWidget(self.track_position_label)
         self.player_buttons_row.setVisible(False)
         self.track_position_label.setVisible(False)
@@ -724,7 +726,6 @@ class MainWindow(QMainWindow):
         name_layout.setContentsMargins(0, 0, 0, 0)
         self.name_edit = QLineEdit(self.cfg.get("name", ""))
         self.name_edit.setAccessibleName("Ваше имя")
-        self.name_edit.setAccessibleDescription("Введите имя и нажмите Присоединиться.")
         self.name_edit.setPlaceholderText("Ваше имя")
         self.join_button = QPushButton("Присоединиться")
         self.join_button.setAccessibleName("Присоединиться к преподавателю")
@@ -741,13 +742,11 @@ class MainWindow(QMainWindow):
         self.chat_view = QPlainTextEdit()
         self.chat_view.setReadOnly(True)
         self.chat_view.setAccessibleName("История чата")
-        self.chat_view.setAccessibleDescription("История сообщений и файлов. Стрелки прокручивают.")
         chat_layout.addWidget(self.chat_view, 1)
 
         input_row = QHBoxLayout()
         self.message_edit = QLineEdit()
         self.message_edit.setAccessibleName("Сообщение")
-        self.message_edit.setAccessibleDescription("Введите сообщение и нажмите Enter.")
         self.send_button = QPushButton("Отправить")
         self.send_button.setAccessibleName("Отправить сообщение")
         self.file_button = QPushButton("Отправить файл")
@@ -765,8 +764,14 @@ class MainWindow(QMainWindow):
         self.settings_button.setAccessibleName("Настройки, Control P")
         self.connect_button = QPushButton("Открыть кабинет" if self.is_teacher else "Подключиться")
         self.connect_button.setAccessibleName(self.connect_button.text())
+        self.mic_button = QPushButton("Выключить микрофон (Control+A)")
+        self.mic_button.setAccessibleName("Выключить микрофон")
+        self.cam_button = QPushButton("Включить камеру (Control+V)")
+        self.cam_button.setAccessibleName("Включить камеру")
         bottom.addWidget(self.settings_button)
         bottom.addWidget(self.connect_button)
+        bottom.addWidget(self.mic_button)
+        bottom.addWidget(self.cam_button)
         bottom.addStretch(1)
         layout.addLayout(bottom)
 
@@ -781,6 +786,9 @@ class MainWindow(QMainWindow):
         self.bpm_spin.valueChanged.connect(self._on_metronome_value)
         self.beats_spin.valueChanged.connect(self._on_metronome_value)
         self.add_track_button.clicked.connect(self._add_track)
+        self.import_button.clicked.connect(self._import_audio)
+        self.mic_button.clicked.connect(self._toggle_mic)
+        self.cam_button.clicked.connect(self._toggle_camera)
         self.track_combo.currentIndexChanged.connect(self._on_track_changed)
         self.play_button.clicked.connect(self._toggle_play)
         self.back_button.clicked.connect(lambda: self._seek(-1))
@@ -798,6 +806,9 @@ class MainWindow(QMainWindow):
         self.sig_video.connect(self._on_video_frame)
         self.sig_join_request.connect(self._on_join_request)
         self.sig_ended.connect(self._on_ended)
+        self.sig_media_list.connect(self._on_media_list)
+        self.sig_media_saved.connect(self._on_media_saved)
+        self.sig_peer_video.connect(self._on_peer_video)
 
     # -- запуск ролей -------------------------------------------------------
 
@@ -811,6 +822,7 @@ class MainWindow(QMainWindow):
                 "система", f"{who} прислал файл: {os.path.basename(path)}"),
             on_peer=self.sig_peer.emit,
             on_join_request=self.sig_join_request.emit,
+            on_video_state=self.sig_peer_video.emit,
             port=int(self.cfg.get("server_port", 45800)),
         )
         if self.server.start():
@@ -861,6 +873,9 @@ class MainWindow(QMainWindow):
             on_busy=self.sig_busy.emit,
             on_peer=self.sig_peer.emit,
             on_ended=self.sig_ended.emit,
+            on_media_list=self.sig_media_list.emit,
+            on_media_saved=self.sig_media_saved.emit,
+            on_video_state=self.sig_peer_video.emit,
         )
         self._set_status(f"Подключаюсь к {host}…")
         # connect() может ждать до шести секунд — не держим интерфейс.
@@ -885,8 +900,10 @@ class MainWindow(QMainWindow):
                 self.server.stop()
                 self.server = None
                 self.engine.stop()
+                self._stop_video()
                 self.connected = False
                 self.connect_button.setText("Открыть кабинет")
+                self.connect_button.setAccessibleName("Открыть кабинет")
                 self._set_status("Кабинет закрыт.")
             else:
                 self._start_teacher()
@@ -896,6 +913,11 @@ class MainWindow(QMainWindow):
                 self.client = None
                 self.engine.stop()
                 self.connected = False
+                self._stop_video()
+                self._cam_on = False
+                self._update_cam_button()
+                self.connect_button.setText("Подключиться")
+                self.connect_button.setAccessibleName("Подключиться")
                 # После отключения местный звук остаётся: метроном и MIDI
                 # нужны и для самостоятельной работы.
                 self._start_audio(local_only=True)
@@ -973,6 +995,9 @@ class MainWindow(QMainWindow):
         text = texts.get(reason, texts["lost"])
         self.client = None
         self.connected = False
+        self._stop_video()
+        self._cam_on = False
+        self._update_cam_button()
         self.connect_button.setText("Подключиться")
         self.connect_button.setAccessibleName("Подключиться")
         self._set_status(text)
@@ -1040,62 +1065,188 @@ class MainWindow(QMainWindow):
                 self._start_video()
         return ok
 
-    def _start_video(self) -> None:
+    def _start_video(self, force: bool = False) -> bool:
         if self.video_sender is not None:
-            return
-        if not self.cfg["video"].get("enabled"):
-            return
+            return True
+        if not force and not self.cfg["video"].get("enabled"):
+            return False
         self.video_label.setVisible(bool(self.cfg["video"].get("show_remote", True)))
-        self.video_sender = VideoSender(
+        sender = VideoSender(
             camera=int(self.cfg["video"].get("camera", 0)),
             fps=int(self.cfg["video"].get("fps", 15)),
             quality=int(self.cfg["video"].get("quality", 60)),
             send_fn=self.engine.send_video_packet,
             log=self._log_threadsafe,
         )
-        ok, message = self.video_sender.start()
+        ok, message = sender.start()
         if not ok:
             self._log_threadsafe(message)
+            return False
+        self.video_sender = sender
+        self._cam_on = True
+        self._update_cam_button()
+        self._send_video_state(True)
+        return True
 
     def _stop_video(self) -> None:
+        had_camera = self.video_sender is not None
         if self.video_sender is not None:
             self.video_sender.stop()
             self.video_sender = None
         self.video_label.clear()
+        self._cam_on = False
+        self._update_cam_button()
+        if had_camera:
+            self._send_video_state(False)
+
+    def _send_video_state(self, on: bool) -> None:
+        """Сказать собеседнику, что камера включилась или погасла."""
+        try:
+            if self.is_teacher and self.server is not None:
+                self.server.send_video_state(on)
+            elif self.client is not None:
+                self.client.send_video_state(on)
+        except Exception:
+            pass
+
+    def _update_cam_button(self) -> None:
+        if self._cam_on:
+            text = "Выключить камеру (Control+V)"
+            name = "Выключить камеру"
+        else:
+            text = "Включить камеру (Control+V)"
+            name = "Включить камеру"
+        self.cam_button.setText(text)
+        self.cam_button.setAccessibleName(name)
+
+    def _toggle_camera(self) -> None:
+        if self._cam_on or self.video_sender is not None:
+            self._stop_video()
+            self._set_status("Камера выключена.")
+            return
+        if self._start_video(force=True):
+            self._set_status("Камера включена.")
+        else:
+            self._set_status(
+                "Камера не запустилась. Проверьте камеру в настройках видео.")
+
+    def _on_peer_video(self, on: bool) -> None:
+        """Собеседник выключил камеру — убираем застывший кадр."""
+        if not on:
+            self.video_label.clear()
+
+    # -- микрофон -----------------------------------------------------------
+
+    def _update_mic_button(self) -> None:
+        if self._mic_muted:
+            text = "Включить микрофон (Control+A)"
+            name = "Включить микрофон"
+        else:
+            text = "Выключить микрофон (Control+A)"
+            name = "Выключить микрофон"
+        self.mic_button.setText(text)
+        self.mic_button.setAccessibleName(name)
+
+    def _toggle_mic(self) -> None:
+        self._mic_muted = not self._mic_muted
+        self.engine.set_mic_muted(self._mic_muted)
+        self._update_mic_button()
+        self._set_status("Микрофон выключен." if self._mic_muted
+                         else "Микрофон включён.")
+
+    # -- импорт треков от преподавателя -------------------------------------
+
+    def _import_audio(self) -> None:
+        if self.client is None:
+            self._set_status("Импорт доступен при подключении к преподавателю.")
+            return
+        if self.client.request_media_list():
+            self._set_status("Запрашиваю у преподавателя список треков.")
+
+    def _on_media_list(self, tracks) -> None:
+        names = [str(t.get("name", "")) for t in (tracks or []) if t.get("name")]
+        if not names:
+            self._set_status("У преподавателя нет треков в папке Media.")
+            return
+        if len(names) == 1:
+            choice = names[0]
+        else:
+            choice, ok = QInputDialog.getItem(
+                self, "Импортировать аудио", "Трек:", names, 0, False)
+            if not ok or not choice:
+                return
+        if self.client is None or not self.client.request_media(choice):
+            self._set_status("Не удалось запросить трек: нет соединения.")
+            return
+        self._set_status(f"Скачиваю трек: {choice}.")
+
+    def _on_media_saved(self, path: str) -> None:
+        name = Path(str(path)).name
+        appeared = self._refresh_tracks(select=str(path))
+        text = f"Трек импортирован в папку Media: {name}."
+        if "player" in appeared:
+            text += " Плеер готов."
+        self._set_status(text)
+        self._append_chat("система", text)
 
     # -- громкость ----------------------------------------------------------
 
+    def _volume_bus(self) -> dict:
+        """Набор громкостей активного режима."""
+        if self.volume_mode == "peer":
+            return self.cfg["audio"].setdefault("volumes_peer", {})
+        return self.cfg["audio"].setdefault("volumes", {})
+
     def _on_volume(self, key: str, title: str, value: int) -> None:
-        self.engine.set_volume(key, value)
-        self.cfg["audio"]["volumes"][key] = int(value)
+        peer = self.volume_mode == "peer"
+        self.engine.set_volume(key, value, peer=peer)
+        self._volume_bus()[key] = int(value)
         self.slider_values[key].setText(f"{value} процентов")
-        self.slider_values[key].setAccessibleDescription(f"{title}: {value} процентов")
         self._save_timer.start()
 
     def _apply_volumes(self) -> None:
+        # Открыли звук — применяем обе стороны: ползунки показывают только
+        # одну, а собеседник должен слышать свою громкость с самого начала.
+        for peer in (False, True):
+            bus = (self.cfg["audio"].get("volumes_peer") if peer
+                   else self.cfg["audio"].get("volumes")) or {}
+            for key, value in bus.items():
+                self.engine.set_volume(key, int(value), peer=peer)
+
+    def _toggle_volume_mode(self) -> None:
+        self.volume_mode = "local" if self.volume_mode == "peer" else "peer"
+        self.cfg["audio"]["volume_mode"] = self.volume_mode
+        self._save_timer.start()
+        self._refresh_volume_mode()
+        self._set_status(f"{self.volume_mode_button.text()}.")
+
+    def _refresh_volume_mode(self) -> None:
+        """Подпись переключателя и значения ползунков под активный режим."""
+        peer = self.volume_mode == "peer"
+        if peer:
+            title = ("Громкость ученика" if self.is_teacher
+                     else "Громкость преподавателя")
+        else:
+            title = "Моя громкость"
+        self.volume_mode_button.setText(title)
+        self.volume_mode_button.setAccessibleName(title)
+        bus = self._volume_bus()
         for key, slider in self.sliders.items():
-            self.engine.set_volume(key, slider.value())
+            slider.blockSignals(True)
+            slider.setValue(int(bus.get(key, 100)))
+            slider.blockSignals(False)
+            self.slider_values[key].setText(f"{slider.value()} процентов")
+        self._refresh_volume_visibility()
 
     # -- метроном -----------------------------------------------------------
 
     def _update_metro_button(self) -> None:
         """Подпись кнопки, доступное имя и видимость полей темпа и ритма."""
         enabled = self.metro_button.isChecked()
-        bpm = self.bpm_spin.value()
-        beats = self.beats_spin.value()
         if enabled:
             self.metro_button.setText("Выключить метроном")
-            self.metro_button.setAccessibleDescription(
-                f"Метроном включён: {bpm} {_plural(bpm, 'удар', 'удара', 'ударов')} "
-                f"в минуту, {beats} {_plural(beats, 'доля', 'доли', 'долей')} в такте. "
-                "Нажмите, чтобы выключить."
-            )
         else:
             self.metro_button.setText("Включить метроном")
-            self.metro_button.setAccessibleDescription(
-                "Нажмите, чтобы включить метроном. Появятся поля темпа и ритма "
-                "и регулятор громкости метронома."
-            )
         self.metro_button.setAccessibleName(self.metro_button.text())
         self.metro_row.setVisible(enabled)
 
@@ -1350,21 +1501,12 @@ class MainWindow(QMainWindow):
         self.play_button.setText(play_text)
         self.play_button.setAccessibleName(
             "Остановить трек" if playing else "Играть трек")
-        self.play_button.setAccessibleDescription(
-            "Трек играет. Нажмите, чтобы остановить — ученик перестанет его слышать."
-            if playing else
-            "Включает выбранный трек. Его слышат и вы, и ученик."
-        )
         back = f"Назад на {skip} секунд"
         forward = f"Вперёд на {skip} секунд"
         self.back_button.setText(back)
         self.back_button.setAccessibleName(back)
-        self.back_button.setAccessibleDescription(
-            f"Возвращает трек на {skip} секунд назад.")
         self.forward_button.setText(forward)
         self.forward_button.setAccessibleName(forward)
-        self.forward_button.setAccessibleDescription(
-            f"Перематывает трек на {skip} секунд вперёд.")
 
     def _refresh_volume_visibility(self) -> list[str]:
         """Оставляет на экране только регуляторы выбранных устройств.
@@ -1374,11 +1516,14 @@ class MainWindow(QMainWindow):
         Возвращает ключи регуляторов, которые только что появились.
         """
         audio_cfg = self.cfg.get("audio", {})
+        peer = self.volume_mode == "peer"
         active = {
-            "student": True,
-            "in1": bool(str(audio_cfg.get("device1") or "").strip()),
-            "in2": bool(str(audio_cfg.get("device2") or "").strip()),
-            "usb": bool(str(audio_cfg.get("usb") or "").strip()),
+            # Свою сторону собеседник не регулирует, а его сторону —
+            # свои входы: поэтому наборы разные.
+            "student": not peer,
+            "in1": peer and bool(str(audio_cfg.get("device1") or "").strip()),
+            "in2": peer and bool(str(audio_cfg.get("device2") or "").strip()),
+            "usb": peer and bool(str(audio_cfg.get("usb") or "").strip()),
             "midi": bool(audio_cfg.get("midi_enabled")),
             "metronome": bool(self.cfg.get("metronome", {}).get("enabled")),
             "player": bool(self._tracks_available),
@@ -1481,6 +1626,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         config.save(self.cfg)
+        if self._shortcut_filter is not None:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self._shortcut_filter)
+            self._shortcut_filter = None
         self._stop_video()
         self.engine.stop()
         if self.server is not None:

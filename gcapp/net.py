@@ -14,6 +14,8 @@ import threading
 import time
 from pathlib import Path
 
+from . import media
+
 APP_PORT = 45800
 UDP_PORT = 45801
 # Сколько ждём решения преподавателя, если место занято. Дольше держать
@@ -85,13 +87,15 @@ class Server:
     """Кабинет преподавателя. Один активный ученик, остальные ждут."""
 
     def __init__(self, name: str, on_status=None, on_chat=None, on_file=None,
-                 on_peer=None, on_join_request=None, port: int = APP_PORT):
+                 on_peer=None, on_join_request=None, on_video_state=None,
+                 port: int = APP_PORT):
         self.name = name
         self.port = port
         self.on_status = on_status or (lambda *a: None)
         self.on_chat = on_chat or (lambda *a: None)
         self.on_file = on_file or (lambda *a: None)
         self.on_peer = on_peer or (lambda *a: None)
+        self.on_video_state = on_video_state or (lambda *a: None)
         # Второй ученик не входит молча и не висит в очереди: преподаватель
         # решает сам — заменить текущего или отказать.
         self.on_join_request = on_join_request or (lambda *a: None)
@@ -225,6 +229,16 @@ class Server:
             return False
         return session.send_file(path)
 
+    def send_video_state(self, on: bool) -> bool:
+        """Сообщаем ученику, что камера включается или гаснет.
+
+        Без этого у него замирает последний кадр, и он не понимает,
+        что камеру просто выключили."""
+        session = self.current()
+        if session is None:
+            return False
+        return session.send_json({"type": "video", "on": bool(on)})
+
     def _accept_loop(self) -> None:
         while self._running:
             try:
@@ -331,6 +345,28 @@ class _Session:
                     "from": "система",
                     "text": f"Файл получен: {os.path.basename(path)}",
                 })
+            elif kind == "media_list":
+                # Ученик просит список треков из папки Media преподавателя.
+                tracks = []
+                for p in media.list_tracks():
+                    try:
+                        tracks.append({"name": p.name, "size": p.stat().st_size})
+                    except OSError:
+                        continue
+                self.send_json({"type": "media_list", "tracks": tracks})
+            elif kind == "media_get":
+                # Ученик выбрал трек — отдаём его файлом, чтобы он лёг
+                # в его собственную папку Media.
+                name = str(msg.get("name") or "")
+                path = next((p for p in media.list_tracks() if p.name == name),
+                            None)
+                if path is None:
+                    self.send_json({"type": "media_error",
+                                    "text": "Трек не найден."})
+                else:
+                    self.send_media(path)
+            elif kind == "video":
+                self.server.on_video_state(bool(msg.get("on")))
         self.server.leave(self)
         self.close()
 
@@ -344,6 +380,27 @@ class _Session:
         try:
             send_json(self.conn, {"type": "file_start", "name": p.name,
                                   "size": len(data)}, self._send_lock)
+            with self._send_lock:
+                self.conn.sendall(data)
+            return True
+        except OSError:
+            self.close()
+            return False
+
+    def send_media(self, path: str) -> bool:
+        """Отправляет трек из папки Media. Пометка media говорит клиенту,
+        что файл нужно положить в Media, а не в папку принятых файлов."""
+        p = Path(path)
+        try:
+            data = p.read_bytes()
+        except OSError:
+            self.send_json({"type": "media_error",
+                            "text": "Не удалось прочитать трек."})
+            return False
+        try:
+            send_json(self.conn, {"type": "file_start", "name": p.name,
+                                  "size": len(data), "media": True},
+                      self._send_lock)
             with self._send_lock:
                 self.conn.sendall(data)
             return True
@@ -371,7 +428,8 @@ class Client:
     def __init__(self, name: str, host: str, port: int = APP_PORT,
                  on_status=None, on_chat=None, on_file=None,
                  on_ready=None, on_busy=None, on_peer=None,
-                 on_ended=None):
+                 on_ended=None, on_media_list=None, on_media_saved=None,
+                 on_video_state=None):
         self.name = name
         self.host = host
         self.port = port
@@ -384,6 +442,11 @@ class Client:
         # Код окончания: closed — кабинет закрыли, replaced — подключили
         # другого ученика, rejected — не пустили, lost — связь оборвалась.
         self.on_ended = on_ended or (lambda *a: None)
+        # Список треков преподавателя и трек, сохранённый в свою папку Media.
+        self.on_media_list = on_media_list or (lambda *a: None)
+        self.on_media_saved = on_media_saved or (lambda *a: None)
+        # Камера собеседника включилась или погасла.
+        self.on_video_state = on_video_state or (lambda *a: None)
         self._sock: socket.socket | None = None
         self._send_lock = threading.Lock()
         self._connected = False
@@ -499,9 +562,31 @@ class Client:
                 elif kind == "file_start":
                     size = int(msg.get("size") or 0)
                     data = recv_exact(sock, size)
-                    path = save_received(str(msg.get("name") or "файл"), data)
-                    self.on_file("Преподаватель", path)
-                    self.on_chat("система", f"Файл получен: {os.path.basename(path)}")
+                    if msg.get("media"):
+                        # Трек из папки Media преподавателя: кладём его
+                        # в свою Media, чтобы можно было сразу включить.
+                        try:
+                            path = media.import_track(
+                                str(msg.get("name") or "трек"), data)
+                        except OSError as exc:
+                            self.on_status(f"Не удалось сохранить трек: {exc}")
+                            continue
+                        self.on_media_saved(str(path))
+                    else:
+                        path = save_received(str(msg.get("name") or "файл"),
+                                             data)
+                        self.on_file("Преподаватель", path)
+                        self.on_chat("система",
+                                     f"Файл получен: {os.path.basename(path)}")
+                elif kind == "media_list":
+                    tracks = [str(t.get("name") or "")
+                              for t in (msg.get("tracks") or [])
+                              if t.get("name")]
+                    self.on_media_list(tracks)
+                elif kind == "media_error":
+                    self.on_status(str(msg.get("text") or "Трек не получен."))
+                elif kind == "video":
+                    self.on_video_state(bool(msg.get("on")))
                 elif kind == "ended":
                     reason = str(msg.get("reason") or "closed")
                     break
@@ -541,6 +626,45 @@ class Client:
                              "size": len(data)}, self._send_lock)
             with self._send_lock:
                 sock.sendall(data)
+            return True
+        except OSError:
+            self.disconnect()
+            return False
+
+    def request_media_list(self) -> bool:
+        """Спросить у преподавателя, какие треки есть в его папке Media."""
+        sock = self._sock
+        if sock is None or not self._connected:
+            self.on_status("Нет соединения — список треков не получен.")
+            return False
+        try:
+            send_json(sock, {"type": "media_list"}, self._send_lock)
+            return True
+        except OSError:
+            self.disconnect()
+            return False
+
+    def request_media(self, name: str) -> bool:
+        """Попросить преподавателя прислать трек в свою папку Media."""
+        sock = self._sock
+        if sock is None or not self._connected:
+            self.on_status("Нет соединения — трек не получен.")
+            return False
+        try:
+            send_json(sock, {"type": "media_get", "name": name},
+                      self._send_lock)
+            return True
+        except OSError:
+            self.disconnect()
+            return False
+
+    def send_video_state(self, on: bool) -> bool:
+        """Сообщить преподавателю, что камера включается или гаснет."""
+        sock = self._sock
+        if sock is None or not self._connected:
+            return False
+        try:
+            send_json(sock, {"type": "video", "on": bool(on)}, self._send_lock)
             return True
         except OSError:
             self.disconnect()

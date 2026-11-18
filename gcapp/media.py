@@ -57,6 +57,24 @@ def add_track(source: str | Path) -> Path:
     return target
 
 
+def import_track(name: str, data: bytes) -> Path:
+    """Сохраняет трек, пришедший от собеседника, в свою папку Media."""
+    name = Path(str(name or "")).name
+    if not name:
+        name = "трек.mp3"
+    if Path(name).suffix.lower() not in SUPPORTED:
+        name += ".mp3"
+    target = media_dir() / name
+    if target.exists():
+        stem, suffix = target.stem, target.suffix
+        i = 1
+        while target.exists():
+            target = media_dir() / f"{stem} ({i}){suffix}"
+            i += 1
+    target.write_bytes(data)
+    return target
+
+
 def track_duration(path: str | Path) -> float:
     import soundfile as sf
 

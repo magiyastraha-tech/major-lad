@@ -77,10 +77,8 @@ class RoleDialog(QDialog):
 
         teacher = QPushButton("Я преподаватель")
         teacher.setAccessibleName("Я преподаватель")
-        teacher.setAccessibleDescription("Открыть кабинет и принимать учеников.")
         student = QPushButton("Я ученик")
         student.setAccessibleName("Я ученик")
-        student.setAccessibleDescription("Подключиться к кабинету преподавателя.")
 
         teacher.clicked.connect(lambda: self._choose("teacher"))
         student.clicked.connect(lambda: self._choose("student"))
