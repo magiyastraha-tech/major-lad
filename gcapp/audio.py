@@ -268,6 +268,55 @@ def find_device(name: str, kind: str) -> int | None:
     return found[0] if found else None
 
 
+def output_candidates(name: str) -> list[int]:
+    """Все выходные устройства по порядку предпочтения.
+
+    Сначала выбранное в настройках, потом системное по умолчанию, потом все
+    остальные выходы — быстрый драйвер раньше медленного.
+
+    Перебирать все нужно потому, что «системное по умолчанию» на некоторых
+    машинах не открывается: это HDMI без подключённого монитора, отключённая
+    звуковая карта или драйвер, не принимающий нужную частоту. Раньше
+    программа в таком случае оставалась совсем без звука, хотя рабочие
+    устройства в системе были.
+    """
+    if sd is None:
+        return []
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except Exception:
+        return []
+    preferred: list[int] = []
+    if name:
+        preferred.extend(find_devices(name, "output"))
+    try:
+        default = int(sd.default.device[1])
+    except Exception:
+        default = -1
+    if 0 <= default < len(devices):
+        if devices[default]["max_output_channels"] > 0 and default not in preferred:
+            preferred.append(default)
+    rest: list[tuple[int, int]] = []
+    for index, dev in enumerate(devices):
+        if dev["max_output_channels"] <= 0 or index in preferred:
+            continue
+        rest.append((_hostapi_rank(dev, hostapis), index))
+    rest.sort()
+    return preferred + [index for _, index in rest]
+
+
+def device_name(index: int) -> str:
+    """Имя устройства по индексу — для лога. Индекс сам по себе ничего
+    не говорит, а имя владелец видит в настройках Windows."""
+    if sd is None:
+        return str(index)
+    try:
+        return str(sd.query_devices(index)["name"])
+    except Exception:
+        return str(index)
+
+
 def _stream_latency(stream) -> float | None:
     """Задержка потока в секундах. У дуплексного потока она приходит парой."""
     try:
@@ -340,55 +389,61 @@ class AudioEngine:
         threading.Thread(target=self._udp_loop, daemon=True).start()
         threading.Thread(target=self._send_loop, daemon=True).start()
 
-        out_indices = find_devices(output, "output") if output else []
-        if not out_indices:
-            try:
-                default = sd.default.device[1]
-                if isinstance(default, int) and default >= 0:
-                    out_indices = [default]
-            except Exception:
-                out_indices = []
+        if output and not find_devices(output, "output"):
+            self.log(f"Устройство вывода «{output}» не найдено — ищу другое.")
+        out_indices = output_candidates(output)
         # Звуковая карта может не принимать моно: тогда открываем стерео
         # и дублируем сигнал в оба канала. Драйверы перебираем от быстрого
-        # к медленному — WASAPI первым, MME последним.
+        # к медленному — WASAPI первым, MME последним. Если «низкая
+        # задержка» не принимается, пробуем обычную.
         out_error: Exception | None = None
+        tried: list[str] = []
         for index in out_indices:
+            label = device_name(index)
+            if label not in tried:
+                tried.append(label)
             for channels in (1, 2):
                 opened = False
                 for block in (AUDIO_BLOCK, BLOCK):
-                    stream = None
-                    try:
-                        stream = sd.OutputStream(
-                            device=index,
-                            channels=channels,
-                            samplerate=SAMPLE_RATE,
-                            blocksize=block,
-                            dtype="float32",
-                            latency="low",
-                            callback=self._out_callback,
-                        )
-                        stream.start()
-                        self._out = stream
-                        self._out_channels = channels
-                        latency = _stream_latency(stream)
-                        detail = f", задержка {latency:.3f} с" if latency is not None else ""
-                        self.log(f"Аудиовыход открыт: {output or index}, "
-                                 f"{channels} кан., блок {block}{detail}")
-                        opened = True
+                    for latency_mode in ("low", None):
+                        stream = None
+                        try:
+                            stream = sd.OutputStream(
+                                device=index,
+                                channels=channels,
+                                samplerate=SAMPLE_RATE,
+                                blocksize=block,
+                                dtype="float32",
+                                latency=latency_mode,
+                                callback=self._out_callback,
+                            )
+                            stream.start()
+                            self._out = stream
+                            self._out_channels = channels
+                            latency = _stream_latency(stream)
+                            detail = f", задержка {latency:.3f} с" if latency is not None else ""
+                            self.log(f"Аудиовыход открыт: {label}, "
+                                     f"{channels} кан., блок {block}{detail}")
+                            opened = True
+                            break
+                        except Exception as exc:
+                            out_error = exc
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except Exception:
+                                    pass
+                    if opened:
                         break
-                    except Exception as exc:
-                        out_error = exc
-                        if stream is not None:
-                            try:
-                                stream.close()
-                            except Exception:
-                                pass
                 if opened:
                     break
             if self._out is not None:
                 break
         if self._out is None:
             self.stop()
+            available = ", ".join(tried) if tried else "нет ни одного выходного устройства"
+            self.log(f"Аудиовыход не открылся. Пробовал: {available}. "
+                     f"Ошибка: {out_error}")
             return False, f"Не удалось открыть аудиовыход: {out_error}"
         latency = _stream_latency(self._out)
         if latency is not None and latency > 0.06:
