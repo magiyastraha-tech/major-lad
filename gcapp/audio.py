@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import socket
 import struct
 import threading
@@ -376,11 +377,25 @@ def _hostapi_rank(device: dict, hostapis: list) -> int:
     return len(HOSTAPI_PREFERENCE)
 
 
+# Номер копии устройства в имени Windows: «Наушники (2- Vault Green)».
+# Одно и то же устройство перечисляется под несколькими драйверами, и Windows
+# добавляет номер, чтобы имена не совпадали. Номер меняется от запуска
+# к запуску, поэтому сохранённое имя перестаёт находиться.
+_DUP_NUMBER = re.compile(r"\(\s*\d+\s*-\s*")
+
+
+def _device_key(name: str) -> str:
+    """Имя устройства без номера копии — для сравнения."""
+    return _DUP_NUMBER.sub("(", name or "").strip().lower()
+
+
 def find_devices(name: str, kind: str) -> list[int]:
     """Все устройства с этим именем, лучший драйвер первым.
 
     Имена переживают перезапуск, индексы — нет, поэтому в настройках хранится
-    имя, а индекс ищем каждый раз заново.
+    имя, а индекс ищем каждый раз заново. Если точного имени нет, ищем по
+    имени без номера копии: «Наушники (2- Vault Green)» находит
+    «Наушники (Vault Green)» и наоборот.
     """
     if sd is None or not name:
         return []
@@ -389,17 +404,26 @@ def find_devices(name: str, kind: str) -> list[int]:
         hostapis = sd.query_hostapis()
     except Exception:
         return []
-    found: list[tuple[int, int]] = []
-    for index, dev in enumerate(devices):
-        if dev["name"] != name:
-            continue
-        if kind == "input" and dev["max_input_channels"] <= 0:
-            continue
-        if kind == "output" and dev["max_output_channels"] <= 0:
-            continue
-        found.append((_hostapi_rank(dev, hostapis), index))
-    found.sort()
-    return [index for _, index in found]
+
+    def collect(exact: bool) -> list[tuple[int, int]]:
+        key = _device_key(name)
+        found: list[tuple[int, int]] = []
+        for index, dev in enumerate(devices):
+            dev_name = str(dev["name"])
+            if exact:
+                if dev_name != name:
+                    continue
+            elif _device_key(dev_name) != key:
+                continue
+            if kind == "input" and dev["max_input_channels"] <= 0:
+                continue
+            if kind == "output" and dev["max_output_channels"] <= 0:
+                continue
+            found.append((_hostapi_rank(dev, hostapis), index))
+        found.sort()
+        return [index for _, index in found]
+
+    return collect(True) or collect(False)
 
 
 def find_device(name: str, kind: str) -> int | None:
@@ -454,6 +478,23 @@ def output_candidates(name: str) -> list[int]:
         rest.append((_hostapi_rank(dev, hostapis), index))
     rest.sort()
     return preferred + [index for _, index in rest]
+
+
+def default_input_candidates() -> list[int]:
+    """Системный микрофон по умолчанию, быстрый драйвер первым."""
+    if sd is None:
+        return []
+    try:
+        devices = sd.query_devices()
+        index = int(sd.default.device[0])
+    except Exception:
+        return []
+    if not (0 <= index < len(devices)):
+        return []
+    if devices[index]["max_input_channels"] <= 0:
+        return []
+    found = find_devices(str(devices[index]["name"]), "input")
+    return found or [index]
 
 
 def device_name(index: int) -> str:
@@ -656,10 +697,18 @@ class AudioEngine:
             self.log(f"Внимание: задержка вывода {latency:.3f} с — "
                      f"похоже, выбран медленный драйвер (MME).")
 
-        for key, name in (devices or {}).items():
-            if not name:
-                continue
+        configured = {k: v for k, v in (devices or {}).items() if v}
+        for key, name in configured.items():
             indices = find_devices(name, "input")
+            if not indices and len(configured) == 1:
+                # Единственный выбранный микрофон пропал из списка — лучше
+                # открыть системный по умолчанию, чем остаться совсем без
+                # входа: собеседник тогда не слышит вообще ничего.
+                fallback = default_input_candidates()
+                if fallback:
+                    self.log(f"Вход «{name}» не найден — открываю системный "
+                             f"микрофон «{device_name(fallback[0])}».")
+                    indices = fallback
             if not indices:
                 self.log(f"Вход не найден: {name}")
                 continue
