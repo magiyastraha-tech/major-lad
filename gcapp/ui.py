@@ -30,8 +30,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import (__version__, audio, config, effects, history, media, runlog,
-               shortcuts, sounds, updater)
+from . import (__version__, audio, cameras, config, effects, history, media,
+               runlog, shortcuts, sounds, updater)
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
@@ -231,6 +231,71 @@ class _ShortcutFilter(QObject):
             return False
         self.window._run_shortcut(action)
         return True
+
+
+class ShortcutDialog(QDialog):
+    """Окно ввода сочетания клавиш.
+
+    Открывается Enter на действии в списке. Внутри одно поле и две
+    кнопки: диктору легко пройти Tab до «Принять» и нажать Пробел.
+    """
+
+    def __init__(self, title: str, combo: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Сочетание клавиш")
+        self.setAccessibleName(f"Сочетание клавиш для действия {title}")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        info = QLabel(f"{title}.\nНажмите нужное сочетание клавиш, "
+                      f"например Control+M.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.edit = QKeySequenceEdit(QKeySequence(combo or ""))
+        self.edit.setAccessibleName("Новое сочетание клавиш")
+        self.edit.setAccessibleDescription(
+            "Нажмите сочетание: Control, Alt или клавиша F1–F12 плюс буква. "
+            "Потом Tab до кнопки «Принять» и Пробел.")
+        try:
+            # Одно сочетание без цепочки: поле перестаёт ждать продолжения
+            # и показывает нажатое сразу.
+            self.edit.setMaximumSequenceLength(1)
+        except Exception:
+            pass
+        layout.addWidget(label_for("Новое сочетание", self.edit))
+        layout.addWidget(self.edit)
+
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setAccessibleName("Ошибка ввода сочетания")
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        self.ok_button = buttons.button(QDialogButtonBox.Ok)
+        self.ok_button.setText("Принять")
+        self.ok_button.setAccessibleName("Принять сочетание")
+        cancel = buttons.button(QDialogButtonBox.Cancel)
+        cancel.setText("Отмена")
+        cancel.setAccessibleName("Отмена")
+        buttons.accepted.connect(self._try_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _try_accept(self) -> None:
+        ok, error = shortcuts.combo_is_safe(self.edit.keySequence())
+        if not ok:
+            self.error_label.setText(error)
+            announce(self, error)
+            self.edit.setFocus()
+            return
+        self.error_label.setText("")
+        self.accept()
+
+    def combo(self) -> str:
+        return shortcuts.normalize(
+            self.edit.keySequence().toString(
+                QKeySequence.SequenceFormat.PortableText))
 
 
 class SettingsDialog(QDialog):
@@ -593,11 +658,33 @@ class SettingsDialog(QDialog):
         self.video_box.setAccessibleName("Включить видео")
         form.addRow(self.video_box)
 
-        self.cam_spin = QSpinBox()
-        self.cam_spin.setRange(0, 9)
-        self.cam_spin.setValue(int(self.cfg["video"].get("camera", 0)))
-        self.cam_spin.setAccessibleName("Номер камеры")
-        form.addRow(label_for("Номер камеры", self.cam_spin), self.cam_spin)
+        # Список камер с именами: «Встроенная камера», «USB-камера».
+        # Номер OpenCV спрятан в данных пункта. Камер не видно — остаётся
+        # обычная нумерация, как было раньше.
+        self.cam_combo = QComboBox()
+        self.cam_combo.setAccessibleName("Камера")
+        saved_camera = int(self.cfg["video"].get("camera", 0))
+        devices = cameras.list_cameras()
+        if devices:
+            for name, index in devices:
+                self.cam_combo.addItem(name, index)
+            chosen = self.cam_combo.findData(saved_camera)
+            if chosen < 0:
+                # Сохранённой камеры сейчас нет: не подменяем её молча
+                # другой, а показываем её отдельным пунктом.
+                self.cam_combo.addItem(f"Камера {saved_camera + 1}",
+                                       saved_camera)
+                chosen = self.cam_combo.count() - 1
+            self.cam_combo.setCurrentIndex(chosen)
+        else:
+            for index in range(4):
+                self.cam_combo.addItem(f"Камера {index + 1}", index)
+            self.cam_combo.setCurrentIndex(
+                min(saved_camera, self.cam_combo.count() - 1))
+        self.cam_combo.setAccessibleDescription(
+            "Список подключённых камер. Если нужной камеры нет, подключите "
+            "её до открытия настроек.")
+        form.addRow(label_for("Камера", self.cam_combo), self.cam_combo)
 
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 30)
@@ -655,8 +742,9 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(page)
 
         hint = QLabel(
-            "Выберите действие стрелками, нажмите нужное сочетание клавиш "
-            "и нажмите «Назначить». Подходят сочетания с Control, Alt или "
+            "Выберите действие стрелками и нажмите Enter. В открывшемся "
+            "окне нажмите нужное сочетание клавиш, затем Tab до кнопки "
+            "«Принять» и Пробел. Подходят сочетания с Control, Alt или "
             "клавиши с F1 по F12."
         )
         hint.setWordWrap(True)
@@ -668,25 +756,18 @@ class SettingsDialog(QDialog):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, action_id)
             self.shortcut_list.addItem(item)
-        self.shortcut_list.currentItemChanged.connect(
-            lambda *_: self._fill_shortcut_editor())
+        self.shortcut_list.itemActivated.connect(
+            lambda _item: self._edit_shortcut())
         layout.addWidget(self.shortcut_list, 1)
 
-        self.shortcut_edit = QKeySequenceEdit()
-        self.shortcut_edit.setAccessibleName("Новое сочетание клавиш")
-        edit_row = QHBoxLayout()
-        edit_row.addWidget(label_for("Новое сочетание", self.shortcut_edit))
-        edit_row.addWidget(self.shortcut_edit, 1)
-        layout.addLayout(edit_row)
-
         buttons = QHBoxLayout()
-        self.assign_button = QPushButton("Назначить")
+        self.assign_button = QPushButton("Изменить")
         self.assign_button.setAccessibleName(
-            "Назначить сочетание выбранному действию")
+            "Изменить сочетание выбранного действия")
         self.clear_button = QPushButton("Сбросить")
         self.clear_button.setAccessibleName(
             "Сбросить сочетание у выбранного действия")
-        self.assign_button.clicked.connect(self._assign_shortcut)
+        self.assign_button.clicked.connect(self._edit_shortcut)
         self.clear_button.clicked.connect(self._clear_shortcut)
         buttons.addWidget(self.assign_button)
         buttons.addWidget(self.clear_button)
@@ -716,22 +797,21 @@ class SettingsDialog(QDialog):
         if row >= 0:
             self.shortcut_list.setCurrentRow(row)
 
-    def _fill_shortcut_editor(self) -> None:
-        action_id = self._shortcut_action()
-        combo = shortcuts.resolved(self.shortcut_map, action_id)
-        self.shortcut_edit.setKeySequence(QKeySequence(combo or ""))
-
-    def _assign_shortcut(self) -> None:
+    def _edit_shortcut(self) -> None:
+        """Enter на действии (или кнопка «Изменить») — окно ввода."""
         action_id = self._shortcut_action()
         if not action_id:
+            announce(self.shortcut_list, "Сначала выберите действие в списке.")
             return
-        seq = self.shortcut_edit.keySequence()
-        ok, error = shortcuts.combo_is_safe(seq)
-        if not ok:
-            announce(self.shortcut_list, error)
+        titles = dict(shortcuts.all_actions(self.is_teacher))
+        title = titles.get(action_id, action_id)
+        combo = shortcuts.resolved(self.shortcut_map, action_id)
+        dialog = ShortcutDialog(title, combo, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        combo = shortcuts.normalize(
-            seq.toString(QKeySequence.SequenceFormat.PortableText))
+        self._apply_shortcut(action_id, dialog.combo())
+
+    def _apply_shortcut(self, action_id: str, combo: str) -> None:
         titles = dict(shortcuts.all_actions(self.is_teacher))
         # Одно сочетание — одно действие: у прежнего владельца оно
         # снимается, иначе нажатие срабатывало бы дважды.
@@ -879,7 +959,7 @@ class SettingsDialog(QDialog):
         cfg["shortcuts"] = dict(self.shortcut_map)
 
         cfg["video"]["enabled"] = self.video_box.isChecked()
-        cfg["video"]["camera"] = int(self.cam_spin.value())
+        cfg["video"]["camera"] = int(self.cam_combo.currentData() or 0)
         cfg["video"]["fps"] = int(self.fps_spin.value())
         cfg["video"]["quality"] = int(self.quality_spin.value())
         cfg["video"]["width"] = int(self.video_width_spin.value())
@@ -2799,9 +2879,9 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
         # То же, что видно в строке состояния, ложится в majorlad.log:
-        # по этому файлу видно, что случилось до ошибки.
+        # по этому файлу видно, что случилось до ошибки. Диктору статусные
+        # подсказки не читаем: они мешают и всё равно есть в логе.
         runlog.write(text)
-        announce(self.status_label, text)
 
     def _log_threadsafe(self, text: str) -> None:
         self.sig_status.emit(text)
