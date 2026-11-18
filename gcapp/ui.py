@@ -15,6 +15,11 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAccessible, QAccessibleEvent, QKeySequence, QPixmap, QShortcut
+
+try:  # Qt 6.8 и новее: «объявление» диктору не зависит от того, где фокус
+    from PySide6.QtGui import QAccessibleAnnouncementEvent
+except ImportError:  # на более старом Qt остаётся событие «тревога»
+    QAccessibleAnnouncementEvent = None
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
@@ -98,10 +103,11 @@ _announcer: "Announcer | None" = None
 class Announcer(QLabel):
     """Невидимая строка для объявлений экранному диктору.
 
-    Диктор Windows читает событие «тревога» по доступному имени объекта.
-    У списка чата имя постоянное — «История чата», поэтому новые сообщения
-    через него не озвучивались. Эта строка размером 1×1: текст сообщения
-    кладётся в её доступное имя, и диктор читает уже его.
+    Нужно, чтобы диктор проговорил текст, даже когда фокус стоит не в чате,
+    а, скажем, на регуляторе громкости. Qt 6.8 и новее умеет объявления
+    (Announcement) — диктор читает их, где бы ни был фокус. На более старом
+    Qt остаются события «тревога» и «сменилось имя» по доступному имени
+    этой строки.
     """
 
     def __init__(self, parent=None):
@@ -111,17 +117,37 @@ class Announcer(QLabel):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAccessibleName("Объявления программы")
 
-    def say(self, text: str) -> None:
+    def say(self, text: str, polite: bool = True) -> None:
         if not text:
             return
         self.setAccessibleName(text)
         self.setAccessibleDescription(text)
+        if QAccessibleAnnouncementEvent is not None:
+            if self._announce(text, polite):
+                return
+        for kind in (QAccessible.Event.NameChanged, QAccessible.Event.Alert):
+            try:
+                QAccessible.updateAccessibility(QAccessibleEvent(self, kind))
+            except Exception:
+                pass
+
+    def _announce(self, text: str, polite: bool) -> bool:
+        """Объявление через Qt. Если оно не поддержано — False."""
         try:
-            QAccessible.updateAccessibility(
-                QAccessibleEvent(self, QAccessible.Event.Alert)
-            )
+            event = QAccessibleAnnouncementEvent(self, text)
+        except Exception:
+            return False
+        try:
+            level = (QAccessibleAnnouncementEvent.Polite if polite
+                     else QAccessibleAnnouncementEvent.Assertive)
+            event.setPoliteness(level)
         except Exception:
             pass
+        try:
+            QAccessible.updateAccessibility(event)
+            return True
+        except Exception:
+            return False
 
 
 def announce(widget: QWidget, text: str) -> None:
@@ -130,12 +156,11 @@ def announce(widget: QWidget, text: str) -> None:
     if _announcer is not None:
         _announcer.say(text)
         return
-    try:
-        QAccessible.updateAccessibility(
-            QAccessibleEvent(widget, QAccessible.Event.Alert)
-        )
-    except Exception:
-        pass
+    for kind in (QAccessible.Event.NameChanged, QAccessible.Event.Alert):
+        try:
+            QAccessible.updateAccessibility(QAccessibleEvent(widget, kind))
+        except Exception:
+            pass
 
 
 def _explain(exc: Exception) -> str:
