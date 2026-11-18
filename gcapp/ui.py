@@ -302,6 +302,30 @@ class SettingsDialog(QDialog):
 
     # -- страницы -----------------------------------------------------------
 
+    def _refresh_midi_ports(self, announce_it: bool = True) -> None:
+        """Перечитывает список MIDI-устройств на ходу.
+
+        Клавиатуру часто включают уже после запуска программы, поэтому
+        список нужно уметь обновлять, не закрывая настройки.
+        """
+        current = self.midi_combo.currentData() or ""
+        ports = _midi_ports()
+        self.midi_combo.clear()
+        self.midi_combo.addItem("Первое доступное", "")
+        for port in ports:
+            self.midi_combo.addItem(port, port)
+        index = self.midi_combo.findData(current)
+        self.midi_combo.setCurrentIndex(index if index >= 0 else 0)
+        if not announce_it:
+            return
+        if ports:
+            announce(self.midi_combo,
+                     "Найдено MIDI-устройств: " + ", ".join(ports))
+        else:
+            announce(self.midi_combo,
+                     "MIDI-устройства не найдены. Проверь, что клавиатура "
+                     "включена и подключена, и нажми «Обновить» ещё раз.")
+
     def _page_general(self) -> QWidget:
         page = QWidget()
         page.setAccessibleName("Общее")
@@ -433,12 +457,24 @@ class SettingsDialog(QDialog):
 
         self.midi_combo = QComboBox()
         self.midi_combo.setAccessibleName("MIDI-устройство")
-        self.midi_combo.addItem("Первое доступное", "")
-        for port in _midi_ports():
-            self.midi_combo.addItem(port, port)
-        index = self.midi_combo.findData(self.cfg["audio"].get("midi_port", ""))
+        midi_row = QWidget()
+        midi_row_layout = QHBoxLayout(midi_row)
+        midi_row_layout.setContentsMargins(0, 0, 0, 0)
+        midi_row_layout.addWidget(self.midi_combo, 1)
+        refresh = QPushButton("Обновить")
+        refresh.setAccessibleName("Обновить список MIDI-устройств")
+        refresh.clicked.connect(self._refresh_midi_ports)
+        midi_row_layout.addWidget(refresh)
+        self._refresh_midi_ports(announce_it=False)
+        selected = str(self.cfg["audio"].get("midi_port", ""))
+        index = self.midi_combo.findData(selected)
+        if index < 0 and selected:
+            # Устройство было выбрано, но сейчас его нет — запоминаем выбор,
+            # чтобы оно подхватилось, когда его включат.
+            self.midi_combo.addItem(f"{selected} (не найдено)", selected)
+            index = self.midi_combo.count() - 1
         self.midi_combo.setCurrentIndex(index if index >= 0 else 0)
-        midi_form.addRow(label_for("Порт", self.midi_combo), self.midi_combo)
+        midi_form.addRow(label_for("Порт", self.midi_combo), midi_row)
 
         self.midi_fixed_box = QCheckBox("Всегда полная громкость нот")
         self.midi_fixed_box.setChecked(

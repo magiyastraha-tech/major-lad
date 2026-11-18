@@ -22,6 +22,24 @@ try:
 except Exception:  # pragma: no cover
     rtmidi = None
 
+def list_midi_ports() -> list[str]:
+    """Имена доступных MIDI-входов. Пустой список — устройства не найдены."""
+    if rtmidi is None:
+        return []
+    probe = None
+    try:
+        probe = rtmidi.MidiIn()
+        return [str(name) for name in probe.get_ports()]
+    except Exception:
+        return []
+    finally:
+        if probe is not None:
+            try:
+                del probe
+            except Exception:
+                pass
+
+
 MAX_VOICES = 24
 # Огибающая считается на каждом отсчёте, а не на каждом блоке: ступеньки
 # амплитуды на границе блоков дают призвук, который на слух читается как
@@ -176,6 +194,10 @@ class MidiInput:
                     if name == port_name:
                         index = i
                         break
+                else:
+                    self.log(f"MIDI-устройство «{port_name}» не найдено. "
+                             f"Доступны: {', '.join(str(p) for p in ports)}. "
+                             f"Открываю «{ports[0]}».")
             midi.open_port(index)
             midi.set_callback(self._on_message)
             try:
