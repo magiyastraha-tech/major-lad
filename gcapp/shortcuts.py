@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeyCombination, QKeySequence
+from PySide6.QtGui import QKeySequence
 
 # Цифровой блок Qt помечает отдельным флагом, но в строку сочетания его не
 # пишет. Своя пометка делает клавишу нумпада отличимой от такой же клавиши
@@ -120,19 +120,28 @@ def combo_from_event(event) -> str:
     key = event.key()
     if key in MODIFIER_KEYS:
         return ""
-    mods = event.modifiers()
-    pad = bool(mods & Qt.KeyboardModifier.KeypadModifier)
-    text = QKeySequence(
-        QKeyCombination(mods & ~Qt.KeyboardModifier.KeypadModifier, key)
-    ).toString(QKeySequence.SequenceFormat.PortableText)
-    if not text:
+    mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+    pad = bool(event.modifiers() & Qt.KeyboardModifier.KeypadModifier)
+    # Строку собираем сами, без QKeyCombination: в некоторых сборках
+    # PySide6 этого класса в QtGui нет, и программа падала при запуске.
+    # Имя самой клавиши знает QKeySequence, модификаторы дописываем в том
+    # же порядке, в каком их печатает Qt: Ctrl, Alt, Shift, Meta.
+    name = QKeySequence(key).toString(QKeySequence.SequenceFormat.PortableText)
+    if not name:
         return ""
-    if pad:
-        # Пометку ставим прямо перед клавишей: Ctrl+Num+1 читается диктором
-        # как «Control, нумпад 1».
-        head, sep, tail = text.rpartition("+")
-        text = (head + sep if sep else "") + NUMPAD_PREFIX + tail
-    return text
+    parts = []
+    if mods & Qt.KeyboardModifier.ControlModifier:
+        parts.append("Ctrl")
+    if mods & Qt.KeyboardModifier.AltModifier:
+        parts.append("Alt")
+    if mods & Qt.KeyboardModifier.ShiftModifier:
+        parts.append("Shift")
+    if mods & Qt.KeyboardModifier.MetaModifier:
+        parts.append("Meta")
+    # Пометку ставим прямо перед клавишей: Ctrl+Num+1 читается диктором
+    # как «Control, нумпад 1».
+    parts.append(NUMPAD_PREFIX + name if pad else name)
+    return "+".join(parts)
 
 
 def pretty(text: str) -> str:
