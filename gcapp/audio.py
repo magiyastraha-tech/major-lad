@@ -76,6 +76,11 @@ class Ring:
         self._read = 0
         self._count = 0
         self._lock = threading.Lock()
+        # Статистика для журнала: сколько звука потеряно на переполнении
+        # и сколько не хватило при чтении. По этим числам видно, хрипит
+        # звук из-за сети, буфера или перегруза входа.
+        self.overflows = 0
+        self.underruns = 0
 
     def write(self, data: np.ndarray) -> None:
         data = np.asarray(data, dtype=np.float32).reshape(-1)
@@ -89,6 +94,7 @@ class Ring:
             overflow = self._count + n - self._size
             if overflow > 0:
                 # Старое выбрасываем: лучше короткая задержка, чем растущая.
+                self.overflows += overflow
                 self._read = (self._read + overflow) % self._size
                 self._count -= overflow
             end = self._write + n
@@ -105,6 +111,10 @@ class Ring:
         out = np.zeros(n, dtype=np.float32)
         with self._lock:
             k = min(n, self._count)
+            if k < n:
+                # Не хватило звука: остаток остаётся тишиной. Частые провалы
+                # слышны как хрипы и щелчки.
+                self.underruns += n - k
             if k:
                 end = self._read + k
                 if end <= self._size:
@@ -141,6 +151,11 @@ class Ring:
         with self._lock:
             self._read = self._write = self._count = 0
 
+    def reset_stats(self) -> None:
+        with self._lock:
+            self.overflows = 0
+            self.underruns = 0
+
 
 # ---------------------------------------------------------------------------
 # Источник звука
@@ -171,6 +186,12 @@ class Source:
         self.volume = 1.0
         self.stream = None
         self.channels = 1
+        self.block = BLOCK
+        # Уровень входа за последний промежуток: максимальный отсчёт и
+        # сколько блоков упёрлось в предел. Перегруз на входе звучит как
+        # хрип ещё до передачи, и никакая сеть тут не виновата.
+        self.peak = 0.0
+        self.clipped = 0
 
     @property
     def stereo(self) -> bool:
@@ -204,6 +225,7 @@ class Source:
                         stream.start()
                         self.stream = stream
                         self.channels = channels
+                        self.block = block
                         if channels == 1 and self.ring_r is not None:
                             # Стерео просили, а устройство моно: правый канал
                             # будет копией левого.
@@ -219,6 +241,14 @@ class Source:
         raise last_error if last_error is not None else RuntimeError("вход не открыт")
 
     def _callback(self, indata, frames, time_info, status) -> None:
+        try:
+            peak = float(np.max(np.abs(indata)))
+            if peak > self.peak:
+                self.peak = peak
+            if peak >= 0.999:
+                self.clipped += 1
+        except Exception:
+            pass
         if self.ring_r is not None and indata.shape[1] > 1:
             self.ring.write(indata[:, 0].copy())
             self.ring_r.write(indata[:, 1].copy())
@@ -419,6 +449,17 @@ class AudioEngine:
         self._send_q: queue.Queue = queue.Queue(maxsize=8)
         self._seq = 0
         self._running = False
+        # Счётчики для журнала: потери по сети, провалы буфера, перегруз.
+        self._stat_t0 = 0.0
+        self._stat_connected = False
+        self._rx_packets = 0
+        self._rx_lost = 0
+        self._rx_ooo = 0
+        self._rx_last_seq: int | None = None
+        self._tx_packets = 0
+        self._tx_dropped = 0
+        self._tx_nopeer = 0
+        self._tx_clip = 0
 
     # -- запуск -------------------------------------------------------------
 
@@ -525,6 +566,16 @@ class AudioEngine:
                 self.sources[key] = source
             except Exception as exc:
                 self.log(f"Не удалось открыть вход «{name}»: {exc}")
+                continue
+            mode_label = {"ch1": "моно, канал 1",
+                          "ch2": "моно, канал 2",
+                          "stereo": "стерео"}.get(source.mode, source.mode)
+            in_latency = _stream_latency(source.stream)
+            in_detail = (f", задержка входа {in_latency:.3f} с"
+                         if in_latency is not None else "")
+            self.log(f"Вход открыт: {device_name(source.device_index)}, "
+                     f"{source.channels} кан., {mode_label}, "
+                     f"блок {source.block}{in_detail}")
 
         if midi_enabled:
             self.set_midi(True, midi_port, midi_fixed_velocity)
@@ -567,6 +618,15 @@ class AudioEngine:
 
     def stop(self) -> None:
         self._running = False
+        if self._stat_connected:
+            span = time.monotonic() - self._stat_t0
+            self._stat_connected = False
+            if span >= 5.0:
+                try:
+                    self.log(self._stats_text(span, final=True))
+                except Exception:
+                    pass
+        self._reset_stat_counters()
         if self._out is not None:
             try:
                 self._out.stop()
@@ -696,6 +756,15 @@ class AudioEngine:
             mix_l[:track_peer.size] += track_peer
             mix_r[:track_peer.size] += track_peer
 
+        # Перегруз в отправляемом миксе: всё, что выше единицы, срезается
+        # жёстко и на слух хрипит. Считаем такие блоки для журнала.
+        try:
+            if (float(np.max(np.abs(mix_l))) >= 1.0
+                    or float(np.max(np.abs(mix_r))) >= 1.0):
+                self._tx_clip += 1
+        except Exception:
+            pass
+
         # Стерео шлём, только если собеседник подтвердил, что понимает его.
         # Старая версия получила бы пакет с незнакомой меткой и оглохла.
         if stereo_out and self._peer_stereo:
@@ -712,6 +781,97 @@ class AudioEngine:
         try:
             self._send_q.put_nowait(packet_data)
         except queue.Full:
+            self._tx_dropped += 1
+
+    # -- статистика ---------------------------------------------------------
+
+    def _note_seq(self, data: bytes) -> None:
+        """Считает потери по номеру пакета.
+
+        UDP не пересылает потерянное, и дырка в нумерации — это ровно тот
+        звук, которого не хватило в буфере. Без этого числа нельзя отличить
+        хрип от перегруза входа от хрипа из-за сети.
+        """
+        self._rx_packets += 1
+        if len(data) < 8:
+            return
+        seq = struct.unpack_from("!I", data, 4)[0]
+        last = self._rx_last_seq
+        self._rx_last_seq = seq
+        if last is None:
+            return
+        diff = (seq - last) & 0xFFFFFFFF
+        if diff == 1:
+            return
+        if diff == 0:
+            self._rx_ooo += 1
+        elif diff < 1000:
+            self._rx_lost += diff - 1
+        else:
+            # Пакет из прошлого или собеседник перезапустил программу:
+            # это не потеря, считаем отдельно.
+            self._rx_ooo += 1
+
+    def _reset_stat_counters(self) -> None:
+        self._stat_t0 = 0.0
+        self._rx_packets = 0
+        self._rx_lost = 0
+        self._rx_ooo = 0
+        self._rx_last_seq = None
+        self._tx_packets = 0
+        self._tx_dropped = 0
+        self._tx_nopeer = 0
+        self._tx_clip = 0
+        self.student.reset_stats()
+        self.student_r.reset_stats()
+
+    def _stats_text(self, seconds: float, final: bool = False) -> str:
+        rings = [self.student, self.student_r]
+        peak = 0.0
+        in_clip = 0
+        for source in self.sources.values():
+            rings.append(source.ring)
+            if source.ring_r is not None:
+                rings.append(source.ring_r)
+            if source.peak > peak:
+                peak = source.peak
+            in_clip += source.clipped
+            source.peak = 0.0
+            source.clipped = 0
+        gaps_ms = sum(r.underruns for r in rings) * 1000.0 / SAMPLE_RATE
+        over_ms = sum(r.overflows for r in rings) * 1000.0 / SAMPLE_RATE
+        head = "Итог звука" if final else "Звук"
+        parts = [
+            f"принято {self._rx_packets} пакетов",
+            f"потеряно {self._rx_lost}",
+            f"не по порядку {self._rx_ooo}",
+            f"пустых буферов {gaps_ms:.0f} мс",
+            f"выброшено {over_ms:.0f} мс",
+            f"уровень входа {peak:.2f}",
+            f"перегруз входа {in_clip}",
+            f"отправлено {self._tx_packets}",
+            f"не ушло {self._tx_nopeer + self._tx_dropped}",
+            f"перегруз отправки {self._tx_clip}",
+        ]
+        return f"{head} за {seconds:.0f} с: " + ", ".join(parts) + "."
+
+    def _maybe_log_stats(self, now: float) -> None:
+        if self._peer is None:
+            return
+        if not self._stat_connected:
+            # Связь только что установилась: счёт с этого момента, иначе
+            # в статистику попал бы звук, ушедший в пустоту до подключения.
+            self._reset_stat_counters()
+            self._stat_connected = True
+            self._stat_t0 = now
+            return
+        if now - self._stat_t0 < 60.0:
+            return
+        span = now - self._stat_t0
+        self._stat_t0 = now
+        try:
+            self.log(self._stats_text(span))
+        except Exception:
             pass
 
     # -- сеть ---------------------------------------------------------------
@@ -757,10 +917,12 @@ class AudioEngine:
                 self._peer = addr
 
             if magic == MAGIC_AUDIO:
+                self._note_seq(data)
                 pcm = np.frombuffer(data[8:], dtype=np.int16)
                 self._recv_stereo = False
                 self.student.write(pcm.astype(np.float32) / 32768.0)
             elif magic == MAGIC_AUDIO_STEREO:
+                self._note_seq(data)
                 # Пары int16 вперемешку: левый, правый, левый, правый…
                 samples = np.frombuffer(data[8:], dtype=np.int16)
                 frames = samples.size // 2
@@ -779,6 +941,7 @@ class AudioEngine:
         caps_sent = 0
         while self._running and sock is not None:
             now = time.monotonic()
+            self._maybe_log_stats(now)
             if not self._is_server and self._peer is None and self._server_addr:
                 if now - hello_at > 1.0:
                     hello_at = now
@@ -802,12 +965,14 @@ class AudioEngine:
             except queue.Empty:
                 continue
             if self._peer is None:
+                self._tx_nopeer += 1
                 continue
             self._seq = (self._seq + 1) & 0xFFFFFFFF
             magic = MAGIC_AUDIO_STEREO if stereo else MAGIC_AUDIO
             packet = magic + struct.pack("!I", self._seq) + pcm
             try:
                 sock.sendto(packet, self._peer)
+                self._tx_packets += 1
             except OSError:
                 pass
 
