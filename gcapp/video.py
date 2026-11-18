@@ -88,21 +88,33 @@ class VideoSender:
                             self.quality = max(20, self.quality - 3)
                         elif len(data) < budget * 0.7 and self.quality < 95:
                             self.quality += 1
-                    self._send(data)
+                    self._send(data, interval, started + interval)
                 rest = interval - (time.monotonic() - started)
                 if rest > 0:
                     time.sleep(rest)
         finally:
             cap.release()
 
-    def _send(self, data: bytes) -> None:
+    def _send(self, data: bytes, interval: float = 0.0,
+              deadline: float = 0.0) -> None:
         total = (len(data) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
         if total > 65535:
             return
         self._frame_id = (self._frame_id + 1) & 0xFFFFFFFF
+        # Фрагменты растягиваем на время кадра. Залп из десятков пакетов
+        # подряд забивает канал, и звук рядом с ним захлёбывается — именно
+        # от этого трещало при включённой камере. Пауза между фрагментами
+        # делает видеопоток ровным, а звук проходит между ними.
+        gap = (interval / total) if (interval > 0 and total > 1) else 0.0
         for index in range(total):
             chunk = data[index * MAX_PAYLOAD:(index + 1) * MAX_PAYLOAD]
             self.send_fn(HEADER.pack(MAGIC_VIDEO, self._frame_id, index, total) + chunk)
+            if gap and index + 1 < total:
+                # Не выходим за время кадра: лучше короткий залп в конце,
+                # чем видео, которое отстаёт от звука.
+                rest = deadline - time.monotonic()
+                if rest > 0:
+                    time.sleep(min(gap, rest))
 
     def stop(self) -> None:
         self._running = False

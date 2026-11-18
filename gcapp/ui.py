@@ -640,6 +640,24 @@ class SettingsDialog(QDialog):
         form.addRow(label_for("Размер буфера звука", self.buffer_combo),
                     self.buffer_combo)
 
+        # Компенсация задержки: клик, MIDI и трек ждут, пока голос пройдёт
+        # микрофон и входной буфер, и только потом уходят собеседнику.
+        # Ноль — программа считает задержку сама по открытым устройствам.
+        self.tx_delay_spin = QSpinBox()
+        self.tx_delay_spin.setRange(0, 300)
+        self.tx_delay_spin.setSingleStep(5)
+        self.tx_delay_spin.setSuffix(" мс")
+        self.tx_delay_spin.setSpecialValueText("Автоматически")
+        self.tx_delay_spin.setValue(
+            int(self.cfg["audio"].get("tx_delay_ms", 0) or 0))
+        self.tx_delay_spin.setAccessibleName("Компенсация задержки")
+        self.tx_delay_spin.setAccessibleDescription(
+            "Ноль — программа сама измеряет задержку микрофона и буфера. "
+            "Если клик у собеседника всё равно опережает хлопок, увеличьте "
+            "значение на 10–30 мс.")
+        form.addRow(label_for("Компенсация задержки", self.tx_delay_spin),
+                    self.tx_delay_spin)
+
         hint = QLabel(
             "Для занятий нужны наушники: без них микрофон поймает колонки "
             "и вернёт эхо собеседнику."
@@ -956,6 +974,7 @@ class SettingsDialog(QDialog):
         cfg["audio"]["backing_source"] = (
             self.backing_combo.currentData() or "local")
         cfg["audio"]["buffer"] = str(self.buffer_combo.currentData() or "normal")
+        cfg["audio"]["tx_delay_ms"] = int(self.tx_delay_spin.value())
         cfg["shortcuts"] = dict(self.shortcut_map)
 
         cfg["video"]["enabled"] = self.video_box.isChecked()
@@ -1769,6 +1788,9 @@ class MainWindow(QMainWindow):
         """
         cfg_audio = self.cfg["audio"]
         audio.set_buffer_preset(str(cfg_audio.get("buffer", "normal")))
+        # Ручная компенсация нужна движку до старта: авто он посчитает сам,
+        # когда откроет устройства.
+        self.engine.tx_delay_ms = int(cfg_audio.get("tx_delay_ms", 0) or 0)
         devices = {
             "in1": cfg_audio.get("device1", ""),
             "in2": cfg_audio.get("device2", ""),
@@ -2983,6 +3005,9 @@ class MainWindow(QMainWindow):
         # Размер буфера — общий для обеих сторон обмена, перезапуск не нужен.
         self.engine.set_buffer_preset(
             str(self.cfg["audio"].get("buffer", "normal")))
+        # Компенсация задержки — тоже без перезапуска звука.
+        self.engine.set_tx_delay(
+            int(self.cfg["audio"].get("tx_delay_ms", 0) or 0))
         # Новый шаг перемотки из настроек — на кнопках плеера.
         self._update_player_buttons()
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.

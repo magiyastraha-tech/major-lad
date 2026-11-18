@@ -12,6 +12,9 @@ import sys
 from pathlib import Path
 
 DEFAULTS = {
+    # Версия схемы настроек: по ней load() понимает, какие старые
+    # умолчания пора привести к новым.
+    "settings_version": 2,
     "role": "",
     "name": "",
     "server_ip": "",
@@ -60,6 +63,10 @@ DEFAULTS = {
         # stable (80–160 мс). Чем больше, тем устойчивее связь и тем длиннее
         # задержка.
         "buffer": "normal",
+        # Компенсация задержки: клик, MIDI и трек уходят собеседнику с
+        # задержкой тракта, чтобы совпасть с голосом. 0 — автоматически,
+        # иначе значение в миллисекундах.
+        "tx_delay_ms": 0,
     },
     # Сочетания клавиш на кнопки и регуляторы главного окна.
     "shortcuts": {},
@@ -78,9 +85,11 @@ DEFAULTS = {
         "fps": 15,
         "quality": 60,
         # Размер кадра и предел потока в кбит/с (0 — без предела).
+        # По умолчанию поток ограничен: неограниченный JPEG забивает канал
+        # и трещит вместе со звуком.
         "width": 640,
         "height": 480,
-        "bitrate": 0,
+        "bitrate": 600,
         "show_remote": True,
     },
 }
@@ -116,12 +125,21 @@ def _merge(base: dict, data: dict) -> dict:
 
 def load() -> dict:
     path = config_path()
+    data = {}
     if path.exists():
         try:
-            return _merge(DEFAULTS, json.loads(path.read_text(encoding="utf-8")))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            pass
-    return copy.deepcopy(DEFAULTS)
+            data = {}
+    cfg = _merge(DEFAULTS, data if isinstance(data, dict) else {})
+    # До 0.3.9 видео по умолчанию шло без предела и забивало канал.
+    # Переводим старые настройки один раз; дальше выбор человека из
+    # «Настройки → Видео» не трогаем — даже «Без предела».
+    if int(cfg.get("settings_version", 1) or 1) < 2:
+        video = cfg.setdefault("video", {})
+        if not int(video.get("bitrate", 0) or 0):
+            video["bitrate"] = 600
+    return cfg
 
 
 def save(cfg: dict) -> None:

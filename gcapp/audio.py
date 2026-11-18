@@ -204,6 +204,49 @@ class Ring:
             self.underruns = 0
 
 
+class DelayLine:
+    """Задержка сигнала на заданное число отсчётов.
+
+    Нужна, чтобы клик, MIDI и трек уходили собеседнику не раньше голоса:
+    голос проходит микрофон и входной буфер и приходит позже, а сигналы,
+    рождённые в самом микшере, уходят сразу. Задерживаем ровно их — и в
+    потоке собеседника всё совпадает по времени.
+    """
+
+    def __init__(self) -> None:
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._size = 0
+        self._pos = 0
+
+    @property
+    def frames(self) -> int:
+        return self._size
+
+    def set_delay(self, frames: int) -> None:
+        frames = max(0, int(frames))
+        if frames == self._size:
+            return
+        self._buf = np.zeros(frames, dtype=np.float32)
+        self._size = frames
+        self._pos = 0
+
+    def process(self, data: np.ndarray) -> np.ndarray:
+        if self._size == 0 or data.size == 0:
+            return data
+        out = np.empty(data.size, dtype=np.float32)
+        done = 0
+        pos = self._pos
+        size = self._size
+        while done < data.size:
+            chunk = min(data.size - done, size - pos)
+            out[done:done + chunk] = self._buf[pos:pos + chunk]
+            self._buf[pos:pos + chunk] = data[done:done + chunk]
+            pos = (pos + chunk) % size
+            done += chunk
+        self._pos = pos
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Источник звука
 # ---------------------------------------------------------------------------
@@ -239,6 +282,10 @@ class Source:
         # хрип ещё до передачи, и никакая сеть тут не виновата.
         self.peak = 0.0
         self.clipped = 0
+        # Сколько отсчётов вход принял всего. По приросту видно, живой ли
+        # микрофон: устройство может открыться и молчать, а в настройках
+        # оно выглядит рабочим.
+        self.frames_in = 0
 
     @property
     def stereo(self) -> bool:
@@ -288,6 +335,7 @@ class Source:
         raise last_error if last_error is not None else RuntimeError("вход не открыт")
 
     def _callback(self, indata, frames, time_info, status) -> None:
+        self.frames_in += frames
         try:
             peak = float(np.max(np.abs(indata)))
             if peak > self.peak:
@@ -610,6 +658,16 @@ class AudioEngine:
         # собеседника: тогда его поток уже содержит дорожку и клик, а свой
         # плеер и метроном молчат, чтобы не было рассинхрона.
         self.backing_source = "local"
+        # Компенсация задержки. Голос проходит микрофон и входной буфер и
+        # приходит позже, а клик, MIDI и трек рождаются в микшере и уходят
+        # сразу. Задерживаем передающую копию этих сигналов на задержку
+        # тракта, чтобы у собеседника они совпали с голосом. 0 — авто.
+        self.tx_delay_ms = 0
+        self._tx_delay = DelayLine()
+        self._tx_delay_auto = 0
+        # Сколько отсчётов принял каждый вход: по приросту видно молчащий
+        # микрофон.
+        self._source_frames: dict[str, int] = {}
         # Настройки MIDI запоминаются, чтобы автоподхват знал, какой порт
         # ждать, когда клавиатуру включат уже после запуска программы.
         self._midi_enabled = False
@@ -762,6 +820,13 @@ class AudioEngine:
             self.log(f"Вход открыт: {device_name(source.device_index)}, "
                      f"{source.channels} кан., {mode_label}, "
                      f"блок {source.block}{in_detail}")
+
+        # Компенсация задержки считается по уже открытым устройствам:
+        # до этого задержка входа неизвестна.
+        delay = self._apply_tx_delay()
+        if self.sources:
+            how = "авто" if self.tx_delay_ms <= 0 else "вручную"
+            self.log(f"Компенсация задержки: {delay} мс ({how}).")
 
         if midi_enabled:
             self.set_midi(True, midi_port, midi_fixed_velocity)
@@ -926,7 +991,45 @@ class AudioEngine:
     def set_buffer_preset(self, name: str) -> str:
         """Набор буферов: low, normal или stable."""
         self.buffer_preset = set_buffer_preset(name)
+        # Размер буфера меняет автоматическую компенсацию задержки.
+        self._apply_tx_delay()
         return self.buffer_preset
+
+    def set_tx_delay(self, ms: int) -> int:
+        """Компенсация задержки передаваемого клика, MIDI и трека.
+
+        0 — автоматически: программа берёт задержку входа и буфера.
+        Другое значение — ручная подстройка в миллисекундах.
+        """
+        self.tx_delay_ms = max(0, min(1000, int(ms)))
+        return self._apply_tx_delay()
+
+    def _measure_tx_delay(self) -> int:
+        """Автоматическая задержка тракта в миллисекундах.
+
+        Голос появляется в отправляемом потоке позже клика ровно на столько:
+        задержка входного устройства плюс заполнение входного буфера.
+        Задержка вывода сюда не входит — она одинакова для всего потока.
+        Средний уровень буфера берём между границами гистерезиса.
+        """
+        if not self.sources:
+            # Входов нет — выравнивать не с чем.
+            return 0
+        in_lat = 0.0
+        for source in self.sources.values():
+            value = _stream_latency(source.stream)
+            if value is not None and value > in_lat:
+                in_lat = value
+        ring_frames = 0.5 * (INPUT_KEEP + INPUT_MAX)
+        return int(round(in_lat * 1000.0 + ring_frames * 1000.0 / SAMPLE_RATE))
+
+    def _apply_tx_delay(self) -> int:
+        """Пересчитывает задержку и перестраивает линию задержки."""
+        auto = self._measure_tx_delay()
+        self._tx_delay_auto = auto
+        value = auto if self.tx_delay_ms <= 0 else self.tx_delay_ms
+        self._tx_delay.set_delay(int(round(value * SAMPLE_RATE / 1000.0)))
+        return value
 
     # -- микшер -------------------------------------------------------------
 
@@ -1020,7 +1123,17 @@ class AudioEngine:
         # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
         # Входы читаем всегда, даже при выключенном микрофоне: иначе буфер
         # копил бы звук и после включения выплюнул старую задержку.
-        mix_l = clicks * metro_peer
+        #
+        # Клик, MIDI и трек рождаются здесь же в микшере и ушли бы к
+        # собеседнику сразу, а голос идёт через микрофон и входной буфер и
+        # приходит позже — на его стороне клик опережал бы хлопок. Поэтому
+        # задерживаем только эти сигналы, до голоса; входы идут как есть.
+        gen = clicks * metro_peer
+        if synth_out is not None:
+            gen += synth_out * midi_peer
+        if track_peer is not None:
+            gen[:track_peer.size] += track_peer
+        mix_l = self._tx_delay.process(gen)
         mix_r = mix_l.copy()
         stereo_out = False
         for source in self.sources.values():
@@ -1032,12 +1145,6 @@ class AudioEngine:
             if source.volume > 0:
                 mix_l += left * source.volume
                 mix_r += right * source.volume
-        if synth_out is not None:
-            mix_l += synth_out * midi_peer
-            mix_r += synth_out * midi_peer
-        if track_peer is not None:
-            mix_l[:track_peer.size] += track_peer
-            mix_r[:track_peer.size] += track_peer
 
         # Перегруз считаем до лимитера: именно эти блоки раньше срезались
         # жёстко и хрипели. Теперь их поджимает soft_limit, но число
@@ -1111,6 +1218,13 @@ class AudioEngine:
         self._stat_frames_t0 = self._out_frames
         self.student.reset_stats()
         self.student_r.reset_stats()
+        # Буферы входов тоже обнуляем: иначе «пустых буферов» копится с
+        # запуска программы и к окну статистики не относится.
+        for source in self.sources.values():
+            source.ring.reset_stats()
+            if source.ring_r is not None:
+                source.ring_r.reset_stats()
+            self._source_frames[source.key] = source.frames_in
 
     def _stats_text(self, seconds: float, final: bool = False) -> str:
         rings = [self.student, self.student_r]
@@ -1127,6 +1241,18 @@ class AudioEngine:
             source.clipped = 0
         gaps_ms = sum(r.underruns for r in rings) * 1000.0 / SAMPLE_RATE
         over_ms = sum(r.overflows for r in rings) * 1000.0 / SAMPLE_RATE
+        # Считаем за отрезок между записями в журнал, а не с запуска.
+        for ring in rings:
+            ring.reset_stats()
+        # Микрофон, открытый и молчащий, звук не портит, но создаёт
+        # впечатление, что он работает. Лучше честно написать в журнал.
+        for source in self.sources.values():
+            now_frames = source.frames_in
+            before = self._source_frames.get(source.key, now_frames)
+            self._source_frames[source.key] = now_frames
+            if now_frames - before <= 0:
+                self.log(f"Вход «{device_name(source.device_index)}» "
+                         f"не присылает звук.")
         # Сколько звука реально выведено за этот отрезок. Ниже 90 % — звук
         # шёл рывками, и это видно раньше, чем человек пожалуется на хрипы.
         frames = self._out_frames - self._stat_frames_t0
