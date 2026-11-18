@@ -344,16 +344,45 @@ class SettingsDialog(QDialog):
 
         return page
 
-    def _device_combo(self, current: str, name: str) -> QComboBox:
+    def _device_combo(self, current: str, name: str,
+                      values: list[str]) -> QComboBox:
         combo = QComboBox()
         combo.setEditable(False)
         combo.setAccessibleName(name)
-        combo.addItem("Не выбрано", "")
-        for dev in audio.list_input_devices():
-            combo.addItem(dev, dev)
-        index = combo.findData(current)
-        combo.setCurrentIndex(index if index >= 0 else 0)
+        self._fill_device_combo(combo, "Не выбрано", values, current)
         return combo
+
+    def _fill_device_combo(self, combo: QComboBox, first_label: str,
+                           values: list[str], keep: str = "") -> None:
+        """Перезаполняет список устройств, сохраняя выбранное.
+
+        Выбранного устройства может не оказаться в новом списке — например,
+        когда оно спрятано фильтром драйверов. Молча сбросить выбор нельзя:
+        человек нажмёт «Сохранить» и потеряет устройство. Поэтому оставляем
+        его отдельным пунктом.
+        """
+        if not keep:
+            keep = str(combo.currentData() or "")
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(first_label, "")
+        for dev in values:
+            combo.addItem(dev, dev)
+        index = combo.findData(keep)
+        if keep and index < 0:
+            combo.addItem(keep, keep)
+            index = combo.count() - 1
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _refresh_device_lists(self, show_all: bool) -> None:
+        """Перезаполняет списки при переключении «Показывать устаревшие»."""
+        self.cfg["audio"]["show_all_drivers"] = bool(show_all)
+        inputs = audio.list_input_devices(show_all)
+        for combo in (self.dev1_combo, self.dev2_combo, self.usb_combo):
+            self._fill_device_combo(combo, "Не выбрано", inputs)
+        self._fill_device_combo(self.out_combo, "Системное по умолчанию",
+                                audio.list_output_devices(show_all))
 
     def _page_inputs(self) -> QWidget:
         page = QWidget()
@@ -363,15 +392,18 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         tabs.setAccessibleName("Вкладки аудиовходов")
 
+        show_all = bool(self.cfg["audio"].get("show_all_drivers", False))
+        inputs = audio.list_input_devices(show_all)
+
         self.dev1_combo = self._device_combo(
-            self.cfg["audio"].get("device1", ""), "Аудиоустройство 1")
+            self.cfg["audio"].get("device1", ""), "Аудиоустройство 1", inputs)
         self.mode1_combo = self._mode_combo(
             self.cfg["audio"].get("mode1", "ch1"), "Режим канала 1")
         tabs.addTab(self._device_tab(self.dev1_combo, self.mode1_combo),
                     "Аудиоустройство 1")
 
         self.dev2_combo = self._device_combo(
-            self.cfg["audio"].get("device2", ""), "Аудиоустройство 2")
+            self.cfg["audio"].get("device2", ""), "Аудиоустройство 2", inputs)
         self.mode2_combo = self._mode_combo(
             self.cfg["audio"].get("mode2", "ch1"), "Режим канала 2")
         tabs.addTab(self._device_tab(self.dev2_combo, self.mode2_combo),
@@ -401,10 +433,20 @@ class SettingsDialog(QDialog):
         tabs.addTab(midi_page, "MIDI-устройства")
 
         self.usb_combo = self._device_combo(
-            self.cfg["audio"].get("usb", ""), "USB-устройство")
+            self.cfg["audio"].get("usb", ""), "USB-устройство", inputs)
         tabs.addTab(self._device_tab(self.usb_combo), "USB-устройство")
 
         layout.addWidget(tabs)
+
+        self.all_drivers_box = QCheckBox("Показывать устаревшие драйверы")
+        self.all_drivers_box.setChecked(show_all)
+        self.all_drivers_box.setAccessibleName("Показывать устаревшие драйверы")
+        self.all_drivers_box.setAccessibleDescription(
+            "Обычно в списках только WASAPI — современный драйвер Windows с "
+            "малой задержкой. Включи, если нужного устройства в списке нет.")
+        self.all_drivers_box.toggled.connect(self._refresh_device_lists)
+        layout.addWidget(self.all_drivers_box)
+
         hint = QLabel(
             "Список устройств обновляется при открытии настроек. "
             "Новую звуковую карту лучше подключить до запуска программы."
@@ -444,11 +486,11 @@ class SettingsDialog(QDialog):
         form = QFormLayout(page)
         self.out_combo = QComboBox()
         self.out_combo.setAccessibleName("Устройство вывода")
-        self.out_combo.addItem("Системное по умолчанию", "")
-        for dev in audio.list_output_devices():
-            self.out_combo.addItem(dev, dev)
-        index = self.out_combo.findData(self.cfg["audio"].get("output", ""))
-        self.out_combo.setCurrentIndex(index if index >= 0 else 0)
+        show_all = bool(self.cfg["audio"].get("show_all_drivers", False))
+        self._fill_device_combo(
+            self.out_combo, "Системное по умолчанию",
+            audio.list_output_devices(show_all),
+            str(self.cfg["audio"].get("output", "")))
         form.addRow(label_for("Устройство вывода", self.out_combo), self.out_combo)
 
         hint = QLabel(
@@ -635,6 +677,7 @@ class SettingsDialog(QDialog):
         cfg["audio"]["midi_enabled"] = self.midi_box.isChecked()
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
         cfg["audio"]["midi_fixed_velocity"] = self.midi_fixed_box.isChecked()
+        cfg["audio"]["show_all_drivers"] = self.all_drivers_box.isChecked()
 
         cfg["video"]["enabled"] = self.video_box.isChecked()
         cfg["video"]["camera"] = int(self.cam_spin.value())

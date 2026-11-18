@@ -283,30 +283,62 @@ class Source:
 # Устройства
 # ---------------------------------------------------------------------------
 
-def list_input_devices() -> list[str]:
-    if sd is None:
-        return []
-    try:
-        return [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
-    except Exception:
-        return []
-
-
-def list_output_devices() -> list[str]:
-    if sd is None:
-        return []
-    try:
-        return [d["name"] for d in sd.query_devices() if d["max_output_channels"] > 0]
-    except Exception:
-        return []
-
-
 # Одно и то же устройство Windows показывает под несколькими драйверами:
 # MME, DirectSound, WASAPI, WDM-KS. Имя у них одинаковое, а задержка разная —
 # MME тянет больше сотни миллисекунд, WASAPI в режиме низкой задержки даёт
 # десятки. Поэтому из совпадений по имени выбираем WASAPI, а MME оставляем
 # последним: он годится только если остальное не открылось.
 HOSTAPI_PREFERENCE = ("wasapi", "wdm-ks", "directsound", "mme")
+
+# В настройках по умолчанию показываем только WASAPI. Если показать все
+# драйверы, в списке одно и то же устройство стоит несколько раз под
+# одинаковым именем, и человек выбирает первое попавшееся — обычно это MME
+# со стомиллисекундной задержкой. Ученик так и попадал на 90 мс вместо 22.
+SHOW_HOSTAPIS = ("wasapi",)
+
+
+def _hostapi_name(device: dict, hostapis: list) -> str:
+    try:
+        return str(hostapis[device["hostapi"]]["name"]).lower()
+    except Exception:
+        return ""
+
+
+def _listed_devices(kind: str, show_all: bool) -> list[str]:
+    """Имена устройств для списков в настройках, без повторов."""
+    if sd is None:
+        return []
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except Exception:
+        return []
+    names: list[str] = []
+    for dev in devices:
+        channels = (dev["max_input_channels"] if kind == "input"
+                    else dev["max_output_channels"])
+        if channels <= 0:
+            continue
+        if not show_all:
+            api = _hostapi_name(dev, hostapis)
+            if not any(pref in api for pref in SHOW_HOSTAPIS):
+                continue
+        name = str(dev["name"])
+        if name not in names:
+            names.append(name)
+    if not names and not show_all:
+        # WASAPI не увидел ни одного устройства — так бывает со старой
+        # картой без нормального драйвера. Пустой список не оставляем.
+        return _listed_devices(kind, True)
+    return names
+
+
+def list_input_devices(show_all: bool = False) -> list[str]:
+    return _listed_devices("input", show_all)
+
+
+def list_output_devices(show_all: bool = False) -> list[str]:
+    return _listed_devices("output", show_all)
 
 
 def _hostapi_rank(device: dict, hostapis: list) -> int:
@@ -379,8 +411,18 @@ def output_candidates(name: str) -> list[int]:
     except Exception:
         default = -1
     if 0 <= default < len(devices):
-        if devices[default]["max_output_channels"] > 0 and default not in preferred:
-            preferred.append(default)
+        default_dev = devices[default]
+        if default_dev["max_output_channels"] > 0:
+            # Системное по умолчанию PortAudio отдаёт под тем драйвером,
+            # который перечислен первым, — обычно это MME со задержкой
+            # 90 мс, хотя то же устройство есть в WASAPI с 22 мс. Поэтому
+            # берём имя устройства и ищем его под всеми драйверами: WASAPI
+            # окажется первым.
+            for index in find_devices(str(default_dev["name"]), "output"):
+                if index not in preferred:
+                    preferred.append(index)
+            if default not in preferred:
+                preferred.append(default)
     rest: list[tuple[int, int]] = []
     for index, dev in enumerate(devices):
         if dev["max_output_channels"] <= 0 or index in preferred:

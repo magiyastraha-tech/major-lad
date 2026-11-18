@@ -29,6 +29,8 @@ DEFAULTS = {
         "midi_enabled": False,
         "midi_port": "",
         "midi_fixed_velocity": False,
+        # Показывать в списках все драйверы, а не только WASAPI.
+        "show_all_drivers": False,
         "volumes": {
             "student": 80,
             "in1": 100,
