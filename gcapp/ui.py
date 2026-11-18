@@ -700,10 +700,10 @@ class MainWindow(QMainWindow):
         buttons_row.setContentsMargins(0, 0, 0, 0)
         self.play_button = QPushButton("Играть")
         self.play_button.setAccessibleName("Играть трек")
-        self.back_button = QPushButton("Назад на 5 секунд")
-        self.back_button.setAccessibleName("Назад на 5 секунд")
-        self.forward_button = QPushButton("Вперёд на 5 секунд")
-        self.forward_button.setAccessibleName("Вперёд на 5 секунд")
+        self.back_button = QPushButton("Назад")
+        self.back_button.setAccessibleName("Назад")
+        self.forward_button = QPushButton("Вперёд")
+        self.forward_button.setAccessibleName("Вперёд")
         self.delete_track_button = QPushButton("Удалить трек")
         self.delete_track_button.setAccessibleName("Удалить трек")
         buttons_row.addWidget(self.play_button)
@@ -1501,12 +1501,11 @@ class MainWindow(QMainWindow):
         self.play_button.setText(play_text)
         self.play_button.setAccessibleName(
             "Остановить трек" if playing else "Играть трек")
-        back = f"Назад на {skip} секунд"
-        forward = f"Вперёд на {skip} секунд"
-        self.back_button.setText(back)
-        self.back_button.setAccessibleName(back)
-        self.forward_button.setText(forward)
-        self.forward_button.setAccessibleName(forward)
+        # Шаг перемотки остаётся в настройках, на кнопке он не нужен.
+        self.back_button.setText("Назад")
+        self.back_button.setAccessibleName("Назад")
+        self.forward_button.setText("Вперёд")
+        self.forward_button.setAccessibleName("Вперёд")
 
     def _refresh_volume_visibility(self) -> list[str]:
         """Оставляет на экране только регуляторы выбранных устройств.
