@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAccessible, QAccessibleEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
-    QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox,
+    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QPushButton, QSlider,
+    QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTextEdit, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import __version__, audio, config, media, updater
@@ -498,9 +502,64 @@ def _midi_ports() -> list[str]:
         return []
 
 
+MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
+          "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+
+class ChatList(QListWidget):
+    """Список сообщений чата.
+
+    Обычное текстовое поле диктор читает только по последней строке, а
+    список отдаёт каждое сообщение отдельным элементом — стрелки вверх и
+    вниз ходят по всей переписке. Клавиша «Меню» на выбранном сообщении
+    открывает правку и удаление, Delete удаляет сразу с подтверждением.
+    """
+
+    sig_delete = Signal()
+    sig_edit = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAccessibleName("История чата")
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.setWordWrap(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Delete:
+            self.sig_delete.emit()
+            event.accept()
+            return
+        # F2 — привычная клавиша переименования в Windows, тот же смысл.
+        if event.key() == Qt.Key_F2:
+            self.sig_edit.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        item = self.itemAt(event.pos())
+        if item is None:
+            super().contextMenuEvent(event)
+            return
+        self.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.setAccessibleName("Действия с сообщением")
+        edit = menu.addAction("Редактировать")
+        delete = menu.addAction("Удалить")
+        chosen = menu.exec(self.viewport().mapToGlobal(event.pos()))
+        if chosen is edit:
+            self.sig_edit.emit()
+        elif chosen is delete:
+            self.sig_delete.emit()
+
+
 class MainWindow(QMainWindow):
     sig_status = Signal(str)
-    sig_chat = Signal(str, str)
+    sig_chat = Signal(str, str, str)
+    sig_chat_delete = Signal(str)
+    sig_chat_edit = Signal(str, str)
     sig_peer = Signal(bool)
     sig_ready = Signal(str)
     sig_busy = Signal()
@@ -739,10 +798,8 @@ class MainWindow(QMainWindow):
         chat_group = QGroupBox("Чат")
         chat_group.setAccessibleName("Чат")
         chat_layout = QVBoxLayout(chat_group)
-        self.chat_view = QPlainTextEdit()
-        self.chat_view.setReadOnly(True)
-        self.chat_view.setAccessibleName("История чата")
-        chat_layout.addWidget(self.chat_view, 1)
+        self.chat_list = ChatList()
+        chat_layout.addWidget(self.chat_list, 1)
 
         input_row = QHBoxLayout()
         self.message_edit = QLineEdit()
@@ -800,6 +857,10 @@ class MainWindow(QMainWindow):
         self.sig_track_ready.connect(self._on_track_ready)
         self.sig_track_error.connect(self._on_track_error)
         self.sig_chat.connect(self._append_chat)
+        self.sig_chat_delete.connect(self._on_chat_delete)
+        self.sig_chat_edit.connect(self._on_chat_edit)
+        self.chat_list.sig_delete.connect(self._delete_chat_message)
+        self.chat_list.sig_edit.connect(self._edit_chat_message)
         self.sig_peer.connect(self._on_peer)
         self.sig_ready.connect(self._on_ready)
         self.sig_busy.connect(self._on_busy)
@@ -818,8 +879,10 @@ class MainWindow(QMainWindow):
             name,
             on_status=self.sig_status.emit,
             on_chat=self.sig_chat.emit,
+            on_chat_delete=self.sig_chat_delete.emit,
+            on_chat_edit=self.sig_chat_edit.emit,
             on_file=lambda who, path: self.sig_chat.emit(
-                "система", f"{who} прислал файл: {os.path.basename(path)}"),
+                "система", f"{who} прислал файл: {os.path.basename(path)}", ""),
             on_peer=self.sig_peer.emit,
             on_join_request=self.sig_join_request.emit,
             on_video_state=self.sig_peer_video.emit,
@@ -867,8 +930,10 @@ class MainWindow(QMainWindow):
             port=int(self.cfg.get("server_port", 45800)),
             on_status=self.sig_status.emit,
             on_chat=self.sig_chat.emit,
+            on_chat_delete=self.sig_chat_delete.emit,
+            on_chat_edit=self.sig_chat_edit.emit,
             on_file=lambda who, path: self.sig_chat.emit(
-                "система", f"{who} прислал файл: {os.path.basename(path)}"),
+                "система", f"{who} прислал файл: {os.path.basename(path)}", ""),
             on_ready=self.sig_ready.emit,
             on_busy=self.sig_busy.emit,
             on_peer=self.sig_peer.emit,
@@ -1541,13 +1606,13 @@ class MainWindow(QMainWindow):
         text = self.message_edit.text().strip()
         if not text:
             return
-        sent = False
+        mid = None
         if self.is_teacher and self.server is not None:
-            sent = self.server.send_chat(text)
+            mid = self.server.send_chat(text)
         elif self.client is not None:
-            sent = self.client.send_chat(text)
-        if sent:
-            self._append_chat("вы", text)
+            mid = self.client.send_chat(text)
+        if mid:
+            self._append_chat("вы", text, mid)
             self.message_edit.clear()
         else:
             self._set_status("Сообщение не отправлено: нет соединения.")
@@ -1566,9 +1631,121 @@ class MainWindow(QMainWindow):
         else:
             self._set_status("Файл не отправлен: нет соединения.")
 
-    def _append_chat(self, sender: str, text: str) -> None:
-        self.chat_view.appendPlainText(f"{sender}: {text}")
-        announce(self.chat_view, f"Новое сообщение от {sender}: {text}")
+    def _append_chat(self, sender: str, text: str, mid: str = "") -> None:
+        """Добавляет строку в чат.
+
+        У каждой строки есть номер отправителя и время. Время пишется после
+        сообщения; у первого сообщения нового дня перед временем стоит дата,
+        чтобы было понятно, в какой день шёл разговор.
+        """
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, mid or f"local-{uuid.uuid4().hex}")
+        item.setData(Qt.UserRole + 1, datetime.now())
+        item.setData(Qt.UserRole + 2, sender)
+        item.setData(Qt.UserRole + 3, text)
+        self.chat_list.addItem(item)
+        self._refresh_chat()
+        self.chat_list.scrollToBottom()
+        announce(self.chat_list, f"Новое сообщение от {sender}: {text}")
+
+    def _refresh_chat(self) -> None:
+        """Пересобирает тексты строк: метка дня ставится один раз в сутки."""
+        previous_day = None
+        for row in range(self.chat_list.count()):
+            item = self.chat_list.item(row)
+            when = item.data(Qt.UserRole + 1)
+            sender = str(item.data(Qt.UserRole + 2) or "")
+            text = str(item.data(Qt.UserRole + 3) or "")
+            stamp = f"{when:%H:%M}" if isinstance(when, datetime) else ""
+            day = (when.year, when.month, when.day) if isinstance(when, datetime) else None
+            if day is not None and day != previous_day:
+                stamp = f"{when.day} {MONTHS[when.month - 1]}, {stamp}"
+            previous_day = day
+            line = f"{sender}: {text}"
+            if stamp:
+                line = f"{line} — {stamp}"
+            if item.text() != line:
+                item.setText(line)
+
+    def _chat_item(self, mid: str) -> QListWidgetItem | None:
+        for row in range(self.chat_list.count()):
+            item = self.chat_list.item(row)
+            if item.data(Qt.UserRole) == mid:
+                return item
+        return None
+
+    def _send_chat_delete(self, mid: str) -> None:
+        if not mid or mid.startswith("local-"):
+            return
+        if self.is_teacher and self.server is not None:
+            self.server.send_chat_delete(mid)
+        elif self.client is not None:
+            self.client.send_chat_delete(mid)
+
+    def _send_chat_edit(self, mid: str, text: str) -> None:
+        if not mid or mid.startswith("local-"):
+            return
+        if self.is_teacher and self.server is not None:
+            self.server.send_chat_edit(mid, text)
+        elif self.client is not None:
+            self.client.send_chat_edit(mid, text)
+
+    def _delete_chat_message(self) -> None:
+        item = self.chat_list.currentItem()
+        if item is None:
+            return
+        text = str(item.data(Qt.UserRole + 3) or "")
+        box = QMessageBox(self)
+        box.setWindowTitle("Удалить сообщение")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Удалить сообщение «{text}» у себя и у собеседника?")
+        box.setAccessibleName("Удаление сообщения")
+        delete = box.addButton("Удалить", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Отмена", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not delete:
+            self._set_status("Удаление отменено.")
+            return
+        mid = str(item.data(Qt.UserRole) or "")
+        self._send_chat_delete(mid)
+        row = self.chat_list.row(item)
+        self.chat_list.takeItem(row)
+        self._refresh_chat()
+        self._set_status("Сообщение удалено.")
+
+    def _edit_chat_message(self) -> None:
+        item = self.chat_list.currentItem()
+        if item is None:
+            return
+        old = str(item.data(Qt.UserRole + 3) or "")
+        text, ok = QInputDialog.getText(
+            self, "Изменить сообщение", "Новый текст:", QLineEdit.Normal, old)
+        if not ok:
+            return
+        text = text.strip()
+        if not text:
+            return
+        item.setData(Qt.UserRole + 3, text)
+        self._refresh_chat()
+        self._send_chat_edit(str(item.data(Qt.UserRole) or ""), text)
+        announce(self.chat_list, f"Сообщение изменено: {text}")
+
+    def _on_chat_delete(self, mid: str) -> None:
+        item = self._chat_item(mid)
+        if item is None:
+            return
+        self.chat_list.takeItem(self.chat_list.row(item))
+        self._refresh_chat()
+        announce(self.chat_list, "Собеседник удалил сообщение.")
+
+    def _on_chat_edit(self, mid: str, text: str) -> None:
+        item = self._chat_item(mid)
+        if item is None:
+            return
+        item.setData(Qt.UserRole + 3, text)
+        self._refresh_chat()
+        announce(self.chat_list, f"Собеседник изменил сообщение: {text}")
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)

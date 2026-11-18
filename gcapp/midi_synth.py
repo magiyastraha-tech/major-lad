@@ -23,16 +23,13 @@ except Exception:  # pragma: no cover
     rtmidi = None
 
 MAX_VOICES = 24
-
-
-def list_midi_ports() -> list[str]:
-    if rtmidi is None:
-        return []
-    try:
-        probe = rtmidi.MidiIn()
-        return list(probe.get_ports())
-    except Exception:
-        return []
+# Огибающая считается на каждом отсчёте, а не на каждом блоке: ступеньки
+# амплитуды на границе блоков дают призвук, который на слух читается как
+# хрипотца. Атака короткая, отпускание мягче — как у язычкового инструмента.
+ATTACK_SECONDS = 0.006
+RELEASE_SECONDS = 0.045
+# Украденный голос не обрываем: за несколько миллисекунд гасим его в ноль.
+STEAL_SECONDS = 0.008
 
 
 class Synth:
@@ -46,23 +43,48 @@ class Synth:
         self.fixed_velocity = False
         self._lock = threading.Lock()
         self._voices: dict[int, dict] = {}
+        self._ghosts: list[dict] = []
 
     def note_on(self, note: int, velocity: int = 100) -> None:
         if self.fixed_velocity:
             velocity = 127
         freq = 440.0 * (2.0 ** ((note - 69) / 12.0))
+        level = max(0.05, min(1.0, velocity / 127.0)) * 0.22
         with self._lock:
+            voice = self._voices.get(note)
+            if voice is not None:
+                # Ту же ноту взяли снова, не отпустив: фазу не сбрасываем,
+                # иначе на стыке двух нот слышен щелчок.
+                voice["level"] = level
+                voice["released"] = False
+                voice["release_step"] = 0.0
+                return
             if len(self._voices) >= MAX_VOICES:
-                oldest = min(self._voices, key=lambda k: self._voices[k]["age"])
-                self._voices.pop(oldest, None)
+                # Крадём самую старую ноту: у неё больше шансов быть уже
+                # отпущенной, и её уход меньше заметен.
+                oldest = max(self._voices,
+                             key=lambda k: self._voices[k]["age"])
+                gone = self._voices.pop(oldest)
+                gone["released"] = True
+                # Скорость спада фиксируется в момент кражи: иначе она
+                # пересчитывалась бы от остатка на каждом блоке и голос
+                # затухал бы бесконечно, с изломом на каждом стыке.
+                gone["release_step"] = (
+                    max(float(gone["env"]), 0.0)
+                    / (STEAL_SECONDS * float(self.sample_rate)))
+                self._ghosts.append(gone)
             self._voices[note] = {
                 "freq": freq,
-                "level": max(0.05, min(1.0, velocity / 127.0)) * 0.25,
+                "level": level,
                 "age": 0,
                 "released": False,
+                "release_step": 0.0,
                 # Фаза живёт внутри голоса: на стыке блоков она должна
                 # продолжаться, иначе волна рвётся и слышен хрип.
                 "phase": 0.0,
+                # Огибающая тоже живёт в голосе: атака, ровный звук и
+                # отпускание идут без скачков амплитуды.
+                "env": 0.0,
             }
 
     def note_off(self, note: int) -> None:
@@ -70,32 +92,63 @@ class Synth:
             voice = self._voices.get(note)
             if voice is not None:
                 voice["released"] = True
+                # Спад идёт с постоянной скоростью от текущей амплитуды до
+                # нуля за RELEASE_SECONDS — без ступенек на стыках блоков.
+                voice["release_step"] = (
+                    max(float(voice["env"]), 0.0)
+                    / (RELEASE_SECONDS * float(self.sample_rate)))
+
+    def _env(self, voice: dict, frames: int) -> np.ndarray:
+        """Амплитуда на каждом отсчёте блока: линейный подъём и спад."""
+        sr = float(self.sample_rate)
+        start = float(voice.get("env", 0.0))
+        n = np.arange(frames, dtype=np.float64)
+        if voice.get("released"):
+            step = float(voice.get("release_step") or 0.0)
+            if step <= 0.0:
+                arr = np.zeros(frames, dtype=np.float64)
+            else:
+                arr = start - step * n
+                np.clip(arr, 0.0, 1.0, out=arr)
+        else:
+            step = 1.0 / max(1.0, ATTACK_SECONDS * sr)
+            arr = np.clip(start + step * n, 0.0, 1.0)
+        voice["env"] = float(arr[-1]) if frames else start
+        return arr
 
     def render(self, frames: int) -> np.ndarray:
         out = np.zeros(frames, dtype=np.float32)
-        if not self._voices:
-            return out
-        t = np.arange(frames, dtype=np.float64) / self.sample_rate
         with self._lock:
-            finished = []
-            for note, voice in self._voices.items():
+            if not self._voices and not self._ghosts:
+                return out
+            sr = float(self.sample_rate)
+            t = np.arange(frames, dtype=np.float64) / sr
+            two_pi = 2.0 * math.pi
+            for voice in list(self._voices.values()):
                 voice["age"] += frames
-                amp = np.float32(voice["level"])
-                if voice["released"]:
-                    amp = amp * 0.85
-                    if amp < 0.004:
-                        finished.append(note)
-                        continue
-                    voice["level"] = float(amp)
-                phase = voice["phase"]
-                wave = np.sin(2.0 * math.pi * voice["freq"] * t + phase)
-                out += (wave * amp).astype(np.float32)
-                voice["phase"] = (phase
-                                  + 2.0 * math.pi * voice["freq"] * frames
-                                  / self.sample_rate) % (2.0 * math.pi)
+                env = self._env(voice, frames)
+                wave = np.sin(two_pi * voice["freq"] * t + voice["phase"])
+                out += (wave * env * voice["level"]).astype(np.float32)
+                voice["phase"] = (voice["phase"]
+                                  + two_pi * voice["freq"] * frames / sr
+                                  ) % two_pi
+            finished = [n for n, v in self._voices.items()
+                        if v.get("released") and v["env"] <= 0.0]
             for note in finished:
                 del self._voices[note]
-        return out
+            for ghost in list(self._ghosts):
+                env = self._env(ghost, frames)
+                wave = np.sin(two_pi * ghost["freq"] * t + ghost["phase"])
+                out += (wave * env * ghost["level"]).astype(np.float32)
+                ghost["phase"] = (ghost["phase"]
+                                  + two_pi * ghost["freq"] * frames / sr
+                                  ) % two_pi
+                if ghost["env"] <= 0.0:
+                    self._ghosts.remove(ghost)
+        # Мягкий ограничитель вместо жёсткого клиппинга: аккорд из многих нот
+        # больше не упирается в потолок и не превращается в хрип. На тихом
+        # уровне tanh почти не меняет звук.
+        return np.tanh(out).astype(np.float32)
 
 
 class MidiInput:

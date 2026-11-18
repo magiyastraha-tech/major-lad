@@ -30,7 +30,12 @@ from .metronome import Metronome
 from .midi_synth import MidiInput, Synth
 
 SAMPLE_RATE = 48000
-BLOCK = 480          # 10 мс
+BLOCK = 480          # 10 мс — единица буферов и пакетов
+# Поток открываем коротким блоком: нажатие на MIDI-клавиатуре попадает в
+# звук на границе блока, и чем блок короче, тем меньше эта пауза. 240
+# отсчётов — 5 мс. Не всякий драйвер даёт такой блок, поэтому при отказе
+# откатываемся на 10 мс.
+AUDIO_BLOCK = 240
 
 # Сколько звука держим в буфере. Это и есть задержка сверх драйвера.
 # Рабочая цель — 4 блока, 40 мс: на локальной сети этого с запасом хватает
@@ -152,27 +157,28 @@ class Source:
         for index in self.device_indices:
             self.device_index = index
             for channels in (1, 2):
-                stream = None
-                try:
-                    stream = sd.InputStream(
-                        device=index,
-                        channels=channels,
-                        samplerate=SAMPLE_RATE,
-                        blocksize=BLOCK,
-                        dtype="float32",
-                        latency="low",
-                        callback=self._callback,
-                    )
-                    stream.start()
-                    self.stream = stream
-                    return
-                except Exception as exc:
-                    last_error = exc
-                    if stream is not None:
-                        try:
-                            stream.close()
-                        except Exception:
-                            pass
+                for block in (AUDIO_BLOCK, BLOCK):
+                    stream = None
+                    try:
+                        stream = sd.InputStream(
+                            device=index,
+                            channels=channels,
+                            samplerate=SAMPLE_RATE,
+                            blocksize=block,
+                            dtype="float32",
+                            latency="low",
+                            callback=self._callback,
+                        )
+                        stream.start()
+                        self.stream = stream
+                        return
+                    except Exception as exc:
+                        last_error = exc
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except Exception:
+                                pass
         raise last_error if last_error is not None else RuntimeError("вход не открыт")
 
     def _callback(self, indata, frames, time_info, status) -> None:
@@ -348,32 +354,37 @@ class AudioEngine:
         out_error: Exception | None = None
         for index in out_indices:
             for channels in (1, 2):
-                stream = None
-                try:
-                    stream = sd.OutputStream(
-                        device=index,
-                        channels=channels,
-                        samplerate=SAMPLE_RATE,
-                        blocksize=BLOCK,
-                        dtype="float32",
-                        latency="low",
-                        callback=self._out_callback,
-                    )
-                    stream.start()
-                    self._out = stream
-                    self._out_channels = channels
-                    latency = _stream_latency(stream)
-                    detail = f", задержка {latency:.3f} с" if latency is not None else ""
-                    self.log(f"Аудиовыход открыт: {output or index}, "
-                             f"{channels} кан.{detail}")
+                opened = False
+                for block in (AUDIO_BLOCK, BLOCK):
+                    stream = None
+                    try:
+                        stream = sd.OutputStream(
+                            device=index,
+                            channels=channels,
+                            samplerate=SAMPLE_RATE,
+                            blocksize=block,
+                            dtype="float32",
+                            latency="low",
+                            callback=self._out_callback,
+                        )
+                        stream.start()
+                        self._out = stream
+                        self._out_channels = channels
+                        latency = _stream_latency(stream)
+                        detail = f", задержка {latency:.3f} с" if latency is not None else ""
+                        self.log(f"Аудиовыход открыт: {output or index}, "
+                                 f"{channels} кан., блок {block}{detail}")
+                        opened = True
+                        break
+                    except Exception as exc:
+                        out_error = exc
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except Exception:
+                                pass
+                if opened:
                     break
-                except Exception as exc:
-                    out_error = exc
-                    if stream is not None:
-                        try:
-                            stream.close()
-                        except Exception:
-                            pass
             if self._out is not None:
                 break
         if self._out is None:

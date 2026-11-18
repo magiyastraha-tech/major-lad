@@ -12,6 +12,7 @@ import socket
 import struct
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from . import media
@@ -22,6 +23,15 @@ UDP_PORT = 45801
 # ученика в неведении нечестно: он лучше узнает ответ и попробует позже.
 WAIT_DECISION = 120
 SAVE_DIR = Path(__file__).resolve().parent.parent / "received"
+
+
+def _chat_id() -> str:
+    """Уникальный номер сообщения.
+
+    По нему сообщение находят обе стороны: удалили у себя — у собеседника
+    исчезает то же самое, а не соседнее.
+    """
+    return uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------------------
@@ -88,11 +98,14 @@ class Server:
 
     def __init__(self, name: str, on_status=None, on_chat=None, on_file=None,
                  on_peer=None, on_join_request=None, on_video_state=None,
+                 on_chat_delete=None, on_chat_edit=None,
                  port: int = APP_PORT):
         self.name = name
         self.port = port
         self.on_status = on_status or (lambda *a: None)
         self.on_chat = on_chat or (lambda *a: None)
+        self.on_chat_delete = on_chat_delete or (lambda *a: None)
+        self.on_chat_edit = on_chat_edit or (lambda *a: None)
         self.on_file = on_file or (lambda *a: None)
         self.on_peer = on_peer or (lambda *a: None)
         self.on_video_state = on_video_state or (lambda *a: None)
@@ -215,12 +228,28 @@ class Server:
 
     # -- сообщения ----------------------------------------------------------
 
-    def send_chat(self, text: str) -> bool:
+    def send_chat(self, text: str) -> str | None:
+        """Возвращает номер сообщения или None, если отправить не вышло."""
         session = self.current()
         if session is None:
             self.on_status("В кабинете никого нет — сообщение не отправлено.")
+            return None
+        mid = _chat_id()
+        ok = session.send_json({"type": "chat", "id": mid,
+                                "from": self.name, "text": text})
+        return mid if ok else None
+
+    def send_chat_delete(self, mid: str) -> bool:
+        session = self.current()
+        if session is None:
             return False
-        return session.send_json({"type": "chat", "from": self.name, "text": text})
+        return session.send_json({"type": "chat_delete", "id": mid})
+
+    def send_chat_edit(self, mid: str, text: str) -> bool:
+        session = self.current()
+        if session is None:
+            return False
+        return session.send_json({"type": "chat_edit", "id": mid, "text": text})
 
     def send_file(self, path: str) -> bool:
         session = self.current()
@@ -331,7 +360,13 @@ class _Session:
             kind = msg.get("type")
             if kind == "chat":
                 self.server.on_chat(str(msg.get("from") or self.name),
-                                    str(msg.get("text") or ""))
+                                    str(msg.get("text") or ""),
+                                    str(msg.get("id") or _chat_id()))
+            elif kind == "chat_delete":
+                self.server.on_chat_delete(str(msg.get("id") or ""))
+            elif kind == "chat_edit":
+                self.server.on_chat_edit(str(msg.get("id") or ""),
+                                         str(msg.get("text") or ""))
             elif kind == "file_start":
                 size = int(msg.get("size") or 0)
                 try:
@@ -342,6 +377,7 @@ class _Session:
                 self.server.on_file(self.name, path)
                 self.send_json({
                     "type": "chat",
+                    "id": _chat_id(),
                     "from": "система",
                     "text": f"Файл получен: {os.path.basename(path)}",
                 })
@@ -429,12 +465,14 @@ class Client:
                  on_status=None, on_chat=None, on_file=None,
                  on_ready=None, on_busy=None, on_peer=None,
                  on_ended=None, on_media_list=None, on_media_saved=None,
-                 on_video_state=None):
+                 on_video_state=None, on_chat_delete=None, on_chat_edit=None):
         self.name = name
         self.host = host
         self.port = port
         self.on_status = on_status or (lambda *a: None)
         self.on_chat = on_chat or (lambda *a: None)
+        self.on_chat_delete = on_chat_delete or (lambda *a: None)
+        self.on_chat_edit = on_chat_edit or (lambda *a: None)
         self.on_file = on_file or (lambda *a: None)
         self.on_ready = on_ready or (lambda *a: None)
         self.on_busy = on_busy or (lambda *a: None)
@@ -558,7 +596,12 @@ class Client:
                 if kind == "chat":
                     sender = str(msg.get("from") or "Преподаватель")
                     text = str(msg.get("text") or "")
-                    self.on_chat(sender, text)
+                    self.on_chat(sender, text, str(msg.get("id") or _chat_id()))
+                elif kind == "chat_delete":
+                    self.on_chat_delete(str(msg.get("id") or ""))
+                elif kind == "chat_edit":
+                    self.on_chat_edit(str(msg.get("id") or ""),
+                                      str(msg.get("text") or ""))
                 elif kind == "file_start":
                     size = int(msg.get("size") or 0)
                     data = recv_exact(sock, size)
@@ -577,7 +620,8 @@ class Client:
                                              data)
                         self.on_file("Преподаватель", path)
                         self.on_chat("система",
-                                     f"Файл получен: {os.path.basename(path)}")
+                                     f"Файл получен: {os.path.basename(path)}",
+                                     _chat_id())
                 elif kind == "media_list":
                     tracks = [str(t.get("name") or "")
                               for t in (msg.get("tracks") or [])
@@ -601,13 +645,39 @@ class Client:
             if not user:
                 self.on_ended(reason)
 
-    def send_chat(self, text: str) -> bool:
+    def send_chat(self, text: str) -> str | None:
+        """Возвращает номер сообщения или None, если отправить не вышло."""
         sock = self._sock
         if sock is None or not self._connected:
             self.on_status("Нет соединения — сообщение не отправлено.")
+            return None
+        mid = _chat_id()
+        try:
+            send_json(sock, {"type": "chat", "id": mid,
+                             "from": self.name, "text": text},
+                      self._send_lock)
+            return mid
+        except OSError:
+            self.disconnect()
+            return None
+
+    def send_chat_delete(self, mid: str) -> bool:
+        sock = self._sock
+        if sock is None or not self._connected:
             return False
         try:
-            send_json(sock, {"type": "chat", "from": self.name, "text": text},
+            send_json(sock, {"type": "chat_delete", "id": mid}, self._send_lock)
+            return True
+        except OSError:
+            self.disconnect()
+            return False
+
+    def send_chat_edit(self, mid: str, text: str) -> bool:
+        sock = self._sock
+        if sock is None or not self._connected:
+            return False
+        try:
+            send_json(sock, {"type": "chat_edit", "id": mid, "text": text},
                       self._send_lock)
             return True
         except OSError:
