@@ -24,11 +24,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Opus собираем здесь же: готовых DLL для Windows никто не раздаёт.
+      # Если сборка не удалась — программа всё равно соберётся и будет
+      # слать звук без сжатия.
+      - name: Build Opus library
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch v1.5.2 https://github.com/xiph/opus.git opus-src
+          cmake -S opus-src -B opus-build -DOPUS_BUILD_SHARED_LIBRARY=ON -DOPUS_BUILD_TESTING=OFF -DOPUS_BUILD_PROGRAMS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build opus-build --config Release
+          New-Item -ItemType Directory -Force -Path opus-lib | Out-Null
+          $dll = Get-ChildItem -Path opus-build -Recurse -Filter opus.dll | Select-Object -First 1
+          if ($dll) {
+            Copy-Item $dll.FullName opus-lib/opus.dll
+            Write-Host "Opus собран: $($dll.FullName)"
+          } else {
+            Write-Host "opus.dll не найден, сборка пойдёт без кодека"
+          }
+
+      - name: Check Opus library
+        id: opus
+        shell: pwsh
+        run: |
+          if (Test-Path opus-lib/opus.dll) {
+            'args=--add-binary "opus-lib/opus.dll;."' | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "args=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
       - name: Build teacher exe
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --windowed
           --name MajorLad-Teacher --collect-all sounddevice
           --collect-all rtmidi --collect-all cv2 --collect-all soundfile --collect-all PySide6.QtMultimedia --exclude-module tkinter
+          ${{ steps.opus.outputs.args }}
           main_teacher.py
 
       - name: Build student exe
@@ -36,6 +66,7 @@ jobs:
           python -m PyInstaller --noconfirm --onefile --windowed
           --name MajorLad-Student --collect-all sounddevice
           --collect-all rtmidi --collect-all cv2 --collect-all soundfile --collect-all PySide6.QtMultimedia --exclude-module tkinter
+          ${{ steps.opus.outputs.args }}
           main_student.py
 
       - name: Upload exe

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAccessible, QAccessibleEvent, QKeySequence, QPixmap
+from PySide6.QtGui import QAccessible, QAccessibleEvent, QPixmap
 
 try:  # Qt 6.8 и новее: «объявление» диктору не зависит от того, где фокус
     from PySide6.QtGui import QAccessibleAnnouncementEvent
@@ -23,7 +23,7 @@ except ImportError:  # на более старом Qt остаётся собы
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QInputDialog, QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
     QPushButton, QSlider,
     QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTextEdit, QTreeWidget,
@@ -40,6 +40,13 @@ _SPEED_STEP = 0.1
 _SPEED_MIN = 0.5
 _SPEED_MAX = 1.5
 _PITCH_LIMIT = 6
+# Сколько готовых вариантов трека держим в памяти. Четырёхминутный трек
+# занимает около 46 МБ, так что хватает на несколько последних настроек.
+_EFFECTS_CACHE_BYTES = 256 * 1024 * 1024
+
+# Пункт списка микрофонов, который всегда означает «тот, что Windows выбрала
+# по умолчанию»: на другом компьютере имя устройства другое, а этот работает.
+DEFAULT_MIC_LABEL = "Системный микрофон (по умолчанию)"
 
 VOLUME_KEYS = [
     ("student", "Звук ученика"),
@@ -219,18 +226,51 @@ class _ShortcutFilter(QObject):
             return False
         if not self.window._shortcut_map:
             return False
-        # Пока человек набирает текст, обычные клавиши правки остаются
-        # за полем ввода.
-        if (event.key() in self.EDITOR_KEYS
-                and self._is_editable_field(QApplication.focusWidget())):
-            return False
-        combo = QKeySequence(event.keyCombination()).toString(
-            QKeySequence.SequenceFormat.PortableText)
+        # Пока человек набирает текст, обычные клавиши остаются за полем
+        # ввода: буквы, цифры, цифры с нумпада.
+        if self._is_editable_field(QApplication.focusWidget()):
+            typed = event.text()
+            if event.key() in self.EDITOR_KEYS or (typed and typed.isprintable()):
+                return False
+        combo = shortcuts.combo_from_event(event)
         action = self.window._shortcut_map.get(combo)
         if not action:
             return False
         self.window._run_shortcut(action)
         return True
+
+
+class _KeyCapture(QLineEdit):
+    """Поле, которое запоминает нажатое сочетание как есть.
+
+    QKeySequenceEdit не годится: клавишу цифрового блока он записывает
+    как обычную цифру, а NumLock без Control вообще отбрасывает. Здесь
+    сочетание собирается из самого нажатия.
+    """
+
+    def __init__(self, combo: str, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self._combo = combo or ""
+        self.setText(shortcuts.pretty(self._combo) or "не задано")
+
+    def combo(self) -> str:
+        return self._combo
+
+    def keyPressEvent(self, event) -> None:
+        # Tab и Esc остаются навигацией: по ним диктор уходит с поля.
+        if event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab,
+                           Qt.Key.Key_Escape):
+            event.ignore()
+            return
+        text = shortcuts.combo_from_event(event)
+        if not text:
+            event.ignore()
+            return
+        self._combo = text
+        self.setText(shortcuts.pretty(text))
+        announce(self, f"Сочетание: {shortcuts.pretty(text)}.")
+        event.accept()
 
 
 class ShortcutDialog(QDialog):
@@ -251,19 +291,15 @@ class ShortcutDialog(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.edit = QKeySequenceEdit(QKeySequence(combo or ""))
+        self.edit = _KeyCapture(combo, self)
         self.edit.setAccessibleName("Новое сочетание клавиш")
         self.edit.setAccessibleDescription(
-            "Нажмите сочетание: Control, Alt или клавиша F1–F12 плюс буква. "
-            "Потом Tab до кнопки «Принять» и Пробел.")
-        try:
-            # Одно сочетание без цепочки: поле перестаёт ждать продолжения
-            # и показывает нажатое сразу.
-            self.edit.setMaximumSequenceLength(1)
-        except Exception:
-            pass
+            "Нажмите сочетание: Control, Alt, Нумлок или клавиша цифрового "
+            "блока, или клавиша с F1 по F12. Потом Tab до кнопки «Принять» "
+            "и Пробел.")
         layout.addWidget(label_for("Новое сочетание", self.edit))
         layout.addWidget(self.edit)
+        self.edit.setFocus()
 
         self.error_label = QLabel("")
         self.error_label.setWordWrap(True)
@@ -283,7 +319,7 @@ class ShortcutDialog(QDialog):
         layout.addWidget(buttons)
 
     def _try_accept(self) -> None:
-        ok, error = shortcuts.combo_is_safe(self.edit.keySequence())
+        ok, error = shortcuts.text_is_safe(self.edit.combo())
         if not ok:
             self.error_label.setText(error)
             announce(self, error)
@@ -293,9 +329,7 @@ class ShortcutDialog(QDialog):
         self.accept()
 
     def combo(self) -> str:
-        return shortcuts.normalize(
-            self.edit.keySequence().toString(
-                QKeySequence.SequenceFormat.PortableText))
+        return shortcuts.normalize(self.edit.combo())
 
 
 class SettingsDialog(QDialog):
@@ -453,11 +487,13 @@ class SettingsDialog(QDialog):
         combo = QComboBox()
         combo.setEditable(False)
         combo.setAccessibleName(name)
-        self._fill_device_combo(combo, "Не выбрано", values, current)
+        self._fill_device_combo(combo, "Не выбрано", values, current,
+                                default_label=DEFAULT_MIC_LABEL)
         return combo
 
     def _fill_device_combo(self, combo: QComboBox, first_label: str,
-                           values: list[str], keep: str = "") -> None:
+                           values: list[str], keep: str = "",
+                           default_label: str = "") -> None:
         """Перезаполняет список устройств, сохраняя выбранное.
 
         Выбранного устройства может не оказаться в новом списке — например,
@@ -470,6 +506,10 @@ class SettingsDialog(QDialog):
         combo.blockSignals(True)
         combo.clear()
         combo.addItem(first_label, "")
+        if default_label:
+            # Пункт «системный по умолчанию» не привязан к имени устройства:
+            # на другом компьютере имя другое, а этот пункт всегда работает.
+            combo.addItem(default_label, config.DEFAULT_DEVICE)
         for dev in values:
             combo.addItem(dev, dev)
         index = combo.findData(keep)
@@ -484,7 +524,8 @@ class SettingsDialog(QDialog):
         self.cfg["audio"]["show_all_drivers"] = bool(show_all)
         inputs = audio.list_input_devices(show_all)
         for combo in (self.dev1_combo, self.dev2_combo, self.usb_combo):
-            self._fill_device_combo(combo, "Не выбрано", inputs)
+            self._fill_device_combo(combo, "Не выбрано", inputs,
+                                    default_label=DEFAULT_MIC_LABEL)
         self._fill_device_combo(self.out_combo, "Системное по умолчанию",
                                 audio.list_output_devices(show_all))
 
@@ -762,8 +803,9 @@ class SettingsDialog(QDialog):
         hint = QLabel(
             "Выберите действие стрелками и нажмите Enter. В открывшемся "
             "окне нажмите нужное сочетание клавиш, затем Tab до кнопки "
-            "«Принять» и Пробел. Подходят сочетания с Control, Alt или "
-            "клавиши с F1 по F12."
+            "«Принять» и Пробел. Подходят сочетания с Control, Alt, "
+            "Нумлоком или клавишей цифрового блока, а также клавиши "
+            "с F1 по F12."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -808,7 +850,7 @@ class SettingsDialog(QDialog):
             item = self.shortcut_list.item(index)
             action_id = str(item.data(Qt.ItemDataRole.UserRole))
             combo = shortcuts.resolved(self.shortcut_map, action_id)
-            state = combo if combo else "не назначено"
+            state = shortcuts.pretty(combo) if combo else "не назначено"
             item.setText(f"{titles.get(action_id, action_id)}: {state}")
             item.setData(Qt.ItemDataRole.AccessibleTextRole,
                          item.text())
@@ -840,13 +882,14 @@ class SettingsDialog(QDialog):
             if other == combo:
                 self.shortcut_map[other_id] = shortcuts.UNSET
                 announce(self.shortcut_list,
-                         f"Сочетание {combo} снято с действия "
-                         f"«{titles.get(other_id, other_id)}».")
+                         f"Сочетание {shortcuts.pretty(combo)} снято "
+                         f"с действия «{titles.get(other_id, other_id)}».")
                 break
         self.shortcut_map[action_id] = combo
         self._refresh_shortcut_list()
         announce(self.shortcut_list,
-                 f"{titles.get(action_id, action_id)}: назначено {combo}.")
+                 f"{titles.get(action_id, action_id)}: назначено "
+                 f"{shortcuts.pretty(combo)}.")
 
     def _clear_shortcut(self) -> None:
         action_id = self._shortcut_action()
@@ -1070,8 +1113,8 @@ class MainWindow(QMainWindow):
     sig_ended = Signal(str)
     sig_track_ready = Signal(str, object)
     sig_track_error = Signal(str)
-    sig_effects_ready = Signal(object)
-    sig_effects_error = Signal(str)
+    sig_effects_ready = Signal(object, int, float, int)
+    sig_effects_error = Signal(str, int)
     sig_media_list = Signal(object)
     sig_media_saved = Signal(str)
     sig_peer_video = Signal(bool)
@@ -1123,9 +1166,19 @@ class MainWindow(QMainWindow):
         self._track_source = None
         self._effects_shown = False
         self._effects_busy = False
-        self._effects_dirty = False
+        # Номер пересчёта, который идёт сейчас: результат с чужим номером
+        # не должен снимать признак занятости у свежего пересчёта.
+        self._effects_job_gen = 0
+        # Настройка, которая прямо сейчас звучит в плеере.
         self._effects_key: tuple[float, int] = (1.0, 0)
         self._effects_path = ""
+        # Номер настройки. Результат, посчитанный для прежнего номера,
+        # отбрасывается: пока он считался, скорость или тон уже сменили.
+        self._effects_gen = 0
+        # Готовые варианты трека: вернуться к уже посчитанной настройке
+        # можно сразу, без повторного пересчёта всего файла.
+        self._effects_cache: dict[tuple[float, int], object] = {}
+        self._effects_cache_bytes = 0
         # Скорость, с которой сейчас звучит загруженный трек.
         self._effects_applied_speed = 1.0
         # Что сказать диктору о кнопках сброса при следующем отчёте.
@@ -1229,9 +1282,9 @@ class MainWindow(QMainWindow):
         vol_layout = QVBoxLayout(vol_group)
         # Переключатель сторон: ползунки показывают либо мою громкость,
         # либо громкость, которую получает собеседник.
+        # Обычная кнопка, не переключатель: диктор должен говорить только
+        # «Моя громкость» или «Громкость ученика», без «отмечено».
         self.volume_mode_button = QPushButton()
-        self.volume_mode_button.setCheckable(True)
-        self.volume_mode_button.setChecked(self.volume_mode == "peer")
         self.volume_mode_button.clicked.connect(self._toggle_volume_mode)
         vol_layout.addWidget(self.volume_mode_button)
         self.sliders: dict[str, QSlider] = {}
@@ -2192,6 +2245,10 @@ class MainWindow(QMainWindow):
             player.clear()
             self._track_source = None
             self._effects_applied_speed = 1.0
+            self._clear_effects_cache()
+            self._effects_gen += 1
+            self._effects_key = (1.0, 0)
+            self._effects_path = ""
         try:
             Path(path).unlink()
         except OSError as exc:
@@ -2245,6 +2302,11 @@ class MainWindow(QMainWindow):
         # Исходный звук храним отдельно: скорость и тон всегда считаются
         # от него, а не от уже обработанного варианта.
         self._track_source = data
+        # Другой трек — другой звук: готовые варианты прежнего бесполезны,
+        # а недосчитанный результат прошлого трека отбрасываем номером.
+        self._clear_effects_cache()
+        self._effects_gen += 1
+        self._effects_key = (1.0, 0)
         self._effects_path = path
         if self._effects_active():
             self._set_status("Применяю эффект…")
@@ -2329,12 +2391,14 @@ class MainWindow(QMainWindow):
 
     def _reset_speed(self) -> None:
         if abs(self._speed - 1.0) < 1e-6:
+            self._set_status("Скорость уже обычная.")
             return
         self._speed = 1.0
         self._apply_effects()
 
     def _reset_pitch(self) -> None:
         if not self._pitch:
+            self._set_status("Тон уже обычный.")
             return
         self._pitch = 0
         self._apply_effects()
@@ -2362,6 +2426,8 @@ class MainWindow(QMainWindow):
         """Пересчитывает трек под текущие скорость и тон."""
         hint = self._update_effects_buttons()
         self._effects_hint = hint
+        # Новый номер настройки: результат прошлого пересчёта уже не нужен.
+        self._effects_gen += 1
         player = self.engine.player
         path = self._selected_track()
         if self._track_source is None or not (
@@ -2371,13 +2437,30 @@ class MainWindow(QMainWindow):
                         "Эффект применится, когда включите трек.")
             else:
                 text = "Эффекты вернулись к обычным."
+            # Подсказку про кнопки сброса уже сказали — второй раз не надо.
+            self._effects_hint = ""
             self._set_status(f"{text} {hint}" if hint else text)
             return
         self._effects_path = path
+        if not self._effects_active():
+            # Обычные скорость и тон — это сам исходный звук. Он уже лежит
+            # в памяти, поэтому возвращаемся к нему сразу, не дожидаясь,
+            # пока досчитается вариант с прошлой настройкой.
+            self._place_effects(self._track_source, 1.0)
+            return
+        key = (self._speed, self._pitch)
+        cached = self._effects_cache.get(key)
+        if cached is not None:
+            # Такую настройку уже считали — ставим готовый вариант сразу.
+            self._place_effects(cached, key[0])
+            return
         if self._effects_busy:
-            # Считается прошлый вариант. Когда закончит, увидит, что
-            # настройки уже другие, и пересчитает ещё раз.
-            self._effects_dirty = True
+            # Считается прошлая настройка. Когда закончит, увидит, что
+            # нужна уже другая, и пересчитает её сам.
+            text = (f"{self._effects_word().capitalize()}. "
+                    "Применю, когда закончится текущий пересчёт.")
+            self._effects_hint = ""
+            self._set_status(f"{text} {hint}" if hint else text)
             return
         self._set_status("Применяю эффект…")
         self._start_effects_worker()
@@ -2387,39 +2470,34 @@ class MainWindow(QMainWindow):
         if source is None:
             return
         self._effects_busy = True
-        self._effects_dirty = False
-        self._effects_key = (self._speed, self._pitch)
+        self._effects_job_gen = self._effects_gen
         threading.Thread(
             target=self._effects_worker,
-            args=(source, self.engine.player.rate, self._speed, self._pitch),
+            args=(source, self.engine.player.rate, self._speed, self._pitch,
+                  self._effects_gen),
             daemon=True).start()
 
-    def _effects_worker(self, source, rate, speed, pitch) -> None:
+    def _effects_worker(self, source, rate, speed, pitch, gen) -> None:
         try:
             data = effects.apply(source, rate, speed, pitch)
         except Exception as exc:
             self.sig_effects_error.emit(
-                f"Не удалось применить эффект: {_explain(exc)}")
+                f"Не удалось применить эффект: {_explain(exc)}", gen)
             return
-        self.sig_effects_ready.emit(data)
+        self.sig_effects_ready.emit(data, gen, speed, pitch)
 
-    def _on_effects_ready(self, data) -> None:
-        self._effects_busy = False
-        if self._effects_dirty or self._effects_key != (self._speed, self._pitch):
-            # Настройки поменялись, пока считали: устаревший вариант не
-            # ставим, считаем сразу новый.
-            self._start_effects_worker()
-            return
+    def _place_effects(self, data, speed_used: float) -> None:
+        """Ставит готовый вариант трека в плеер, сохраняя место."""
         path = self._effects_path
-        if not path or path != self._selected_track():
-            # Трек успели сменить или удалить — результат уже не нужен.
-            return
-        player = self.engine.player
         hint = self._effects_hint
         self._effects_hint = ""
-        speed_used = self._effects_key[0]
+        if data is None or not path or path != self._selected_track():
+            return
+        player = self.engine.player
+        self._effects_key = ((1.0, 0) if not self._effects_active()
+                             else (self._speed, self._pitch))
         if not (player.has_track and player.path == path):
-            # Трек ещё не был загружен: включаем сразу с эффектом.
+            # Трек ещё не был загружен: включаем сразу с нужным звуком.
             prefix = f"{self._effects_word().capitalize()}."
             if hint:
                 prefix = f"{prefix} {hint}"
@@ -2442,8 +2520,64 @@ class MainWindow(QMainWindow):
                 f"Позиция {_clock(position)} из {duration}.")
         self._set_status(f"{text} {hint}" if hint else text)
 
-    def _on_effects_error(self, text: str) -> None:
-        self._effects_busy = False
+    def _remember_effects(self, key: tuple[float, int], data) -> None:
+        """Держит последние варианты трека, чтобы возврат был мгновенным."""
+        size = int(getattr(data, "nbytes", 0))
+        if size <= 0 or size > _EFFECTS_CACHE_BYTES:
+            return
+        old = self._effects_cache.pop(key, None)
+        if old is not None:
+            self._effects_cache_bytes -= int(old.nbytes)
+        self._effects_cache[key] = data
+        self._effects_cache_bytes += size
+        # Память не бесконечна: вытесняем самые старые варианты.
+        while (self._effects_cache_bytes > _EFFECTS_CACHE_BYTES
+               and len(self._effects_cache) > 1):
+            oldest = next(iter(self._effects_cache))
+            if oldest == key:
+                break
+            dropped = self._effects_cache.pop(oldest)
+            self._effects_cache_bytes -= int(dropped.nbytes)
+
+    def _clear_effects_cache(self) -> None:
+        self._effects_cache.clear()
+        self._effects_cache_bytes = 0
+
+    def _continue_effects(self) -> None:
+        """Доводит до конца настройку, которую сменили во время пересчёта."""
+        if not self._effects_active():
+            if self._effects_key != (1.0, 0):
+                self._place_effects(self._track_source, 1.0)
+            return
+        key = (self._speed, self._pitch)
+        if self._effects_key == key:
+            # Нужный вариант уже стоит в плеере.
+            return
+        cached = self._effects_cache.get(key)
+        if cached is not None:
+            self._place_effects(cached, key[0])
+            return
+        self._start_effects_worker()
+
+    def _on_effects_ready(self, data, gen: int, speed: float,
+                          pitch: float) -> None:
+        if gen == self._effects_job_gen:
+            self._effects_busy = False
+        key = (speed, pitch)
+        if gen != self._effects_gen and key != (self._speed, self._pitch):
+            # Пока считали, настройку сменили — этот вариант устарел.
+            self._continue_effects()
+            return
+        path = self._effects_path
+        if not path or path != self._selected_track():
+            # Трек успели сменить или удалить — результат уже не нужен.
+            return
+        self._remember_effects(key, data)
+        self._place_effects(data, speed)
+
+    def _on_effects_error(self, text: str, gen: int = 0) -> None:
+        if gen == self._effects_job_gen:
+            self._effects_busy = False
         hint = self._effects_hint
         self._effects_hint = ""
         self._set_status(f"{text} {hint}" if hint else text)

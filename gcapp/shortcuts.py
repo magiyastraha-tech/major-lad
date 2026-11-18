@@ -7,7 +7,19 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QKeyCombination, QKeySequence
+
+# Цифровой блок Qt помечает отдельным флагом, но в строку сочетания его не
+# пишет. Своя пометка делает клавишу нумпада отличимой от такой же клавиши
+# сверху — иначе назначенное «1 на нумпаде» срабатывало бы на обычной «1».
+NUMPAD_PREFIX = "Num+"
+NUMLOCK_TEXT = "NumLock"
+
+# Клавиши-модификаторы: сами по себе сочетанием не являются.
+MODIFIER_KEYS = (
+    Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta,
+    Qt.Key.Key_AltGr, Qt.Key.Key_CapsLock, Qt.Key.Key_unknown,
+)
 
 # Шаг регулятора громкости на одно нажатие сочетания.
 SLIDER_STEP = 5
@@ -98,12 +110,71 @@ def all_actions(is_teacher: bool) -> list[tuple[str, str]]:
     return actions
 
 
+def combo_from_event(event) -> str:
+    """Сочетание из нажатия клавиши, с пометкой цифрового блока и NumLock.
+
+    Собирать строку из самого события, а не через QKeySequenceEdit, нужно
+    ради нумпада: Qt клавишу цифрового блока записывает так же, как
+    обычную цифру, и различие теряется.
+    """
+    key = event.key()
+    if key in MODIFIER_KEYS:
+        return ""
+    mods = event.modifiers()
+    pad = bool(mods & Qt.KeyboardModifier.KeypadModifier)
+    text = QKeySequence(
+        QKeyCombination(mods & ~Qt.KeyboardModifier.KeypadModifier, key)
+    ).toString(QKeySequence.SequenceFormat.PortableText)
+    if not text:
+        return ""
+    if pad:
+        # Пометку ставим прямо перед клавишей: Ctrl+Num+1 читается диктором
+        # как «Control, нумпад 1».
+        head, sep, tail = text.rpartition("+")
+        text = (head + sep if sep else "") + NUMPAD_PREFIX + tail
+    return text
+
+
+def pretty(text: str) -> str:
+    """Сочетание для диктора: нумпад и нумлок называем по-русски."""
+    text = text or ""
+    if not text:
+        return ""
+    if text == NUMLOCK_TEXT:
+        return "Нумлок"
+    text = text.replace(NUMPAD_PREFIX, "Нумпад ")
+    if text.endswith("+" + NUMLOCK_TEXT):
+        text = text[:-len(NUMLOCK_TEXT)] + "Нумлок"
+    return text
+
+
+def _is_numpad(text: str) -> bool:
+    return NUMPAD_PREFIX in (text or "") or (text or "").endswith(NUMLOCK_TEXT)
+
+
 def normalize(text: str) -> str:
     """Приводит сочетание к единому виду для хранения и сравнения."""
-    seq = QKeySequence(text or "")
+    text = (text or "").strip()
+    if not text:
+        return ""
+    # Свои сочетания нумпада QKeySequence разобрал бы по-другому — храним
+    # их как есть.
+    if _is_numpad(text):
+        return text
+    seq = QKeySequence(text)
     if seq.isEmpty():
         return ""
     return seq.toString(QKeySequence.SequenceFormat.PortableText)
+
+
+def text_is_safe(text: str) -> tuple[bool, str]:
+    """Проверка сочетания, записанного строкой."""
+    text = (text or "").strip()
+    if not text:
+        return False, "Сочетание не задано."
+    if _is_numpad(text):
+        return True, ""
+    return combo_is_safe(QKeySequence(text))
 
 
 def combo_is_safe(seq: QKeySequence) -> tuple[bool, str]:

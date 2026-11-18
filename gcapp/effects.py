@@ -33,6 +33,14 @@ def _best_start(x: np.ndarray, target: int, template: np.ndarray,
     hi = min(target + tolerance, x.size - template.size)
     if hi <= lo:
         return max(0, min(target, x.size - template.size))
+    flat = max(0, min(target, x.size - template.size))
+    # В паузе искать нечего: любой кусок тишины одинаково похож на шаблон,
+    # корреляция получается нулевой, и argmax берёт первый попавшийся край
+    # допуска. Тогда каждая склейка уезжает назад на весь допуск, и трек
+    # постепенно ползёт — на слух это «поехавшая» скорость и тон.
+    energy = float(np.dot(template, template)) / max(1, template.size)
+    if energy < 1e-10:
+        return flat
     region = x[lo:hi + template.size]
     size = 1
     while size < region.size + template.size:
@@ -42,7 +50,16 @@ def _best_start(x: np.ndarray, target: int, template: np.ndarray,
     corr = np.fft.irfft(np.fft.rfft(region, size)
                         * np.conj(np.fft.rfft(template, size)), size)
     count = hi - lo + 1
-    return lo + int(np.argmax(corr[:count]))
+    values = corr[:count]
+    if float(np.max(values)) <= 0.0:
+        return flat
+    # Берём именно самый похожий кусок. Соблазнительно при равных вариантах
+    # выбрать ближайший к нужному месту, но на периодическом звуке таких
+    # вариантов несколько, и ближайший оказывается всегда с одной и той же
+    # стороны. Смещение тогда повторяется из кадра в кадр и накапливается:
+    # трек почти перестаёт растягиваться. Самый похожий кусок такой
+    # systematic ошибки не даёт.
+    return lo + int(np.argmax(values))
 
 
 def time_stretch(x: np.ndarray, rate: float,
@@ -74,6 +91,11 @@ def time_stretch(x: np.ndarray, rate: float,
     step = hop * rate
     pos = 0
     index = 0
+    # Нужное место кадра считаем по ровной сетке, а не от предыдущего
+    # найденного: найденное место каждый раз съезжает на похожий кусок, и
+    # если это смещение повторяется, оно копится и трек перестаёт
+    # растягиваться. По сетке смещение остаётся маленьким и не накапливается.
+    nominal = 0.0
     while True:
         seg = padded[pos:pos + frame]
         if seg.size < frame:
@@ -86,7 +108,8 @@ def time_stretch(x: np.ndarray, rate: float,
         out[start:end] += seg[:part] * win[:part]
         weight[start:end] += win[:part]
         index += 1
-        target = pos + int(round(step))
+        nominal += step
+        target = int(round(nominal))
         if target + frame >= padded.size:
             break
         # Продолжение предыдущего кадра в исходнике — по нему ищем, где

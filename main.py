@@ -111,6 +111,9 @@ def main(forced_role: str | None = None) -> int:
     # Файл прошлой версии после обновления больше не нужен.
     updater.cleanup_backup()
 
+    # До загрузки: есть ли файл настроек. По нему отличаем первый запуск
+    # после установки от обычного, где настройки уже выбирал человек.
+    fresh_install = not config.config_path().exists()
     cfg = config.load()
 
     if forced_role in ("teacher", "student"):
@@ -127,6 +130,14 @@ def main(forced_role: str | None = None) -> int:
         cfg["role"] = dialog.role
         if dialog.role == "teacher" and not cfg.get("name"):
             cfg["name"] = "Преподаватель"
+        config.save(cfg)
+
+    # Свежая установка у ученика: камера включена сразу, микрофон уже стоит
+    # «системный по умолчанию». Человек запускает программу на любом
+    # компьютере и получает звук и видео, не заходя в настройки.
+    if (fresh_install and cfg.get("role") == "student"
+            and not cfg["video"].get("enabled")):
+        cfg["video"]["enabled"] = True
         config.save(cfg)
 
     runlog.write(f"Роль: {cfg.get('role')}.")

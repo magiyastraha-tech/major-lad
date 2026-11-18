@@ -11,17 +11,23 @@ import os
 import sys
 from pathlib import Path
 
+# Отметка «системное устройство по умолчанию» в настройках звука. На
+# другом компьютере имена устройств другие, а эта отметка всегда означает
+# то, что Windows выбрала сама, — поэтому на новом месте звук заработает
+# без захода в настройки.
+DEFAULT_DEVICE = "__default__"
+
 DEFAULTS = {
     # Версия схемы настроек: по ней load() понимает, какие старые
     # умолчания пора привести к новым.
-    "settings_version": 2,
+    "settings_version": 3,
     "role": "",
     "name": "",
     "server_ip": "",
     "server_port": 45800,
     "autoconnect": True,
     "audio": {
-        "device1": "",
+        "device1": DEFAULT_DEVICE,
         "device2": "",
         "usb": "",
         "output": "",
@@ -139,6 +145,17 @@ def load() -> dict:
         video = cfg.setdefault("video", {})
         if not int(video.get("bitrate", 0) or 0):
             video["bitrate"] = 600
+    # 0.4.1: у ученика звук и видео должны работать сразу после обновления,
+    # без похода в настройки. Пустой микрофон меняем на «системный по
+    # умолчанию», камеру включаем. Сделанный человеком выбор не трогаем:
+    # миграция выполняется один раз и помечает настройки новой версией.
+    if int(cfg.get("settings_version", 1) or 1) < 3:
+        if str(cfg.get("role") or "") == "student":
+            audio_cfg = cfg.setdefault("audio", {})
+            if not str(audio_cfg.get("device1") or "").strip():
+                audio_cfg["device1"] = DEFAULT_DEVICE
+            cfg.setdefault("video", {})["enabled"] = True
+        cfg["settings_version"] = 3
     return cfg
 
 
