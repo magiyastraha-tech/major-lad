@@ -47,6 +47,30 @@ STUDENT_KEEP = BLOCK * 4
 STUDENT_MAX = BLOCK * 8
 INPUT_KEEP = BLOCK * 4
 INPUT_MAX = BLOCK * 8
+
+# Три набора буферов на выбор владельца. Низкий — минимальная задержка,
+# но дрожание сети слышно сильнее; устойчивый — запас на плохую сеть.
+BUFFER_PRESETS = {
+    "low": (BLOCK * 2, BLOCK * 4),       # 20–40 мс
+    "normal": (BLOCK * 4, BLOCK * 8),    # 40–80 мс
+    "stable": (BLOCK * 8, BLOCK * 16),   # 80–160 мс
+}
+BUFFER_PRESET_NAMES = {
+    "low": "минимальная задержка",
+    "normal": "обычный",
+    "stable": "устойчивый",
+}
+
+
+def set_buffer_preset(name: str) -> str:
+    """Переключает набор буферов. Возвращает применённое имя."""
+    global STUDENT_KEEP, STUDENT_MAX, INPUT_KEEP, INPUT_MAX
+    keep, maximum = BUFFER_PRESETS.get(name, BUFFER_PRESETS["normal"])
+    if name not in BUFFER_PRESETS:
+        name = "normal"
+    STUDENT_KEEP = INPUT_KEEP = keep
+    STUDENT_MAX = INPUT_MAX = maximum
+    return name
 UDP_PORT = 45801
 MAGIC_AUDIO = b"GCA1"
 # Стереозвук: два канала вперемешку, левый и правый. Отдельная метка, чтобы
@@ -488,9 +512,26 @@ class AudioEngine:
         self._peer = None
         self._server_addr = None
         self._is_server = False
-        self._send_q: queue.Queue = queue.Queue(maxsize=8)
+        self._send_q: queue.Queue = queue.Queue(maxsize=4)
         self._seq = 0
         self._running = False
+        # Поколение запуска. Каждый поток запоминает своё и выходит, как
+        # только поколение сменилось: после перезапуска звука старые потоки
+        # не должны ни читать очередь, ни отправлять в закрытый сокет.
+        self._generation = 0
+        self._udp_thread: threading.Thread | None = None
+        self._send_thread: threading.Thread | None = None
+        # Сторож: следит за обратными вызовами вывода. Если звук встал,
+        # переоткрывает выход сам, без участия человека.
+        self._watchdog: threading.Thread | None = None
+        self._last_cb = 0.0
+        self._last_reopen = 0.0
+        self._start_args: dict | None = None
+        self._out_frames = 0
+        self._stat_frames_t0 = 0
+        self._tx_errors = 0
+        self._cb_errors = 0
+        self.buffer_preset = "normal"
         # Счётчики для журнала: потери по сети, провалы буфера, перегруз.
         self._stat_t0 = 0.0
         self._stat_connected = False
@@ -516,6 +557,15 @@ class AudioEngine:
         self._is_server = bool(is_server)
         self._server_addr = server_addr
         self._peer = None
+        # Новое поколение потоков и свежая очередь: старые потоки выйдут
+        # сами, а их неотправленные пакеты не попадут в новый поток.
+        self._generation += 1
+        self._send_q = queue.Queue(maxsize=4)
+        self._start_args = dict(
+            is_server=is_server, server_addr=server_addr,
+            devices=dict(devices or {}), modes=dict(modes or {}),
+            output=output, midi_enabled=midi_enabled, midi_port=midi_port,
+            midi_fixed_velocity=midi_fixed_velocity)
         self._running = True
 
         try:
@@ -530,8 +580,17 @@ class AudioEngine:
             self._running = False
             return False, f"Не удалось открыть UDP-порт: {exc}"
         self._sock = sock
-        threading.Thread(target=self._udp_loop, daemon=True).start()
-        threading.Thread(target=self._send_loop, daemon=True).start()
+        generation = self._generation
+        self._udp_thread = threading.Thread(
+            target=self._udp_loop, args=(generation,), daemon=True)
+        self._udp_thread.start()
+        self._send_thread = threading.Thread(
+            target=self._send_loop, args=(generation,), daemon=True)
+        self._send_thread.start()
+        if self._watchdog is None or not self._watchdog.is_alive():
+            self._watchdog = threading.Thread(
+                target=self._watchdog_loop, daemon=True)
+            self._watchdog.start()
 
         if output and not find_devices(output, "output"):
             self.log(f"Устройство вывода «{output}» не найдено — ищу другое.")
@@ -564,6 +623,9 @@ class AudioEngine:
                             stream.start()
                             self._out = stream
                             self._out_channels = channels
+                            # Отсчёт для сторожа начинается с открытия:
+                            # первые вызовы приходят не сразу.
+                            self._last_cb = time.monotonic()
                             latency = _stream_latency(stream)
                             detail = f", задержка {latency:.3f} с" if latency is not None else ""
                             self.log(f"Аудиовыход открыт: {label}, "
@@ -617,7 +679,7 @@ class AudioEngine:
                          if in_latency is not None else "")
             self.log(f"Вход открыт: {device_name(source.device_index)}, "
                      f"{source.channels} кан., {mode_label}, "
-                     f"блок {source.block}{in_detail}")
+                     f"блок {source.block}{in_detail})")
 
         if midi_enabled:
             self.set_midi(True, midi_port, midi_fixed_velocity)
@@ -689,6 +751,14 @@ class AudioEngine:
             except OSError:
                 pass
             self._sock = None
+        # Дожидаемся потоков, прежде чем стартовать новые: иначе старый
+        # отправитель переживёт перезапуск, будет тянуть пакеты из общей
+        # очереди и слать их в закрытый сокет.
+        for thread in (self._send_thread, self._udp_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.5)
+        self._send_thread = None
+        self._udp_thread = None
         self._peer = None
         self.student.clear()
         self.student_r.clear()
@@ -717,9 +787,35 @@ class AudioEngine:
         """Микрофон выключен: входы не попадают в поток собеседнику."""
         self.mic_muted = bool(muted)
 
+    def set_buffer_preset(self, name: str) -> str:
+        """Набор буферов: low, normal или stable."""
+        self.buffer_preset = set_buffer_preset(name)
+        return self.buffer_preset
+
     # -- микшер -------------------------------------------------------------
 
     def _out_callback(self, outdata, frames, time_info, status) -> None:
+        """Обёртка: сбой в микшере не должен убивать звуковой поток.
+
+        Если исключение выйдет из callback, PortAudio останавливает поток,
+        и звук пропадает у обеих сторон молча. Поэтому ловим всё, отдаём
+        тишину и считаем сбои — они видны в журнале.
+        """
+        try:
+            self._out_callback_inner(outdata, frames)
+        except Exception as exc:
+            self._cb_errors += 1
+            outdata.fill(0)
+            if self._cb_errors == 1 or self._cb_errors % 200 == 0:
+                try:
+                    self.log(f"Сбой в звуковом потоке ({self._cb_errors}): "
+                             f"{exc.__class__.__name__}: {exc}")
+                except Exception:
+                    pass
+
+    def _out_callback_inner(self, outdata, frames) -> None:
+        self._last_cb = time.monotonic()
+        self._out_frames += frames
         # Синтезатор рендерится ровно один раз: у него внутри фаза и огибающие,
         # второй вызов съел бы часть звука.
         synth = self.synth
@@ -864,6 +960,7 @@ class AudioEngine:
         self._tx_dropped = 0
         self._tx_nopeer = 0
         self._tx_clip = 0
+        self._stat_frames_t0 = self._out_frames
         self.student.reset_stats()
         self.student_r.reset_stats()
 
@@ -882,6 +979,11 @@ class AudioEngine:
             source.clipped = 0
         gaps_ms = sum(r.underruns for r in rings) * 1000.0 / SAMPLE_RATE
         over_ms = sum(r.overflows for r in rings) * 1000.0 / SAMPLE_RATE
+        # Сколько звука реально выведено за этот отрезок. Ниже 90 % — звук
+        # шёл рывками, и это видно раньше, чем человек пожалуется на хрипы.
+        frames = self._out_frames - self._stat_frames_t0
+        self._stat_frames_t0 = self._out_frames
+        realtime = frames / max(1e-6, seconds * SAMPLE_RATE) * 100.0
         head = "Итог звука" if final else "Звук"
         parts = [
             f"принято {self._rx_packets} пакетов",
@@ -893,7 +995,10 @@ class AudioEngine:
             f"перегруз входа {in_clip}",
             f"отправлено {self._tx_packets}",
             f"не ушло {self._tx_nopeer + self._tx_dropped}",
+            f"ошибок отправки {self._tx_errors}",
             f"перегруз отправки {self._tx_clip}",
+            f"выведено {realtime:.0f}% реального времени",
+            f"сбоев потока {self._cb_errors}",
         ]
         return f"{head} за {seconds:.0f} с: " + ", ".join(parts) + "."
 
@@ -916,11 +1021,44 @@ class AudioEngine:
         except Exception:
             pass
 
+    def _watchdog_loop(self) -> None:
+        """Сторож вывода: если обратные вызовы встали, выход переоткрывается.
+
+        Живёт отдельно от звукового потока: упавший или замолчавший callback
+        сам о себе не сообщит. Раз в две секунды сверяем время последнего
+        вызова; молчание дольше двух секунд — переоткрываем выход.
+        """
+        while True:
+            time.sleep(2.0)
+            if not self._running or self._out is None:
+                continue
+            now = time.monotonic()
+            if now - self._last_cb <= 2.0:
+                continue
+            if now - self._last_reopen < 10.0:
+                continue
+            self._last_reopen = now
+            try:
+                self.log("Звук встал: обратных вызовов нет дольше 2 секунд. "
+                         "Переоткрываю выход.")
+            except Exception:
+                pass
+            args = self._start_args
+            if not args:
+                continue
+            try:
+                ok, message = self.start(**args)
+                if not ok:
+                    self.log(f"Переоткрыть выход не удалось: {message}")
+            except Exception as exc:
+                self.log(f"Переоткрыть выход не удалось: {exc}")
+
     # -- сеть ---------------------------------------------------------------
 
-    def _udp_loop(self) -> None:
+    def _udp_loop(self, generation: int) -> None:
         sock = self._sock
-        while self._running and sock is not None:
+        while (self._running and sock is not None
+               and generation == self._generation):
             try:
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
@@ -976,12 +1114,14 @@ class AudioEngine:
             elif magic == MAGIC_VIDEO and self.on_video is not None:
                 self.on_video(data)
 
-    def _send_loop(self) -> None:
+    def _send_loop(self, generation: int) -> None:
         sock = self._sock
+        send_q = self._send_q
         hello_at = 0.0
         caps_at = 0.0
         caps_sent = 0
-        while self._running and sock is not None:
+        while (self._running and sock is not None
+               and generation == self._generation):
             now = time.monotonic()
             self._maybe_log_stats(now)
             if not self._is_server and self._peer is None and self._server_addr:
@@ -1003,7 +1143,7 @@ class AudioEngine:
                 except OSError:
                     pass
             try:
-                stereo, pcm = self._send_q.get(timeout=0.2)
+                stereo, pcm = send_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if self._peer is None:
@@ -1015,8 +1155,16 @@ class AudioEngine:
             try:
                 sock.sendto(packet, self._peer)
                 self._tx_packets += 1
-            except OSError:
-                pass
+            except OSError as exc:
+                # Молча проглатывать нельзя: именно так и терялся звук,
+                # когда старый поток слал в уже закрытый сокет.
+                self._tx_errors += 1
+                if self._tx_errors == 1 or self._tx_errors % 500 == 0:
+                    try:
+                        self.log(f"Ошибка отправки звука ({self._tx_errors}): "
+                                 f"{exc}")
+                    except Exception:
+                        pass
 
     def send_video_packet(self, packet: bytes) -> None:
         """Вызывается видеопотоком; сокет общий со звуком."""

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAccessible, QAccessibleEvent, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QAccessible, QAccessibleEvent, QKeySequence, QPixmap
 
 try:  # Qt 6.8 и новее: «объявление» диктору не зависит от того, где фокус
     from PySide6.QtGui import QAccessibleAnnouncementEvent
@@ -23,7 +23,7 @@ except ImportError:  # на более старом Qt остаётся собы
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QHBoxLayout, QInputDialog, QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
     QPushButton, QSlider,
     QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTextEdit, QTreeWidget,
@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import (__version__, audio, config, effects, history, media, runlog,
-               sounds, updater)
+               shortcuts, sounds, updater)
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
@@ -185,12 +185,20 @@ def label_for(text: str, buddy: QWidget | None = None) -> QLabel:
 
 
 class _ShortcutFilter(QObject):
-    """Control+A и Control+V на главном окне: микрофон и камера.
+    """Пользовательские сочетания клавиш на главном окне.
 
-    В полях ввода сочетания остаются своими: там Control+A выделяет
-    текст, а Control+V вставляет. В читаемом чате они работают как
-    глобальные — там выделять нечего.
+    Карту «сочетание — действие» собирает MainWindow._apply_shortcuts.
+    Назначенное сочетание работает в любом месте программы, но в полях
+    ввода уступает самому полю: иначе нельзя ни выделить, ни скопировать,
+    ни вставить текст.
     """
+
+    # Клавиши, у которых в поле ввода есть своя работа.
+    EDITOR_KEYS = (
+        Qt.Key_A, Qt.Key_C, Qt.Key_V, Qt.Key_X, Qt.Key_Z, Qt.Key_Y,
+        Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down,
+        Qt.Key_Home, Qt.Key_End, Qt.Key_Backspace, Qt.Key_Delete,
+    )
 
     def __init__(self, window: "MainWindow"):
         super().__init__(window)
@@ -209,17 +217,19 @@ class _ShortcutFilter(QObject):
             return False
         if event.isAutoRepeat() or not self.window.isActiveWindow():
             return False
-        if not (event.modifiers() & Qt.ControlModifier):
+        if not self.window._shortcut_map:
             return False
-        key = event.key()
-        if key not in (Qt.Key_A, Qt.Key_V):
+        # Пока человек набирает текст, обычные клавиши правки остаются
+        # за полем ввода.
+        if (event.key() in self.EDITOR_KEYS
+                and self._is_editable_field(QApplication.focusWidget())):
             return False
-        if self._is_editable_field(QApplication.focusWidget()):
+        combo = QKeySequence(event.keyCombination()).toString(
+            QKeySequence.SequenceFormat.PortableText)
+        action = self.window._shortcut_map.get(combo)
+        if not action:
             return False
-        if key == Qt.Key_A:
-            self.window._toggle_mic()
-        else:
-            self.window._toggle_camera()
+        self.window._run_shortcut(action)
         return True
 
 
@@ -230,9 +240,13 @@ class SettingsDialog(QDialog):
     sig_progress = Signal(int)
     sig_download = Signal(dict)
 
-    def __init__(self, cfg: dict, parent=None):
+    def __init__(self, cfg: dict, parent=None, is_teacher: bool | None = None):
         super().__init__(parent)
         self.cfg = cfg
+        self.is_teacher = (bool(is_teacher) if is_teacher is not None
+                           else cfg.get("role") == "teacher")
+        # Сочетания правятся в копии: «Отмена» не должна ничего менять.
+        self.shortcut_map = dict(cfg.get("shortcuts") or {})
         self._downloading = False
         self.sig_update.connect(self._on_update_result)
         self.sig_progress.connect(self._on_progress)
@@ -252,6 +266,7 @@ class SettingsDialog(QDialog):
             ("Аудиовходы", self._page_inputs()),
             ("Аудиовыходы", self._page_outputs()),
             ("Видео", self._page_video()),
+            ("Сочетания клавиш", self._page_shortcuts()),
         ]
         for title, page in sections:
             item = QTreeWidgetItem([title])
@@ -493,6 +508,20 @@ class SettingsDialog(QDialog):
             str(self.cfg["audio"].get("output", "")))
         form.addRow(label_for("Устройство вывода", self.out_combo), self.out_combo)
 
+        # Запас звука на сеть: больше — устойчивее и с более длинной
+        # задержкой, меньше — отзывчивее и чувствительнее к провалам связи.
+        self.buffer_combo = QComboBox()
+        self.buffer_combo.setAccessibleName("Размер буфера звука")
+        for key, title in (("low", "Минимальная задержка, 20–40 мс"),
+                           ("normal", "Обычная, 40–80 мс"),
+                           ("stable", "Устойчивая, 80–160 мс")):
+            self.buffer_combo.addItem(title, key)
+        index = self.buffer_combo.findData(
+            str(self.cfg["audio"].get("buffer", "normal")))
+        self.buffer_combo.setCurrentIndex(index if index >= 0 else 1)
+        form.addRow(label_for("Размер буфера звука", self.buffer_combo),
+                    self.buffer_combo)
+
         hint = QLabel(
             "Для занятий нужны наушники: без них микрофон поймает колонки "
             "и вернёт эхо собеседнику."
@@ -566,6 +595,119 @@ class SettingsDialog(QDialog):
         form.addRow(self.show_remote_box)
 
         return page
+
+    def _page_shortcuts(self) -> QWidget:
+        page = QWidget()
+        page.setAccessibleName("Сочетания клавиш")
+        layout = QVBoxLayout(page)
+
+        hint = QLabel(
+            "Выберите действие стрелками, нажмите нужное сочетание клавиш "
+            "и нажмите «Назначить». Подходят сочетания с Control, Alt или "
+            "клавиши с F1 по F12."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.shortcut_list = QListWidget()
+        self.shortcut_list.setAccessibleName("Действия и их сочетания")
+        for action_id, _title in shortcuts.all_actions(self.is_teacher):
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, action_id)
+            self.shortcut_list.addItem(item)
+        self.shortcut_list.currentItemChanged.connect(
+            lambda *_: self._fill_shortcut_editor())
+        layout.addWidget(self.shortcut_list, 1)
+
+        self.shortcut_edit = QKeySequenceEdit()
+        self.shortcut_edit.setAccessibleName("Новое сочетание клавиш")
+        edit_row = QHBoxLayout()
+        edit_row.addWidget(label_for("Новое сочетание", self.shortcut_edit))
+        edit_row.addWidget(self.shortcut_edit, 1)
+        layout.addLayout(edit_row)
+
+        buttons = QHBoxLayout()
+        self.assign_button = QPushButton("Назначить")
+        self.assign_button.setAccessibleName(
+            "Назначить сочетание выбранному действию")
+        self.clear_button = QPushButton("Сбросить")
+        self.clear_button.setAccessibleName(
+            "Сбросить сочетание у выбранного действия")
+        self.assign_button.clicked.connect(self._assign_shortcut)
+        self.clear_button.clicked.connect(self._clear_shortcut)
+        buttons.addWidget(self.assign_button)
+        buttons.addWidget(self.clear_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self._refresh_shortcut_list()
+        self.shortcut_list.setCurrentRow(0)
+        return page
+
+    def _shortcut_action(self) -> str:
+        item = self.shortcut_list.currentItem()
+        return str(item.data(Qt.ItemDataRole.UserRole)) if item else ""
+
+    def _refresh_shortcut_list(self) -> None:
+        """Переписывает названия: у каждого действия — его сочетание."""
+        titles = dict(shortcuts.all_actions(self.is_teacher))
+        row = self.shortcut_list.currentRow()
+        for index in range(self.shortcut_list.count()):
+            item = self.shortcut_list.item(index)
+            action_id = str(item.data(Qt.ItemDataRole.UserRole))
+            combo = shortcuts.resolved(self.shortcut_map, action_id)
+            state = combo if combo else "не назначено"
+            item.setText(f"{titles.get(action_id, action_id)}: {state}")
+            item.setData(Qt.ItemDataRole.AccessibleTextRole,
+                         item.text())
+        if row >= 0:
+            self.shortcut_list.setCurrentRow(row)
+
+    def _fill_shortcut_editor(self) -> None:
+        action_id = self._shortcut_action()
+        combo = shortcuts.resolved(self.shortcut_map, action_id)
+        self.shortcut_edit.setKeySequence(QKeySequence(combo or ""))
+
+    def _assign_shortcut(self) -> None:
+        action_id = self._shortcut_action()
+        if not action_id:
+            return
+        seq = self.shortcut_edit.keySequence()
+        ok, error = shortcuts.combo_is_safe(seq)
+        if not ok:
+            announce(self.shortcut_list, error)
+            return
+        combo = shortcuts.normalize(
+            seq.toString(QKeySequence.SequenceFormat.PortableText))
+        titles = dict(shortcuts.all_actions(self.is_teacher))
+        # Одно сочетание — одно действие: у прежнего владельца оно
+        # снимается, иначе нажатие срабатывало бы дважды.
+        for other_id, _title in shortcuts.all_actions(self.is_teacher):
+            if other_id == action_id:
+                continue
+            other = shortcuts.resolved(self.shortcut_map, other_id)
+            if other == combo:
+                self.shortcut_map[other_id] = shortcuts.UNSET
+                announce(self.shortcut_list,
+                         f"Сочетание {combo} снято с действия "
+                         f"«{titles.get(other_id, other_id)}».")
+                break
+        self.shortcut_map[action_id] = combo
+        self._refresh_shortcut_list()
+        announce(self.shortcut_list,
+                 f"{titles.get(action_id, action_id)}: назначено {combo}.")
+
+    def _clear_shortcut(self) -> None:
+        action_id = self._shortcut_action()
+        if not action_id:
+            return
+        titles = dict(shortcuts.all_actions(self.is_teacher))
+        # Осознанно снятое сочетание не должно вернуться из значений
+        # по умолчанию.
+        self.shortcut_map[action_id] = shortcuts.UNSET
+        self._refresh_shortcut_list()
+        announce(self.shortcut_list,
+                 f"{titles.get(action_id, action_id)}: сочетание снято.")
 
     # -- обновления ---------------------------------------------------------
 
@@ -678,6 +820,8 @@ class SettingsDialog(QDialog):
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
         cfg["audio"]["midi_fixed_velocity"] = self.midi_fixed_box.isChecked()
         cfg["audio"]["show_all_drivers"] = self.all_drivers_box.isChecked()
+        cfg["audio"]["buffer"] = str(self.buffer_combo.currentData() or "normal")
+        cfg["shortcuts"] = dict(self.shortcut_map)
 
         cfg["video"]["enabled"] = self.video_box.isChecked()
         cfg["video"]["camera"] = int(self.cam_spin.value())
@@ -840,6 +984,8 @@ class MainWindow(QMainWindow):
         self._mic_muted = bool(getattr(self.engine, "mic_muted", False))
         self._cam_on = False
         self._shortcut_filter: _ShortcutFilter | None = None
+        # Сочетание клавиш → действие. Собирается из настроек.
+        self._shortcut_map: dict[str, str] = {}
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
@@ -866,15 +1012,14 @@ class MainWindow(QMainWindow):
         self._player_timer.timeout.connect(self._tick_player)
         self._player_timer.start()
 
-        shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
-        shortcut.activated.connect(self.open_settings)
-
-        # Control+A и Control+V — микрофон и камера. Фильтр стоит на
-        # приложении: в полях ввода он уступает выделению и вставке.
+        # Сочетания клавиш — из настроек, включая старые Control+P,
+        # Control+A и Control+V. Фильтр стоит на приложении: в полях
+        # ввода он уступает выделению, копированию и вставке.
         self._shortcut_filter = _ShortcutFilter(self)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self._shortcut_filter)
+        self._apply_shortcuts()
 
         if self.is_teacher:
             # Общий History.txt из версий до 0.2.5 переезжает в папку
@@ -1479,6 +1624,7 @@ class MainWindow(QMainWindow):
         метроном и MIDI-клавиатура работают до подключения и без сети.
         """
         cfg_audio = self.cfg["audio"]
+        audio.set_buffer_preset(str(cfg_audio.get("buffer", "normal")))
         devices = {
             "in1": cfg_audio.get("device1", ""),
             "in2": cfg_audio.get("device2", ""),
@@ -1562,14 +1708,13 @@ class MainWindow(QMainWindow):
             pass
 
     def _update_cam_button(self) -> None:
+        hint = self._hint("camera")
         if self._cam_on:
-            text = "Выключить камеру (Control+V)"
-            name = "Выключить камеру"
+            text = f"Выключить камеру{hint}"
         else:
-            text = "Включить камеру (Control+V)"
-            name = "Включить камеру"
+            text = f"Включить камеру{hint}"
         self.cam_button.setText(text)
-        self.cam_button.setAccessibleName(name)
+        self.cam_button.setAccessibleName(text)
 
     def _toggle_camera(self) -> None:
         if self._cam_on or self.video_sender is not None:
@@ -1590,14 +1735,13 @@ class MainWindow(QMainWindow):
     # -- микрофон -----------------------------------------------------------
 
     def _update_mic_button(self) -> None:
+        hint = self._hint("mic")
         if self._mic_muted:
-            text = "Включить микрофон (Control+A)"
-            name = "Включить микрофон"
+            text = f"Включить микрофон{hint}"
         else:
-            text = "Выключить микрофон (Control+A)"
-            name = "Выключить микрофон"
+            text = f"Выключить микрофон{hint}"
         self.mic_button.setText(text)
-        self.mic_button.setAccessibleName(name)
+        self.mic_button.setAccessibleName(text)
 
     def _toggle_mic(self) -> None:
         self._mic_muted = not self._mic_muted
@@ -2570,14 +2714,85 @@ class MainWindow(QMainWindow):
                           Qt.SmoothTransformation)
         )
 
+    # -- сочетания клавиш ---------------------------------------------------
+
+    def _hint(self, action_id: str) -> str:
+        """Сочетание в скобках — для подписи кнопки."""
+        combo = shortcuts.resolved(self.cfg.get("shortcuts") or {}, action_id)
+        return f" ({combo})" if combo else ""
+
+    def _apply_shortcuts(self) -> None:
+        """Собирает карту «сочетание — действие» из настроек."""
+        saved = self.cfg.get("shortcuts") or {}
+        mapping: dict[str, str] = {}
+        for action_id, _title in shortcuts.all_actions(self.is_teacher):
+            combo = shortcuts.resolved(saved, action_id)
+            if not combo:
+                continue
+            # Одно сочетание — одно действие: при повторе срабатывает
+            # первое по списку.
+            mapping.setdefault(combo, action_id)
+        self._shortcut_map = mapping
+        self.settings_button.setText(f"Настройки{self._hint('settings')}")
+        self.settings_button.setAccessibleName(self.settings_button.text())
+        self._update_mic_button()
+        self._update_cam_button()
+
+    def _run_shortcut(self, action_id: str) -> None:
+        """Выполняет действие, назначенное на сочетание клавиш."""
+        if action_id.startswith("volume_"):
+            kind, _sep, key = action_id.partition(":")
+            slider = self.sliders.get(key)
+            if slider is None:
+                return
+            step = shortcuts.SLIDER_STEP if kind == "volume_up" else -shortcuts.SLIDER_STEP
+            value = max(slider.minimum(),
+                        min(slider.maximum(), slider.value() + step))
+            slider.setValue(value)
+            announce(slider,
+                     f"{self.slider_titles.get(key, key)}, {value} процентов")
+            return
+        actions = {
+            "volume_mode": self._toggle_volume_mode,
+            "metronome": self.metro_button.toggle,
+            "add_track": self._add_track,
+            "import_audio": self._import_audio,
+            "play": self._toggle_play,
+            "back": lambda: self._seek(-1),
+            "forward": lambda: self._seek(1),
+            "delete_track": self._delete_track,
+            "effects": self._toggle_effects,
+            "slow": lambda: self._change_speed(-1),
+            "fast": lambda: self._change_speed(1),
+            "lower": lambda: self._change_pitch(-1),
+            "raise": lambda: self._change_pitch(1),
+            "speed_reset": self._reset_speed,
+            "pitch_reset": self._reset_pitch,
+            "join": self._join,
+            "send": self._send_message,
+            "send_file": self._send_file,
+            "settings": self.open_settings,
+            "connect": self._on_connect_button,
+            "mic": self._toggle_mic,
+            "camera": self._toggle_camera,
+        }
+        handler = actions.get(action_id)
+        if handler is not None:
+            handler()
+
     # -- настройки ----------------------------------------------------------
 
     def open_settings(self) -> None:
         audio_before = dict(self.cfg["audio"])
-        dialog = SettingsDialog(self.cfg, self)
+        dialog = SettingsDialog(self.cfg, self, self.is_teacher)
         if dialog.exec() != QDialog.Accepted:
             return
         self._apply_volumes()
+        # Новые сочетания клавиш действуют сразу.
+        self._apply_shortcuts()
+        # Размер буфера — общий для обеих сторон обмена, перезапуск не нужен.
+        self.engine.set_buffer_preset(
+            str(self.cfg["audio"].get("buffer", "normal")))
         # Новый шаг перемотки из настроек — на кнопках плеера.
         self._update_player_buttons()
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.
