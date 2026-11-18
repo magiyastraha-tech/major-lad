@@ -50,6 +50,10 @@ STUDENT_MAX = BLOCK * 8
 INPUT_KEEP = BLOCK * 4
 INPUT_MAX = BLOCK * 8
 
+# Длина гашения на провале буфера: 5 мс. Дольше — уже слышно как затухание,
+# короче — остаётся щелчок.
+FADE_FRAMES = AUDIO_BLOCK
+
 # Три набора буферов на выбор владельца. Низкий — минимальная задержка,
 # но дрожание сети слышно сильнее; устойчивый — запас на плохую сеть.
 BUFFER_PRESETS = {
@@ -94,6 +98,24 @@ def set_buffer_preset(name: str) -> str:
     STUDENT_KEEP = INPUT_KEEP = keep
     STUDENT_MAX = INPUT_MAX = maximum
     return name
+
+
+# Запас входному буферу сверх пресета. Нужен, когда вывод открыт на медленном
+# драйвере: тот зовёт обратный вызов пачками, и каждый вызов забирает из
+# микрофонного кольца свой блок. Пачка вычерпывает кольцо досуха, в отправку
+# уходит тишина — у собеседника это слышно как треск.
+_EXTRA_KEEP = 0
+
+
+def set_input_reserve(frames: int) -> None:
+    """Добавляет входному буферу запас сверх пресета (в отсчётах)."""
+    global _EXTRA_KEEP
+    _EXTRA_KEEP = max(0, int(frames))
+
+
+def input_bounds() -> tuple[int, int]:
+    """Рабочая и предельная глубина входного буфера с учётом запаса."""
+    return INPUT_KEEP + _EXTRA_KEEP, INPUT_MAX + _EXTRA_KEEP
 UDP_PORT = 45801
 MAGIC_AUDIO = b"GCA1"
 # Стереозвук: два канала вперемешку, левый и правый. Отдельная метка, чтобы
@@ -123,6 +145,9 @@ class Ring:
         self._read = 0
         self._count = 0
         self._lock = threading.Lock()
+        # Сколько отсчётов отдал последний read — по этому числу видно,
+        # была ли в блоке дырка.
+        self.last_got = 0
         # Статистика для журнала: сколько звука потеряно на переполнении
         # и сколько не хватило при чтении. По этим числам видно, хрипит
         # звук из-за сети, буфера или перегруза входа.
@@ -172,6 +197,7 @@ class Ring:
                     out[first:k] = self._buf[:k - first]
                 self._read = end % self._size
                 self._count -= k
+        self.last_got = k
         return out
 
     def trim(self, keep: int, max_keep: int | None = None) -> None:
@@ -273,6 +299,8 @@ class Source:
         self.device_index = self.device_indices[0] if self.device_indices else -1
         self.ring = Ring(SAMPLE_RATE)
         self.ring_r = Ring(SAMPLE_RATE) if self.mode == "stereo" else None
+        # Последний отсчёт прошлого блока — от него гасим провал буфера.
+        self._last_sample = 0.0
         self.volume = 1.0
         self.stream = None
         self.channels = 1
@@ -352,13 +380,30 @@ class Source:
         else:
             self.ring.write(indata[:, 0].copy())
 
+    def _read_ring(self, ring: Ring, frames: int) -> np.ndarray:
+        """Читает блок и мягко гасит дырку, если звука не хватило.
+
+        Обрыв в тишину — это ступенька в сигнале, и слышна она щелчком,
+        даже если сама тишина короткая. Провал лучше пропустить плавно:
+        за 5 мс уходим от последнего отсчёта в ноль.
+        """
+        ring.trim(*input_bounds())
+        out = ring.read(frames)
+        got = ring.last_got
+        if got < frames:
+            start = out[got - 1] if got > 0 else self._last_sample
+            fade = min(frames - got, FADE_FRAMES)
+            if start and fade > 0:
+                out[got:got + fade] = start * np.linspace(
+                    1.0, 0.0, fade, dtype=np.float32)
+        self._last_sample = float(out[got - 1]) if got > 0 else self._last_sample
+        return out
+
     def read(self, frames: int) -> tuple[np.ndarray, np.ndarray]:
         """Очередной блок: левый и правый каналы. У моно они одинаковые."""
-        self.ring.trim(INPUT_KEEP, INPUT_MAX)
-        left = self.ring.read(frames)
+        left = self._read_ring(self.ring, frames)
         if self.ring_r is not None:
-            self.ring_r.trim(INPUT_KEEP, INPUT_MAX)
-            return left, self.ring_r.read(frames)
+            return left, self._read_ring(self.ring_r, frames)
         return left, left
 
     def close(self) -> None:
@@ -436,6 +481,24 @@ def list_output_devices(show_all: bool = False) -> list[str]:
     return _listed_devices("output", show_all)
 
 
+def _hostapi_slow(index: int) -> bool:
+    """MME и DirectSound отдают звук пачками — им нужен блок побольше.
+
+    WASAPI зовёт обратный вызов ровным потоком каждые 5 мс, и каждый вызов
+    забирает 5 мс микрофона. Старые драйверы могут отдать два-три вызова
+    подряд, и такой пачкой микрофонное кольцо вычерпывается досуха — в
+    отправку уходит тишина, а у собеседника это слышно как треск.
+    """
+    if sd is None:
+        return False
+    try:
+        dev = sd.query_devices(index)
+        name = str(sd.query_hostapis(dev["hostapi"])["name"]).lower()
+    except Exception:
+        return False
+    return "mme" in name or "directsound" in name
+
+
 def _hostapi_rank(device: dict, hostapis: list) -> int:
     try:
         name = str(hostapis[device["hostapi"]]["name"]).lower()
@@ -459,6 +522,24 @@ def _device_key(name: str) -> str:
     return _DUP_NUMBER.sub("(", name or "").strip().lower()
 
 
+# Windows обрезает имена устройств MME до 31 символа: «Динамики (Graphite 2
+# Pro Wirele» — это то же устройство, что «Динамики (Graphite 2 Pro
+# Wireless)» в WASAPI. Без сопоставления по началу имени сохранённое
+# обрезанное имя находило только MME — и программа оставалась на медленном
+# драйвере, хотя WASAPI-вариант был рядом.
+_MME_NAME_LEN = 30
+
+
+def _same_device(a: str, b: str) -> bool:
+    """Одно и то же устройство, даже если одно из имён обрезано."""
+    a_key = _device_key(a)
+    b_key = _device_key(b)
+    if a_key == b_key:
+        return True
+    short, long = (a_key, b_key) if len(a_key) <= len(b_key) else (b_key, a_key)
+    return len(short) >= _MME_NAME_LEN and long.startswith(short)
+
+
 def find_devices(name: str, kind: str) -> list[int]:
     """Все устройства с этим именем, лучший драйвер первым.
 
@@ -476,14 +557,13 @@ def find_devices(name: str, kind: str) -> list[int]:
         return []
 
     def collect(exact: bool) -> list[tuple[int, int]]:
-        key = _device_key(name)
         found: list[tuple[int, int]] = []
         for index, dev in enumerate(devices):
             dev_name = str(dev["name"])
             if exact:
                 if dev_name != name:
                     continue
-            elif _device_key(dev_name) != key:
+            elif not _same_device(dev_name, name):
                 continue
             if kind == "input" and dev["max_input_channels"] <= 0:
                 continue
@@ -733,13 +813,18 @@ class AudioEngine:
         # задержка» не принимается, пробуем обычную.
         out_error: Exception | None = None
         tried: list[str] = []
+        failed: set[tuple[str, str]] = set()
+        opened_index = -1
         for index in out_indices:
             label = device_name(index)
             if label not in tried:
                 tried.append(label)
+            # Медленным драйверам сразу даём блок 10 мс: мельче они всё
+            # равно отдают пачками, только чаще.
+            blocks = (BLOCK, AUDIO_BLOCK) if _hostapi_slow(index) else (AUDIO_BLOCK, BLOCK)
             for channels in (1, 2):
                 opened = False
-                for block in (AUDIO_BLOCK, BLOCK):
+                for block in blocks:
                     for latency_mode in ("low", None):
                         stream = None
                         try:
@@ -755,6 +840,7 @@ class AudioEngine:
                             stream.start()
                             self._out = stream
                             self._out_channels = channels
+                            opened_index = index
                             # Отсчёт для сторожа начинается с открытия:
                             # первые вызовы приходят не сразу.
                             self._last_cb = time.monotonic()
@@ -766,6 +852,13 @@ class AudioEngine:
                             break
                         except Exception as exc:
                             out_error = exc
+                            # Один и тот же отказ повторяется на всех
+                            # вариантах каналов и блоков — пишем его в лог
+                            # один раз, иначе журнал забьётся.
+                            mark = (label, str(exc)[:120])
+                            if mark not in failed:
+                                failed.add(mark)
+                                self.log(f"Выход «{label}» не открылся: {exc}")
                             if stream is not None:
                                 try:
                                     stream.close()
@@ -784,9 +877,16 @@ class AudioEngine:
                      f"Ошибка: {out_error}")
             return False, f"Не удалось открыть аудиовыход: {out_error}"
         latency = _stream_latency(self._out)
-        if latency is not None and latency > 0.06:
-            self.log(f"Внимание: задержка вывода {latency:.3f} с — "
-                     f"похоже, выбран медленный драйвер (MME).")
+        slow = _hostapi_slow(opened_index) or (latency is not None and latency > 0.06)
+        # Медленный вывод зовёт обратный вызов пачками, и каждый вызов
+        # забирает из микрофонного кольца свой блок. Даём входу лишние
+        # 40 мс: голос уйдёт к собеседнику на столько позже, зато без дыр
+        # и треска. Компенсация задержки ниже это учитывает.
+        set_input_reserve(BLOCK * 4 if slow else 0)
+        if slow:
+            at = f" ({latency:.3f} с)" if latency is not None else ""
+            self.log(f"Внимание: вывод открыт на медленном драйвере{at} — "
+                     f"входу добавлен запас 40 мс, чтобы звук не рвался.")
 
         configured = {k: v for k, v in (devices or {}).items() if v}
         for key, name in configured.items():
@@ -1020,7 +1120,8 @@ class AudioEngine:
             value = _stream_latency(source.stream)
             if value is not None and value > in_lat:
                 in_lat = value
-        ring_frames = 0.5 * (INPUT_KEEP + INPUT_MAX)
+        keep, maximum = input_bounds()
+        ring_frames = 0.5 * (keep + maximum)
         return int(round(in_lat * 1000.0 + ring_frames * 1000.0 / SAMPLE_RATE))
 
     def _apply_tx_delay(self) -> int:
@@ -1228,18 +1329,27 @@ class AudioEngine:
 
     def _stats_text(self, seconds: float, final: bool = False) -> str:
         rings = [self.student, self.student_r]
+        in_rings: list = []
         peak = 0.0
         in_clip = 0
         for source in self.sources.values():
             rings.append(source.ring)
+            in_rings.append(source.ring)
             if source.ring_r is not None:
                 rings.append(source.ring_r)
+                in_rings.append(source.ring_r)
             if source.peak > peak:
                 peak = source.peak
             in_clip += source.clipped
             source.peak = 0.0
             source.clipped = 0
         gaps_ms = sum(r.underruns for r in rings) * 1000.0 / SAMPLE_RATE
+        # Отдельно считаем голод приёмного буфера (звук собеседника) и
+        # входных (свой микрофон). Это разные поломки: первая значит, что
+        # до нас не дошёл звук, вторая — что мы отправили тишину вместо
+        # голоса, и трещит тогда у собеседника.
+        peer_gap_ms = (self.student.underruns + self.student_r.underruns) * 1000.0 / SAMPLE_RATE
+        mic_gap_ms = sum(r.underruns for r in in_rings) * 1000.0 / SAMPLE_RATE
         over_ms = sum(r.overflows for r in rings) * 1000.0 / SAMPLE_RATE
         # Считаем за отрезок между записями в журнал, а не с запуска.
         for ring in rings:
@@ -1263,7 +1373,8 @@ class AudioEngine:
             f"принято {self._rx_packets} пакетов",
             f"потеряно {self._rx_lost}",
             f"не по порядку {self._rx_ooo}",
-            f"пустых буферов {gaps_ms:.0f} мс",
+            f"пустых буферов {gaps_ms:.0f} мс "
+            f"(собеседник {peer_gap_ms:.0f}, микрофон {mic_gap_ms:.0f})",
             f"выброшено {over_ms:.0f} мс",
             f"уровень входа {peak:.2f}",
             f"перегруз входа {in_clip}",

@@ -24,6 +24,25 @@ MAGIC_VIDEO = b"GCV1"
 MAX_PAYLOAD = 1100
 HEADER = struct.Struct("!4sIHH")
 
+# THREAD_PRIORITY_BELOW_NORMAL
+_BELOW_NORMAL = -1
+
+
+def _quiet_thread() -> None:
+    """Уводит видео-поток ниже обычного приоритета.
+
+    Звук живёт по жёсткому расписанию: обратный вызов обязан уложиться в
+    свои 5 мс. Кодирование кадра дедлайна не имеет, и если оно захватит
+    процессор в неудачный момент, звук получит провал — на слух это треск.
+    Поэтому видео уступает звуку, а не наоборот.
+    """
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadPriority(
+            ctypes.windll.kernel32.GetCurrentThread(), _BELOW_NORMAL)
+    except Exception:
+        pass
+
 
 class VideoSender:
     def __init__(self, camera: int, fps: int, quality: int, send_fn, log=None,
@@ -50,6 +69,7 @@ class VideoSender:
         return True, "Камера запущена."
 
     def _loop(self) -> None:
+        _quiet_thread()
         cap = cv2.VideoCapture(self.camera)
         if not cap.isOpened():
             self.log(f"Камера {self.camera} не открылась.")
