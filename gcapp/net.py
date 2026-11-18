@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import media
+from . import history, media
 
 APP_PORT = 45800
 UDP_PORT = 45801
@@ -99,9 +99,13 @@ class Server:
     def __init__(self, name: str, on_status=None, on_chat=None, on_file=None,
                  on_peer=None, on_join_request=None, on_video_state=None,
                  on_chat_delete=None, on_chat_edit=None,
+                 chat_history: list | None = None,
                  port: int = APP_PORT):
         self.name = name
         self.port = port
+        # История переписки: тот же список, что показывает программа
+        # преподавателя. Ученик забирает её постранично, когда листает вверх.
+        self._chat_history = chat_history if chat_history is not None else []
         self.on_status = on_status or (lambda *a: None)
         self.on_chat = on_chat or (lambda *a: None)
         self.on_chat_delete = on_chat_delete or (lambda *a: None)
@@ -251,6 +255,21 @@ class Server:
             return False
         return session.send_json({"type": "chat_edit", "id": mid, "text": text})
 
+    def history_page(self, before: str = "", limit: int = 50) -> dict:
+        """Порция истории для ученика: новые сообщения или более ранние."""
+        chunk, more = history.page(list(self._chat_history), before, limit)
+        return {
+            "type": "chat_history",
+            "messages": [
+                {"id": str(m.get("id") or ""),
+                 "time": str(m.get("time") or ""),
+                 "from": str(m.get("sender") or ""),
+                 "text": str(m.get("text") or "")}
+                for m in chunk if m.get("id")
+            ],
+            "more": more,
+        }
+
     def send_file(self, path: str) -> bool:
         session = self.current()
         if session is None:
@@ -367,6 +386,12 @@ class _Session:
             elif kind == "chat_edit":
                 self.server.on_chat_edit(str(msg.get("id") or ""),
                                          str(msg.get("text") or ""))
+            elif kind == "chat_history_req":
+                # Ученик открыл чат или долистал до верхнего сообщения —
+                # отдаём ему очередную порцию прошлой переписки.
+                self.send_json(self.server.history_page(
+                    str(msg.get("before") or ""),
+                    int(msg.get("limit") or 50)))
             elif kind == "file_start":
                 size = int(msg.get("size") or 0)
                 try:
@@ -465,7 +490,8 @@ class Client:
                  on_status=None, on_chat=None, on_file=None,
                  on_ready=None, on_busy=None, on_peer=None,
                  on_ended=None, on_media_list=None, on_media_saved=None,
-                 on_video_state=None, on_chat_delete=None, on_chat_edit=None):
+                 on_video_state=None, on_chat_delete=None, on_chat_edit=None,
+                 on_history=None):
         self.name = name
         self.host = host
         self.port = port
@@ -473,6 +499,9 @@ class Client:
         self.on_chat = on_chat or (lambda *a: None)
         self.on_chat_delete = on_chat_delete or (lambda *a: None)
         self.on_chat_edit = on_chat_edit or (lambda *a: None)
+        # Порция прошлой переписки от преподавателя: сообщения и признак
+        # «раньше есть ещё».
+        self.on_history = on_history or (lambda *a: None)
         self.on_file = on_file or (lambda *a: None)
         self.on_ready = on_ready or (lambda *a: None)
         self.on_busy = on_busy or (lambda *a: None)
@@ -602,6 +631,10 @@ class Client:
                 elif kind == "chat_edit":
                     self.on_chat_edit(str(msg.get("id") or ""),
                                       str(msg.get("text") or ""))
+                elif kind == "chat_history":
+                    msgs = [m for m in (msg.get("messages") or [])
+                            if isinstance(m, dict) and m.get("id")]
+                    self.on_history(msgs, bool(msg.get("more")))
                 elif kind == "file_start":
                     size = int(msg.get("size") or 0)
                     data = recv_exact(sock, size)
@@ -679,6 +712,22 @@ class Client:
         try:
             send_json(sock, {"type": "chat_edit", "id": mid, "text": text},
                       self._send_lock)
+            return True
+        except OSError:
+            self.disconnect()
+            return False
+
+    def request_history(self, before: str = "", limit: int = 50) -> bool:
+        """Попросить у преподавателя прошлую переписку.
+
+        Пустой before — самые новые сообщения; иначе — те, что были
+        до указанного, чтобы листать вверх по одной порции."""
+        sock = self._sock
+        if sock is None or not self._connected:
+            return False
+        try:
+            send_json(sock, {"type": "chat_history_req", "before": before,
+                             "limit": limit}, self._send_lock)
             return True
         except OSError:
             self.disconnect()
