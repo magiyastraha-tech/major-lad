@@ -26,10 +26,15 @@ HEADER = struct.Struct("!4sIHH")
 
 
 class VideoSender:
-    def __init__(self, camera: int, fps: int, quality: int, send_fn, log=None):
+    def __init__(self, camera: int, fps: int, quality: int, send_fn, log=None,
+                 width: int = 640, height: int = 480, bitrate: int = 0):
         self.camera = camera
         self.fps = max(1, min(30, int(fps)))
         self.quality = max(20, min(95, int(quality)))
+        self.width = max(160, min(1920, int(width)))
+        self.height = max(120, min(1080, int(height)))
+        # Предел потока в килобитах в секунду; 0 — без предела.
+        self.bitrate = max(0, int(bitrate))
         self.send_fn = send_fn
         self.log = log or (lambda *a: None)
         self._running = False
@@ -50,9 +55,17 @@ class VideoSender:
             self.log(f"Камера {self.camera} не открылась.")
             self._running = False
             return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        if self.bitrate:
+            self.log(f"Видео: {self.width}×{self.height}, {self.fps} кадров/с, "
+                     f"до {self.bitrate} кбит/с.")
+        else:
+            self.log(f"Видео: {self.width}×{self.height}, {self.fps} кадров/с, "
+                     f"без предела потока.")
         interval = 1.0 / self.fps
+        # Бюджет одного кадра в байтах, если задан предел потока.
+        budget = (self.bitrate * 1000 / 8 / self.fps) if self.bitrate else 0
         try:
             while self._running:
                 started = time.monotonic()
@@ -60,10 +73,22 @@ class VideoSender:
                 if not ok:
                     time.sleep(0.05)
                     continue
+                if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                    frame = cv2.resize(frame, (self.width, self.height),
+                                       interpolation=cv2.INTER_AREA)
                 ok, buf = cv2.imencode(".jpg", frame,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
                 if ok:
-                    self._send(buf.tobytes())
+                    data = buf.tobytes()
+                    if budget:
+                        # Подбираем качество под предел: кадр великоват —
+                        # понижаем сразу, заметно меньше бюджета — поднимаем
+                        # понемногу, чтобы картинка не скакала.
+                        if len(data) > budget * 1.05 and self.quality > 20:
+                            self.quality = max(20, self.quality - 3)
+                        elif len(data) < budget * 0.7 and self.quality < 95:
+                            self.quality += 1
+                    self._send(data)
                 rest = interval - (time.monotonic() - started)
                 if rest > 0:
                     time.sleep(rest)

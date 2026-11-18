@@ -365,11 +365,17 @@ class SettingsDialog(QDialog):
 
         self.dev1_combo = self._device_combo(
             self.cfg["audio"].get("device1", ""), "Аудиоустройство 1")
-        tabs.addTab(self._device_tab(self.dev1_combo), "Аудиоустройство 1")
+        self.mode1_combo = self._mode_combo(
+            self.cfg["audio"].get("mode1", "ch1"), "Режим канала 1")
+        tabs.addTab(self._device_tab(self.dev1_combo, self.mode1_combo),
+                    "Аудиоустройство 1")
 
         self.dev2_combo = self._device_combo(
             self.cfg["audio"].get("device2", ""), "Аудиоустройство 2")
-        tabs.addTab(self._device_tab(self.dev2_combo), "Аудиоустройство 2")
+        self.mode2_combo = self._mode_combo(
+            self.cfg["audio"].get("mode2", "ch1"), "Режим канала 2")
+        tabs.addTab(self._device_tab(self.dev2_combo, self.mode2_combo),
+                    "Аудиоустройство 2")
 
         midi_page = QWidget()
         midi_form = QFormLayout(midi_page)
@@ -408,11 +414,28 @@ class SettingsDialog(QDialog):
         layout.addWidget(hint)
         return page
 
-    def _device_tab(self, combo: QComboBox) -> QWidget:
+    def _mode_combo(self, current: str, name: str) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(False)
+        combo.setAccessibleName(name)
+        combo.addItem("Моно, канал 1", "ch1")
+        combo.addItem("Моно, канал 2", "ch2")
+        combo.addItem("Стерео, канал 1 слева, канал 2 справа", "stereo")
+        index = combo.findData(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.setAccessibleDescription(
+            "Стерео берёт оба входа звуковой карты сразу: первый идёт в левое "
+            "ухо, второй — в правое.")
+        return combo
+
+    def _device_tab(self, combo: QComboBox,
+                    mode_combo: QComboBox | None = None) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
         combo_label = label_for("Устройство", combo)
         form.addRow(combo_label, combo)
+        if mode_combo is not None:
+            form.addRow(label_for("Режим", mode_combo), mode_combo)
         return page
 
     def _page_outputs(self) -> QWidget:
@@ -463,6 +486,37 @@ class SettingsDialog(QDialog):
         self.quality_spin.setValue(int(self.cfg["video"].get("quality", 60)))
         self.quality_spin.setAccessibleName("Качество видео")
         form.addRow(label_for("Качество", self.quality_spin), self.quality_spin)
+
+        self.video_width_spin = QSpinBox()
+        self.video_width_spin.setRange(160, 1920)
+        self.video_width_spin.setSingleStep(16)
+        self.video_width_spin.setValue(int(self.cfg["video"].get("width", 640)))
+        self.video_width_spin.setAccessibleName("Ширина видео")
+        form.addRow(label_for("Ширина", self.video_width_spin),
+                    self.video_width_spin)
+
+        self.video_height_spin = QSpinBox()
+        self.video_height_spin.setRange(120, 1080)
+        self.video_height_spin.setSingleStep(8)
+        self.video_height_spin.setValue(int(self.cfg["video"].get("height", 480)))
+        self.video_height_spin.setAccessibleName("Высота видео")
+        form.addRow(label_for("Высота", self.video_height_spin),
+                    self.video_height_spin)
+
+        # Предел видеопотока. Без предела JPEG сам выбирает размер кадра,
+        # а с пределом качество подстраивается под него.
+        self.video_bitrate_combo = QComboBox()
+        self.video_bitrate_combo.setAccessibleName("Предел видеопотока")
+        for title, rate in (("Без предела", 0), ("128 кбит/с", 128),
+                            ("256 кбит/с", 256), ("512 кбит/с", 512),
+                            ("1 Мбит/с", 1000), ("2 Мбит/с", 2000),
+                            ("4 Мбит/с", 4000)):
+            self.video_bitrate_combo.addItem(title, rate)
+        index = self.video_bitrate_combo.findData(
+            int(self.cfg["video"].get("bitrate", 0)))
+        self.video_bitrate_combo.setCurrentIndex(index if index >= 0 else 0)
+        form.addRow(label_for("Предел потока", self.video_bitrate_combo),
+                    self.video_bitrate_combo)
 
         self.show_remote_box = QCheckBox("Показывать видео собеседника")
         self.show_remote_box.setChecked(bool(self.cfg["video"].get("show_remote", True)))
@@ -575,6 +629,8 @@ class SettingsDialog(QDialog):
         cfg["audio"]["device1"] = self.dev1_combo.currentData() or ""
         cfg["audio"]["device2"] = self.dev2_combo.currentData() or ""
         cfg["audio"]["usb"] = self.usb_combo.currentData() or ""
+        cfg["audio"]["mode1"] = self.mode1_combo.currentData() or "ch1"
+        cfg["audio"]["mode2"] = self.mode2_combo.currentData() or "ch1"
         cfg["audio"]["output"] = self.out_combo.currentData() or ""
         cfg["audio"]["midi_enabled"] = self.midi_box.isChecked()
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
@@ -584,6 +640,10 @@ class SettingsDialog(QDialog):
         cfg["video"]["camera"] = int(self.cam_spin.value())
         cfg["video"]["fps"] = int(self.fps_spin.value())
         cfg["video"]["quality"] = int(self.quality_spin.value())
+        cfg["video"]["width"] = int(self.video_width_spin.value())
+        cfg["video"]["height"] = int(self.video_height_spin.value())
+        cfg["video"]["bitrate"] = int(
+            self.video_bitrate_combo.currentData() or 0)
         cfg["video"]["show_remote"] = self.show_remote_box.isChecked()
 
         config.save(cfg)
@@ -1381,6 +1441,11 @@ class MainWindow(QMainWindow):
             "in2": cfg_audio.get("device2", ""),
             "usb": cfg_audio.get("usb", ""),
         }
+        modes = {
+            "in1": cfg_audio.get("mode1", "ch1"),
+            "in2": cfg_audio.get("mode2", "ch1"),
+            "usb": "ch1",
+        }
         is_server = self.is_teacher
         server_addr = None
         if not is_server and not local_only:
@@ -1391,6 +1456,7 @@ class MainWindow(QMainWindow):
             is_server=is_server,
             server_addr=server_addr,
             devices=devices,
+            modes=modes,
             output=cfg_audio.get("output", ""),
             midi_enabled=bool(cfg_audio.get("midi_enabled", False)),
             midi_port=cfg_audio.get("midi_port", ""),
@@ -1415,6 +1481,9 @@ class MainWindow(QMainWindow):
             camera=int(self.cfg["video"].get("camera", 0)),
             fps=int(self.cfg["video"].get("fps", 15)),
             quality=int(self.cfg["video"].get("quality", 60)),
+            width=int(self.cfg["video"].get("width", 640)),
+            height=int(self.cfg["video"].get("height", 480)),
+            bitrate=int(self.cfg["video"].get("bitrate", 0)),
             send_fn=self.engine.send_video_packet,
             log=self._log_threadsafe,
         )
@@ -2469,7 +2538,8 @@ class MainWindow(QMainWindow):
         # Новый шаг перемотки из настроек — на кнопках плеера.
         self._update_player_buttons()
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.
-        device_keys = ("device1", "device2", "usb", "output")
+        device_keys = ("device1", "device2", "usb", "output",
+                       "mode1", "mode2")
         devices_changed = any(audio_before.get(key) != self.cfg["audio"].get(key)
                               for key in device_keys)
         if self.engine.running and devices_changed:

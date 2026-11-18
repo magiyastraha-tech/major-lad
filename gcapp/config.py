@@ -22,6 +22,10 @@ DEFAULTS = {
         "device2": "",
         "usb": "",
         "output": "",
+        # Режим канала входа: «ch1» — первый вход устройства, «ch2» — второй,
+        # «stereo» — оба сразу (первый слева, второй справа).
+        "mode1": "ch1",
+        "mode2": "ch1",
         "midi_enabled": False,
         "midi_port": "",
         "midi_fixed_velocity": False,
@@ -61,6 +65,10 @@ DEFAULTS = {
         "camera": 0,
         "fps": 15,
         "quality": 60,
+        # Размер кадра и предел потока в кбит/с (0 — без предела).
+        "width": 640,
+        "height": 480,
+        "bitrate": 0,
         "show_remote": True,
     },
 }

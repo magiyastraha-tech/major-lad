@@ -49,7 +49,16 @@ INPUT_KEEP = BLOCK * 4
 INPUT_MAX = BLOCK * 8
 UDP_PORT = 45801
 MAGIC_AUDIO = b"GCA1"
+# Стереозвук: два канала вперемешку, левый и правый. Отдельная метка, чтобы
+# оба конца связи понимали, что в пакете не моно. Старый моноформат остаётся:
+# программа, у которой все входы в режиме моно, шлёт по-прежнему GCA1 и не
+# тратит трафик зря.
+MAGIC_AUDIO_STEREO = b"GCA2"
 MAGIC_HELLO = b"GCH1"
+# Обмен возможностями: «я умею стерео». Шлётся отдельно от приветствия,
+# чтобы связь со старой версией не рвалась: та просто не поймёт пакет и
+# останется на моно, а мы не будем глушить её стереопотоком.
+MAGIC_CAPS = b"GCC2"
 MAGIC_VIDEO = b"GCV1"
 
 
@@ -138,25 +147,48 @@ class Ring:
 # ---------------------------------------------------------------------------
 
 class Source:
-    def __init__(self, key: str, device_indices: list[int] | int):
+    """Один вход: устройство, режим канала и кольцевые буферы.
+
+    Режимы:
+      «ch1»    — моно с первого входа устройства;
+      «ch2»    — моно со второго входа (нужно стереоустройство);
+      «stereo» — оба входа сразу: первый слева, второй справа.
+
+    Стереоисточник держит два буфера; моноблок дублируется в оба канала
+    микшера. Так ученику можно отдать гитару слева, а голос справа.
+    """
+
+    def __init__(self, key: str, device_indices: list[int] | int,
+                 mode: str = "ch1"):
         if isinstance(device_indices, int):
             device_indices = [device_indices]
         self.key = key
+        self.mode = mode if mode in ("ch1", "ch2", "stereo") else "ch1"
         self.device_indices = list(device_indices)
         self.device_index = self.device_indices[0] if self.device_indices else -1
         self.ring = Ring(SAMPLE_RATE)
+        self.ring_r = Ring(SAMPLE_RATE) if self.mode == "stereo" else None
         self.volume = 1.0
         self.stream = None
+        self.channels = 1
+
+    @property
+    def stereo(self) -> bool:
+        return self.ring_r is not None
 
     def open(self) -> None:
-        # Не всякое устройство отдаёт один канал: моно-микрофоны и стерео-
-        # интерфейсы ведут себя по-разному. Пробуем моно, потом стерео.
+        # Не всякое устройство отдаёт нужное число каналов: моно-микрофоны
+        # и стереоинтерфейсы ведут себя по-разному. Второму каналу и стерео
+        # нужно стереоустройство; если его нет, откатываемся на первый вход,
+        # чтобы звук был хоть какой-то.
         # Индексы идут в порядке предпочтения драйверов (WASAPI первым):
         # если один драйвер не открылся, пробуем следующий.
+        want = 1 if self.mode == "ch1" else 2
+        choices = [want] if want == 1 else [2, 1]
         last_error: Exception | None = None
         for index in self.device_indices:
             self.device_index = index
-            for channels in (1, 2):
+            for channels in choices:
                 for block in (AUDIO_BLOCK, BLOCK):
                     stream = None
                     try:
@@ -171,6 +203,11 @@ class Source:
                         )
                         stream.start()
                         self.stream = stream
+                        self.channels = channels
+                        if channels == 1 and self.ring_r is not None:
+                            # Стерео просили, а устройство моно: правый канал
+                            # будет копией левого.
+                            self.ring_r = None
                         return
                     except Exception as exc:
                         last_error = exc
@@ -182,7 +219,22 @@ class Source:
         raise last_error if last_error is not None else RuntimeError("вход не открыт")
 
     def _callback(self, indata, frames, time_info, status) -> None:
-        self.ring.write(indata[:, 0].copy())
+        if self.ring_r is not None and indata.shape[1] > 1:
+            self.ring.write(indata[:, 0].copy())
+            self.ring_r.write(indata[:, 1].copy())
+        elif self.mode == "ch2" and indata.shape[1] > 1:
+            self.ring.write(indata[:, 1].copy())
+        else:
+            self.ring.write(indata[:, 0].copy())
+
+    def read(self, frames: int) -> tuple[np.ndarray, np.ndarray]:
+        """Очередной блок: левый и правый каналы. У моно они одинаковые."""
+        self.ring.trim(INPUT_KEEP, INPUT_MAX)
+        left = self.ring.read(frames)
+        if self.ring_r is not None:
+            self.ring_r.trim(INPUT_KEEP, INPUT_MAX)
+            return left, self.ring_r.read(frames)
+        return left, left
 
     def close(self) -> None:
         if self.stream is not None:
@@ -193,6 +245,8 @@ class Source:
                 pass
             self.stream = None
         self.ring.clear()
+        if self.ring_r is not None:
+            self.ring_r.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +391,13 @@ class AudioEngine:
         self.log = log or (lambda *a: None)
         self.on_video = on_video
         self.student = Ring(SAMPLE_RATE)
+        # Правый канал собеседника. Заполняется, только когда он шлёт стерео;
+        # для моно потока остаётся пустым, и правый канал берётся из левого.
+        self.student_r = Ring(SAMPLE_RATE)
+        self._recv_stereo = False
+        # Собеседник подтвердил, что понимает стерео. Пока не подтвердил —
+        # шлём моно, как раньше.
+        self._peer_stereo = False
         self.sources: dict[str, Source] = {}
         # Две независимые громкости: что слышу я и что слышит собеседник.
         self.volumes = {"student": 0.8, "in1": 1.0, "in2": 1.0,
@@ -362,7 +423,7 @@ class AudioEngine:
     # -- запуск -------------------------------------------------------------
 
     def start(self, is_server: bool, server_addr=None, devices=None,
-              output: str = "", midi_enabled: bool = False,
+              modes=None, output: str = "", midi_enabled: bool = False,
               midi_port: str = "", midi_fixed_velocity: bool = False
               ) -> tuple[bool, str]:
         self.stop()
@@ -457,7 +518,8 @@ class AudioEngine:
             if not indices:
                 self.log(f"Вход не найден: {name}")
                 continue
-            source = Source(key, indices)
+            mode = (modes or {}).get(key, "ch1")
+            source = Source(key, indices, mode)
             try:
                 source.open()
                 self.sources[key] = source
@@ -527,6 +589,9 @@ class AudioEngine:
             self._sock = None
         self._peer = None
         self.student.clear()
+        self.student_r.clear()
+        self._recv_stereo = False
+        self._peer_stereo = False
         while True:
             try:
                 self._send_q.get_nowait()
@@ -583,36 +648,69 @@ class AudioEngine:
         # В наушники: собеседник, своя MIDI-клавиатура и свой метроном.
         # Источники со входов сюда не идут — иначе микрофон поймает колонки
         # и получится эхо.
+        student_vol = self.volumes["student"]
         self.student.trim(STUDENT_KEEP, STUDENT_MAX)
-        local = self.student.read(frames) * self.volumes["student"]
+        local_l = self.student.read(frames) * student_vol
+        if self._recv_stereo:
+            self.student_r.trim(STUDENT_KEEP, STUDENT_MAX)
+            local_r = self.student_r.read(frames) * student_vol
+        else:
+            # Собеседник шлёт моно: правый канал — копия левого.
+            local_r = local_l.copy()
         if synth_out is not None:
-            local += synth_out * midi_local
-        local += clicks * metro_local
+            local_l += synth_out * midi_local
+            local_r += synth_out * midi_local
+        local_l += clicks * metro_local
+        local_r += clicks * metro_local
         if track_local is not None:
-            local[:track_local.size] += track_local
-        np.clip(local, -1.0, 1.0, out=local)
-        # Моно и стерео: в стерео потоке сигнал идёт в оба канала.
-        outdata[:] = local[:, None]
+            local_l[:track_local.size] += track_local
+            local_r[:track_local.size] += track_local
+        np.clip(local_l, -1.0, 1.0, out=local_l)
+        np.clip(local_r, -1.0, 1.0, out=local_r)
+        if self._out_channels > 1:
+            outdata[:, 0] = local_l
+            outdata[:, 1] = local_r
+        else:
+            # Моно-выход: сводим каналы, чтобы никто не потерялся.
+            outdata[:, 0] = 0.5 * (local_l + local_r)
 
         # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
         # Входы читаем всегда, даже при выключенном микрофоне: иначе буфер
         # копил бы звук и после включения выплюнул старую задержку.
-        mix = clicks * metro_peer
+        mix_l = clicks * metro_peer
+        mix_r = mix_l.copy()
+        stereo_out = False
         for source in self.sources.values():
-            source.ring.trim(INPUT_KEEP, INPUT_MAX)
-            block = source.ring.read(frames)
+            left, right = source.read(frames)
+            if source.stereo:
+                stereo_out = True
             if self.mic_muted:
                 continue
             if source.volume > 0:
-                mix += block * source.volume
+                mix_l += left * source.volume
+                mix_r += right * source.volume
         if synth_out is not None:
-            mix += synth_out * midi_peer
+            mix_l += synth_out * midi_peer
+            mix_r += synth_out * midi_peer
         if track_peer is not None:
-            mix[:track_peer.size] += track_peer
+            mix_l[:track_peer.size] += track_peer
+            mix_r[:track_peer.size] += track_peer
 
-        pcm = (np.clip(mix, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        # Стерео шлём, только если собеседник подтвердил, что понимает его.
+        # Старая версия получила бы пакет с незнакомой меткой и оглохла.
+        if stereo_out and self._peer_stereo:
+            interleaved = np.empty(frames * 2, dtype=np.float32)
+            interleaved[0::2] = np.clip(mix_l, -1.0, 1.0)
+            interleaved[1::2] = np.clip(mix_r, -1.0, 1.0)
+            pcm = (interleaved * 32767.0).astype(np.int16).tobytes()
+            packet_data = (True, pcm)
+        else:
+            # Все входы моно (или их нет) — шлём прежним экономным форматом.
+            mix = 0.5 * (mix_l + mix_r)
+            pcm = (np.clip(mix, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+            packet_data = (False, pcm)
         try:
-            self._send_q.put_nowait(pcm)
+            self._send_q.put_nowait(packet_data)
         except queue.Full:
             pass
 
@@ -640,36 +738,74 @@ class AudioEngine:
                         pass
                 continue
 
+            if magic == MAGIC_CAPS:
+                # Собеседник подтвердил стерео. Сервер отвечает тем же, чтобы
+                # и ученик узнал, что преподаватель его понимает.
+                self._peer = addr if self._is_server else self._server_addr
+                self._peer_stereo = True
+                if self._is_server:
+                    try:
+                        sock.sendto(MAGIC_CAPS + b"\x01", addr)
+                    except OSError:
+                        pass
+                continue
+
             # Любой пакет от собеседника подтверждает его адрес.
-            if self._peer is None and magic in (MAGIC_AUDIO, MAGIC_VIDEO):
+            if self._peer is None and magic in (MAGIC_AUDIO,
+                                                MAGIC_AUDIO_STEREO,
+                                                MAGIC_VIDEO):
                 self._peer = addr
 
             if magic == MAGIC_AUDIO:
                 pcm = np.frombuffer(data[8:], dtype=np.int16)
+                self._recv_stereo = False
                 self.student.write(pcm.astype(np.float32) / 32768.0)
+            elif magic == MAGIC_AUDIO_STEREO:
+                # Пары int16 вперемешку: левый, правый, левый, правый…
+                samples = np.frombuffer(data[8:], dtype=np.int16)
+                frames = samples.size // 2
+                if frames:
+                    samples = samples[:frames * 2].astype(np.float32) / 32768.0
+                    self._recv_stereo = True
+                    self.student.write(samples[0::2].copy())
+                    self.student_r.write(samples[1::2].copy())
             elif magic == MAGIC_VIDEO and self.on_video is not None:
                 self.on_video(data)
 
     def _send_loop(self) -> None:
         sock = self._sock
         hello_at = 0.0
+        caps_at = 0.0
+        caps_sent = 0
         while self._running and sock is not None:
+            now = time.monotonic()
             if not self._is_server and self._peer is None and self._server_addr:
-                now = time.monotonic()
                 if now - hello_at > 1.0:
                     hello_at = now
                     try:
                         sock.sendto(MAGIC_HELLO, self._server_addr)
                     except OSError:
                         pass
+            # Как только связь есть, пару раз сообщаем, что умеем стерео.
+            # Повтор на случай потери пакета; ответ собеседника включит
+            # стереопоток, молчание — значит он старый или не умеет.
+            if (self._peer is not None and not self._peer_stereo
+                    and caps_sent < 5 and now - caps_at > 1.0):
+                caps_at = now
+                caps_sent += 1
+                try:
+                    sock.sendto(MAGIC_CAPS + b"\x01", self._peer)
+                except OSError:
+                    pass
             try:
-                pcm = self._send_q.get(timeout=0.2)
+                stereo, pcm = self._send_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if self._peer is None:
                 continue
             self._seq = (self._seq + 1) & 0xFFFFFFFF
-            packet = MAGIC_AUDIO + struct.pack("!I", self._seq) + pcm
+            magic = MAGIC_AUDIO_STEREO if stereo else MAGIC_AUDIO
+            packet = magic + struct.pack("!I", self._seq) + pcm
             try:
                 sock.sendto(packet, self._peer)
             except OSError:
