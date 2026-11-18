@@ -29,8 +29,11 @@ CHANNELS = (1, 2)
 # Тесты на двух тонах дали 43 дБ сигнал/шум против 22 дБ у речевого режима.
 APPLICATION_AUDIO = 2049
 _BANDWIDTH_FULLBAND = 1105
-_BITRATE_MONO = 64000
-_BITRATE_STEREO = 96000
+# 64 кбит/с хватало для речи, но гитара на громких переходах «плыла»:
+# на них кодеру не хватало битов, и звук становился мутным. 96/128 кбит/с
+# — тот же канал, что тянет видео, и заметно больше запаса для музыки.
+_BITRATE_MONO = 96000
+_BITRATE_STEREO = 128000
 _COMPLEXITY = 10
 
 _SET_BITRATE = 4002
@@ -133,6 +136,11 @@ def _bind(lib) -> None:
     lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
     lib.opus_get_version_string.restype = ctypes.c_char_p
     lib.opus_get_version_string.argtypes = []
+
+
+def bitrate(stereo: bool) -> int:
+    """Сколько кбит/с уходит на канал при таком числе каналов."""
+    return (_BITRATE_STEREO if stereo else _BITRATE_MONO) // 1000
 
 
 def available() -> bool:

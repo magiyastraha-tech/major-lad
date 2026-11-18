@@ -1878,9 +1878,8 @@ class AudioEngine:
                 if not opus_logged:
                     opus_logged = True
                     try:
-                        rate = "96" if stereo else "64"
                         self.log(f"Звук сжимается кодеком Opus, "
-                                 f"{rate} кбит/с.")
+                                 f"{opus_codec.bitrate(stereo)} кбит/с.")
                     except Exception:
                         pass
         for encoder in encoders.values():
