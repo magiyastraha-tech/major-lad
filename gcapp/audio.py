@@ -28,7 +28,8 @@ except Exception:  # pragma: no cover - без PortAudio модуль всё р�
 
 from .media import Player
 from .metronome import Metronome
-from .midi_synth import MidiInput, Synth
+from .midi_synth import (MidiInput, Synth, list_midi_ports, pick_port,
+                         port_key)
 
 SAMPLE_RATE = 48000
 BLOCK = 480          # 10 мс — единица буферов и пакетов
@@ -61,6 +62,27 @@ BUFFER_PRESET_NAMES = {
     "normal": "обычный",
     "stable": "устойчивый",
 }
+
+
+# Мягкий лимитер вместо жёсткого клиппинга. Жёсткий срез по единице — это
+# цифровой перегруз: на слух он хрипит и щёлкает. До колена сигнал не
+# трогаем совсем, выше — плавно поджимаем по tanh: громкое место остаётся
+# плотным, но в потолок не упирается.
+LIMIT_KNEE = 0.7
+
+
+def soft_limit(x: np.ndarray) -> np.ndarray:
+    """Поджимает пики выше 0.7, не давая сигналу дойти до 1.0."""
+    if x.size == 0:
+        return x
+    ax = np.abs(x)
+    peak = float(np.max(ax))
+    if peak <= LIMIT_KNEE:
+        return x
+    over = np.clip((ax - LIMIT_KNEE) / (1.0 - LIMIT_KNEE), 0.0, None)
+    shaped = LIMIT_KNEE + (1.0 - LIMIT_KNEE) * np.tanh(over)
+    return np.where(ax > LIMIT_KNEE, np.sign(x) * shaped, x).astype(
+        np.float32, copy=False)
 
 
 def set_buffer_preset(name: str) -> str:
@@ -584,6 +606,17 @@ class AudioEngine:
         self._tx_dropped = 0
         self._tx_nopeer = 0
         self._tx_clip = 0
+        # Чья сторона играет минус и метроном. «local» — моя, «peer» —
+        # собеседника: тогда его поток уже содержит дорожку и клик, а свой
+        # плеер и метроном молчат, чтобы не было рассинхрона.
+        self.backing_source = "local"
+        # Настройки MIDI запоминаются, чтобы автоподхват знал, какой порт
+        # ждать, когда клавиатуру включат уже после запуска программы.
+        self._midi_enabled = False
+        self._midi_port = ""
+        self._midi_fixed = False
+        self._midi_absent = ""
+        self._midi_last_try = 0.0
 
     # -- запуск -------------------------------------------------------------
 
@@ -728,7 +761,7 @@ class AudioEngine:
                          if in_latency is not None else "")
             self.log(f"Вход открыт: {device_name(source.device_index)}, "
                      f"{source.channels} кан., {mode_label}, "
-                     f"блок {source.block}{in_detail})")
+                     f"блок {source.block}{in_detail}")
 
         if midi_enabled:
             self.set_midi(True, midi_port, midi_fixed_velocity)
@@ -744,20 +777,74 @@ class AudioEngine:
         Нужно, чтобы клавиатура начинала играть сразу после сохранения
         настроек, без закрытия кабинета.
         """
+        self._midi_enabled = bool(enabled)
+        self._midi_port = port or ""
+        self._midi_fixed = bool(fixed_velocity)
+        self._midi_absent = ""
         if self.midi is not None:
             self.midi.close()
             self.midi = None
         if not enabled:
             self.synth = None
             return
+        self._open_midi()
+
+    def _open_midi(self) -> bool:
+        """Открывает сохранённый порт. Клавиатуры нет — тихо ждёт её."""
+        ports = list_midi_ports()
+        name = pick_port(self._midi_port, ports)
+        if not name:
+            if ports and self._midi_port and self._midi_absent != self._midi_port:
+                self._midi_absent = self._midi_port
+                self.log(f"MIDI «{self._midi_port}» не подключена, жду.")
+            return False
         if self.synth is None:
             self.synth = Synth(SAMPLE_RATE)
-        self.synth.fixed_velocity = bool(fixed_velocity)
+        self.synth.fixed_velocity = self._midi_fixed
         midi = MidiInput(self.synth, self.log)
-        if not midi.open(port):
+        if not midi.open(name):
             self.log("MIDI-устройство не открыто.")
-            return
+            return False
         self.midi = midi
+        self._midi_absent = ""
+        return True
+
+    def ensure_midi(self) -> None:
+        """Подхватывает клавиатуру при подключении и отпускает при отключении.
+
+        Порты MIDI не присылают события «воткнули/выдернули»: их видно
+        только повторным опросом. Вызывается по таймеру, пока звук запущен.
+        """
+        if not self._midi_enabled or not self._running:
+            return
+        ports = list_midi_ports()
+        if self.midi is not None:
+            current = self.midi.port_name
+            wanted = pick_port(self._midi_port, ports) if self._midi_port else (
+                ports[0] if ports else "")
+            if current and wanted and port_key(wanted) == port_key(current):
+                return
+            self.log(f"MIDI-клавиатура «{current}» отключена.")
+            self.midi.close()
+            self.midi = None
+            self.synth = None
+        if self._midi_port and not pick_port(self._midi_port, ports):
+            if self._midi_absent != self._midi_port:
+                self._midi_absent = self._midi_port
+                self.log(f"MIDI «{self._midi_port}» не подключена, жду.")
+            return
+        # Не чаще раза в 5 секунд: неудачная попытка иначе писала бы
+        # в журнал одну и ту же строку каждые два такта таймера.
+        now = time.monotonic()
+        if now - self._midi_last_try < 5.0:
+            return
+        self._midi_last_try = now
+        self._open_midi()
+
+    def set_backing_source(self, value: str) -> str:
+        """Чья сторона играет минус и метроном: «local» или «peer»."""
+        self.backing_source = "peer" if value == "peer" else "local"
+        return self.backing_source
 
     def set_metronome(self, enabled: bool, bpm: int = 90, beats: int = 4) -> None:
         self.metronome.configure(enabled, bpm, beats)
@@ -874,17 +961,22 @@ class AudioEngine:
                 synth_out = synth.render(frames)
             except Exception:
                 synth_out = None
+        # Чья сторона ведёт минус и метроном. Если ведёт собеседник, свой
+        # клик и свой трек здесь молчат: они уже пришли в его потоке, а
+        # второй экземпляр разъехался бы по фазе и дал эхо.
+        backing = self.backing_source != "peer"
         midi_local = self.volumes.get("midi", 0.8)
         midi_peer = self.volumes_peer.get("midi", 0.8)
-        metro_local = self.volumes.get("metronome", 0.6)
-        metro_peer = self.volumes_peer.get("metronome", 0.6)
-        clicks = self.metronome.render(frames)
+        metro_local = self.volumes.get("metronome", 0.6) if backing else 0.0
+        metro_peer = self.volumes_peer.get("metronome", 0.6) if backing else 0.0
+        clicks = (self.metronome.render(frames) if backing
+                  else np.zeros(frames, dtype=np.float32))
 
         # Трек рендерится ровно один раз (внутри позиция) и идёт в обе
         # стороны: в наушники и в поток собеседнику. Поэтому у ученика нет
         # своего плеера, который надо синхронизировать — он слышит трек в
         # общем потоке с той же задержкой, что и голос.
-        track = self.player.render(frames)
+        track = self.player.render(frames) if backing else None
         track_local = track_peer = None
         if track is not None:
             if self.volumes.get("player", 0.8) > 0:
@@ -912,6 +1004,10 @@ class AudioEngine:
         if track_local is not None:
             local_l[:track_local.size] += track_local
             local_r[:track_local.size] += track_local
+        # Мягкий лимитер, а не жёсткий срез: громкий аккорд или хор
+        # поджимается плавно и не превращается в цифровой хрип.
+        local_l = soft_limit(local_l)
+        local_r = soft_limit(local_r)
         np.clip(local_l, -1.0, 1.0, out=local_l)
         np.clip(local_r, -1.0, 1.0, out=local_r)
         if self._out_channels > 1:
@@ -943,14 +1039,17 @@ class AudioEngine:
             mix_l[:track_peer.size] += track_peer
             mix_r[:track_peer.size] += track_peer
 
-        # Перегруз в отправляемом миксе: всё, что выше единицы, срезается
-        # жёстко и на слух хрипит. Считаем такие блоки для журнала.
+        # Перегруз считаем до лимитера: именно эти блоки раньше срезались
+        # жёстко и хрипели. Теперь их поджимает soft_limit, но число
+        # по-прежнему подсказывает, что где-то слишком громко.
         try:
             if (float(np.max(np.abs(mix_l))) >= 1.0
                     or float(np.max(np.abs(mix_r))) >= 1.0):
                 self._tx_clip += 1
         except Exception:
             pass
+        mix_l = soft_limit(mix_l)
+        mix_r = soft_limit(mix_r)
 
         # Стерео шлём, только если собеседник подтвердил, что понимает его.
         # Старая версия получила бы пакет с незнакомой меткой и оглохла.

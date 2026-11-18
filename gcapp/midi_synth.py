@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 
 import numpy as np
@@ -38,6 +39,32 @@ def list_midi_ports() -> list[str]:
                 del probe
             except Exception:
                 pass
+
+
+def port_key(name: str) -> str:
+    """Имя порта для сравнения — без хвостового номера и регистра.
+
+    Windows прибавляет к имени копии число: «Impact LX49+ 1», а после
+    переподключения номер может стать другим или исчезнуть. Сравнивать
+    точные строки из-за этого нельзя.
+    """
+    return re.sub(r"\s+\d+$", "", (name or "").strip()).strip().lower()
+
+
+def pick_port(port_name: str, ports: list[str]) -> str:
+    """Какой порт открывать. Пустая строка — подходящего нет."""
+    if not ports:
+        return ""
+    if port_name:
+        if port_name in ports:
+            return port_name
+        key = port_key(port_name)
+        for name in ports:
+            if port_key(name) == key:
+                return name
+        # Сохранённого устройства нет среди подключённых.
+        return ""
+    return ports[0]
 
 
 MAX_VOICES = 24
@@ -188,16 +215,17 @@ class MidiInput:
             if not ports:
                 self.log("MIDI-устройства не найдены.")
                 return False
+            names = [str(p) for p in ports]
             index = 0
             if port_name:
-                for i, name in enumerate(ports):
-                    if name == port_name:
-                        index = i
-                        break
-                else:
+                chosen = pick_port(port_name, names)
+                if not chosen:
+                    # Сохранённого устройства сейчас нет. Молча играть в
+                    # другое не нужно: это не тот инструмент.
                     self.log(f"MIDI-устройство «{port_name}» не найдено. "
-                             f"Доступны: {', '.join(str(p) for p in ports)}. "
-                             f"Открываю «{ports[0]}».")
+                             f"Доступны: {', '.join(names)}.")
+                    return False
+                index = names.index(chosen)
             midi.open_port(index)
             midi.set_callback(self._on_message)
             try:
@@ -205,12 +233,17 @@ class MidiInput:
             except Exception:
                 pass
             self._midi = midi
-            self._port_name = ports[index]
+            self._port_name = names[index]
             self.log(f"MIDI открыт: {self._port_name}")
             return True
         except Exception as exc:
             self.log(f"Ошибка MIDI: {exc}")
             return False
+
+    @property
+    def port_name(self) -> str:
+        """Имя открытого порта. Пусто — ничего не открыто."""
+        return self._port_name
 
     def _on_message(self, event, data=None) -> None:
         message = event[0] if isinstance(event, tuple) else event
@@ -233,3 +266,4 @@ class MidiInput:
             except Exception:
                 pass
             self._midi = None
+        self._port_name = ""

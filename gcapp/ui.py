@@ -498,6 +498,23 @@ class SettingsDialog(QDialog):
         self.all_drivers_box.toggled.connect(self._refresh_device_lists)
         layout.addWidget(self.all_drivers_box)
 
+        # Чья сторона играет минус и метроном. Когда дорожка звучит только
+        # на одной стороне, она приходит собеседнику в общем потоке — с
+        # задержкой связи, но точно в одном тайминге с голосом.
+        self.backing_combo = QComboBox()
+        self.backing_combo.setAccessibleName("Минус и метроном")
+        self.backing_combo.addItem("Играет моя сторона", "local")
+        self.backing_combo.addItem("Играет сторона собеседника", "peer")
+        index = self.backing_combo.findData(
+            str(self.cfg["audio"].get("backing_source", "local")))
+        self.backing_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.backing_combo.setAccessibleDescription(
+            "Если минус запускаешь ты, оставь «моя сторона»: ученик услышит "
+            "трек в твоём потоке. Если минус запускает ученик, выбери «сторона "
+            "собеседника» — твой плеер и метроном замолчат.")
+        layout.addWidget(label_for("Минус и метроном", self.backing_combo))
+        layout.addWidget(self.backing_combo)
+
         hint = QLabel(
             "Список устройств обновляется при открытии настроек. "
             "Новую звуковую карту лучше подключить до запуска программы."
@@ -856,6 +873,8 @@ class SettingsDialog(QDialog):
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
         cfg["audio"]["midi_fixed_velocity"] = self.midi_fixed_box.isChecked()
         cfg["audio"]["show_all_drivers"] = self.all_drivers_box.isChecked()
+        cfg["audio"]["backing_source"] = (
+            self.backing_combo.currentData() or "local")
         cfg["audio"]["buffer"] = str(self.buffer_combo.currentData() or "normal")
         cfg["shortcuts"] = dict(self.shortcut_map)
 
@@ -1039,6 +1058,7 @@ class MainWindow(QMainWindow):
         self._wire_signals()
         self._apply_volumes()
         self._apply_metronome()
+        self._apply_backing_source()
         self._refresh_tracks()
 
         # Позиция трека и «трек закончился» читаются опросом: сам плеер
@@ -1047,6 +1067,14 @@ class MainWindow(QMainWindow):
         self._player_timer.setInterval(400)
         self._player_timer.timeout.connect(self._tick_player)
         self._player_timer.start()
+
+        # MIDI-клавиатура подключается и отключается молча: порты не шлют
+        # событий, поэтому опрашиваем их раз в две секунды. Движок сам
+        # решит, открывать ли порт — без клавиатуры опрос тихий.
+        self._midi_timer = QTimer(self)
+        self._midi_timer.setInterval(2000)
+        self._midi_timer.timeout.connect(self._tick_midi)
+        self._midi_timer.start()
 
         # Сочетания клавиш — из настроек, включая старые Control+P,
         # Control+A и Control+V. Фильтр стоит на приложении: в полях
@@ -1692,6 +1720,7 @@ class MainWindow(QMainWindow):
         if ok:
             self._apply_volumes()
             self._apply_metronome()
+            self._apply_backing_source()
             if self.connected:
                 self._start_video()
         return ok
@@ -1898,6 +1927,36 @@ class MainWindow(QMainWindow):
         self._update_metro_button()
         self.engine.set_metronome(enabled, bpm, beats)
         self._refresh_volume_visibility()
+
+    def _apply_backing_source(self) -> None:
+        """Кто ведёт минус и метроном: моя сторона или собеседника.
+
+        Когда ведёт собеседник, его поток уже содержит дорожку и клик.
+        Свой плеер и метроном в этот момент не нужны: второй экземпляр
+        разъехался бы по фазе и дал эхо, поэтому кнопки гаснут.
+        """
+        peer = str(self.cfg["audio"].get("backing_source", "local")) == "peer"
+        self.engine.set_backing_source("peer" if peer else "local")
+        if peer:
+            if self.metro_button.isChecked():
+                self.metro_button.blockSignals(True)
+                self.metro_button.setChecked(False)
+                self.metro_button.blockSignals(False)
+                cfg_metro = self.cfg.setdefault("metronome", {})
+                cfg_metro["enabled"] = False
+                self._update_metro_button()
+                self.engine.set_metronome(False, self.bpm_spin.value(),
+                                          self.beats_spin.value())
+            if self.engine.player.playing:
+                self.engine.player.stop()
+                self._update_player_buttons()
+        for widget in (self.metro_button, self.metro_row, self.play_button,
+                       self.back_button, self.forward_button):
+            widget.setEnabled(not peer)
+        hint = ("Минус и метроном сейчас идут со стороны собеседника."
+                if peer else "")
+        for widget in (self.metro_button, self.play_button):
+            widget.setAccessibleDescription(hint)
 
     def _on_metronome_toggle(self, checked: bool) -> None:
         cfg_metro = self.cfg.setdefault("metronome", {})
@@ -2306,6 +2365,15 @@ class MainWindow(QMainWindow):
         word = "Назад" if direction < 0 else "Вперёд"
         self._set_status(f"{word} на {step} секунд. "
                          f"Позиция {_clock(position)} из {duration}.")
+
+    def _tick_midi(self) -> None:
+        """Автоподхват MIDI-клавиатуры: воткнули или выдернули — без настроек."""
+        if not self.engine.running:
+            return
+        try:
+            self.engine.ensure_midi()
+        except Exception as exc:
+            self._log_threadsafe(f"Ошибка автоподхвата MIDI: {exc}")
 
     def _tick_player(self) -> None:
         player = self.engine.player
