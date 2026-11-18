@@ -99,6 +99,7 @@ class Server:
     def __init__(self, name: str, on_status=None, on_chat=None, on_file=None,
                  on_peer=None, on_join_request=None, on_video_state=None,
                  on_chat_delete=None, on_chat_edit=None,
+                 on_history_loaded=None,
                  chat_history: list | None = None,
                  port: int = APP_PORT):
         self.name = name
@@ -106,6 +107,9 @@ class Server:
         # История переписки: тот же список, что показывает программа
         # преподавателя. Ученик забирает её постранично, когда листает вверх.
         self._chat_history = chat_history if chat_history is not None else []
+        # Вызывается, когда в кабинет вошёл новый ученик и его переписка
+        # подставлена: окно преподавателя перерисовывает чат.
+        self.on_history_loaded = on_history_loaded or (lambda *a: None)
         self.on_status = on_status or (lambda *a: None)
         self.on_chat = on_chat or (lambda *a: None)
         self.on_chat_delete = on_chat_delete or (lambda *a: None)
@@ -174,6 +178,25 @@ class Server:
         """Имя ученика, который сейчас в кабинете. Пусто — кабинет свободен."""
         with self._lock:
             return self._active.name if self._active is not None else ""
+
+    def is_active(self, session: "_Session") -> bool:
+        """Этот вход всё ещё занимает кабинет."""
+        with self._lock:
+            return self._active is session
+
+    def activate_history(self, student: str) -> None:
+        """Подставляет в кабинет переписку именно этого ученика.
+
+        У программы преподавателя один список истории на всё время работы,
+        и он же отдан серверу. Поэтому содержимое меняется на месте: новый
+        список разошёлся бы с тем, что показывает окно. Меняем раньше, чем
+        ученику уйдёт «готово», — иначе его первый запрос истории получил бы
+        переписку предыдущего ученика.
+        """
+        loaded = history.load(student)
+        with self._lock:
+            self._chat_history[:] = loaded
+        self.on_history_loaded(student)
 
     def request_join(self, session: "_Session") -> None:
         """Спросить преподавателя, пускать ли второго ученика."""
@@ -319,6 +342,7 @@ class _Session:
             return False
 
     def promote(self) -> None:
+        self.server.activate_history(self.name)
         self._promoted.set()
         if self.send_json({"type": "ready"}):
             self.server.on_peer(True)
@@ -345,6 +369,7 @@ class _Session:
         self.name = (str(hello.get("name") or "Ученик")).strip()[:40] or "Ученик"
 
         if self.server.join(self):
+            self.server.activate_history(self.name)
             self.send_json({"type": "joined", "teacher": self.server.name})
             self.server.on_peer(True)
             self.server.on_status(f"Ученик в кабинете: {self.name}")
@@ -375,6 +400,11 @@ class _Session:
             try:
                 msg = recv_json(self.conn)
             except Exception:
+                break
+            # Кабинет уже занят другим учеником: этот вход больше ничего не
+            # пишет в общую переписку и не читает её — у каждого ученика
+            # теперь своя история.
+            if not self.server.is_active(self):
                 break
             kind = msg.get("type")
             if kind == "chat":

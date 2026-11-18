@@ -579,6 +579,8 @@ class MainWindow(QMainWindow):
     # Порция прошлой переписки от преподавателя: список сообщений и
     # признак «раньше есть ещё».
     sig_history = Signal(object, bool)
+    # В кабинет вошёл ученик, и в чат подставлена именно его переписка.
+    sig_history_loaded = Signal(str)
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -592,10 +594,14 @@ class MainWindow(QMainWindow):
         self.client: Client | None = None
         self._join_queue: list = []
         self._join_dialog_open = False
-        # История переписки. У преподавателя это весь чат из History.txt:
-        # его показывает он сам и постранично отдаёт ученику. У ученика —
-        # только загруженные с сервера сообщения.
+        # История переписки. У преподавателя это чат с учеником, который
+        # сейчас в кабинете: его показывает окно и постранично отдаёт
+        # ученику. У каждого ученика свой файл в папке History. У ученика
+        # здесь только загруженные с сервера сообщения.
         self._history: list[dict] = []
+        # Чья переписка сейчас на экране: по этому имени сохраняются
+        # правка и удаление сообщений, когда ученик уже отключился.
+        self._history_student = ""
         self._history_more = False
         self._history_pending = False
         self._loading_history = False
@@ -647,7 +653,8 @@ class MainWindow(QMainWindow):
             app.installEventFilter(self._shortcut_filter)
 
         if self.is_teacher:
-            self._load_saved_history()
+            # Чат при запуске пустой: переписка появляется, когда вошёл
+            # ученик, — у каждого своя.
             self._start_teacher()
         else:
             QTimer.singleShot(300, self._start_student)
@@ -876,6 +883,7 @@ class MainWindow(QMainWindow):
         self.sig_chat_delete.connect(self._on_chat_delete)
         self.sig_chat_edit.connect(self._on_chat_edit)
         self.sig_history.connect(self._on_history)
+        self.sig_history_loaded.connect(self._on_history_loaded)
         # Поднялись стрелкой на самое верхнее сообщение — догружаем
         # предыдущую порцию переписки.
         self.chat_list.currentRowChanged.connect(self._on_chat_row_changed)
@@ -906,6 +914,7 @@ class MainWindow(QMainWindow):
             on_peer=self.sig_peer.emit,
             on_join_request=self.sig_join_request.emit,
             on_video_state=self.sig_peer_video.emit,
+            on_history_loaded=self.sig_history_loaded.emit,
             chat_history=self._history,
             port=int(self.cfg.get("server_port", 45800)),
         )
@@ -1695,7 +1704,7 @@ class MainWindow(QMainWindow):
         announce(self.chat_list, f"Новое сообщение от {sender}: {text}")
 
     def _record_history(self, sender: str, text: str, mid: str) -> None:
-        """Запоминает сообщение переписки и сохраняет History.txt.
+        """Запоминает сообщение переписки и сохраняет файл ученика.
 
         В историю идут только настоящие сообщения: строки состояния и
         подсказки программы разговором не считаются.
@@ -1704,8 +1713,8 @@ class MainWindow(QMainWindow):
             return
         if sender == "система":
             return
-        # «вы» — подпись на экране преподавателя. В общем файле это должно
-        # быть его имя: ученик прочтёт «вы» как себя самого.
+        # «вы» — подпись на экране преподавателя. В файле это должно быть
+        # его имя: ученик прочтёт «вы» как себя самого.
         if sender == "вы":
             sender = str(self.cfg.get("name") or "Преподаватель")
         self._history.append({
@@ -1717,19 +1726,34 @@ class MainWindow(QMainWindow):
         if len(self._history) > history.MAX_MESSAGES:
             # Режем на месте: у сервера тот же список, его нельзя заменять.
             del self._history[:len(self._history) - history.MAX_MESSAGES]
-        history.save(self._history)
+        student = self._history_student_name()
+        if student:
+            history.save(self._history, student)
 
-    def _load_saved_history(self) -> None:
-        """Показывает последние сообщения прошлых занятий.
+    def _history_student_name(self) -> str:
+        """Ученик, к чьей переписке относится то, что сейчас на экране.
 
-        Вся история в окно не грузится: сначала последняя порция, а более
-        ранняя подтягивается, когда преподаватель листает чат вверх.
+        Пока ученик в кабинете — он; когда отключился — тот, чья переписка
+        осталась открыта, чтобы правка и удаление после урока тоже попали
+        в его файл.
         """
-        self._history = history.load()
+        active = self.server.active_name if self.server is not None else ""
+        return str(active or self._history_student)
+
+    def _on_history_loaded(self, student: str) -> None:
+        """Показывает переписку ученика, который вошёл в кабинет.
+
+        У каждого ученика свой разговор, поэтому при смене ученика чат
+        пересобирается заново: сначала последняя порция, а более ранняя
+        подтягивается, когда преподаватель листает чат вверх.
+        """
+        self._history_student = str(student or "")
         chunk, more = history.page(self._history, "", PAGE)
         self._history_more = more
+        self._history_pending = False
         self._loading_history = True
         try:
+            self.chat_list.clear()
             for m in chunk:
                 self._add_chat_item(
                     self._display_sender(str(m.get("sender") or "")),
@@ -1740,6 +1764,12 @@ class MainWindow(QMainWindow):
             self._loading_history = False
         self._refresh_chat()
         self.chat_list.scrollToBottom()
+        if chunk:
+            announce(self.chat_list,
+                     f"Переписка с {student}. Показаны последние сообщения, "
+                     f"{len(chunk)}.")
+        else:
+            announce(self.chat_list, f"Переписки с {student} пока нет.")
 
     @staticmethod
     def _parse_time(value) -> datetime | None:
@@ -1846,17 +1876,21 @@ class MainWindow(QMainWindow):
         before = len(self._history)
         self._history[:] = [m for m in self._history
                             if str(m.get("id") or "") != mid]
-        if len(self._history) != before:
-            history.save(self._history)
+        student = self._history_student_name()
+        if len(self._history) != before and student:
+            history.save(self._history, student)
 
     def _history_edit(self, mid: str, text: str) -> None:
         """Обновляет изменённое сообщение в истории и файле."""
         if not self.is_teacher or not mid:
             return
+        student = self._history_student_name()
+        if not student:
+            return
         for m in self._history:
             if str(m.get("id") or "") == mid:
                 m["text"] = text
-                history.save(self._history)
+                history.save(self._history, student)
                 return
 
     def _refresh_chat(self) -> None:
@@ -2023,8 +2057,11 @@ class MainWindow(QMainWindow):
         config.save(self.cfg)
         if self.is_teacher:
             # История пишется и по ходу разговора, но при закрытии сохраняем
-            # ещё раз: так в файле точно последнее состояние.
-            history.save(self._history)
+            # ещё раз: так в файле точно последнее состояние. Папка History
+            # и файл ученика — только у преподавателя.
+            student = self._history_student_name()
+            if student:
+                history.save(self._history, student)
         if self._shortcut_filter is not None:
             app = QApplication.instance()
             if app is not None:

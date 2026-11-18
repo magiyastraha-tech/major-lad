@@ -1,9 +1,12 @@
-"""История переписки преподавателя.
+"""История переписки преподавателя — по файлу на ученика.
 
-Файл `History.txt` лежит рядом с программой преподавателя и хранит весь чат
-между занятиями. Ученик своего файла не держит: при подключении он получает
-историю от преподавателя по частям — сначала последние сообщения, а более
-ранние подгружаются, когда он листает чат вверх.
+Рядом с программой преподавателя лежит папка `History`, в ней по файлу на
+каждого ученика: имя ученика и есть имя файла. В файле вся переписка с ним —
+и его сообщения, и ответы преподавателя. Между занятиями ничего не пропадает.
+
+У ученика своих файлов нет: при подключении он получает историю от
+преподавателя по частям — сначала последние сообщения, а более ранние
+подгружаются, когда он листает чат вверх.
 
 Формат строки — время, номер, отправитель и текст через табуляцию. Табуляции
 и переводы строк внутри текста экранируются, чтобы одна строка файла всегда
@@ -22,12 +25,36 @@ from . import runlog
 # Пяти тысяч строк хватает на годы занятий, а файл остаётся небольшим.
 MAX_MESSAGES = 5000
 
+# Имена, которые Windows не даёт использовать для файлов.
+_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{prefix}{i}" for prefix in ("COM", "LPT") for i in range(1, 10)}
+_BAD_CHARS = '<>:"/\\|?*'
 
-def history_path() -> Path:
-    """Путь к файлу: рядом с exe, а при запуске из исходников — в проекте."""
+
+def history_dir() -> Path:
+    """Папка истории: рядом с exe, а при запуске из исходников — в проекте."""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "History.txt"
-    return Path(__file__).resolve().parent.parent / "History.txt"
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).resolve().parent.parent
+    return base / "History"
+
+
+def safe_name(student: str) -> str:
+    """Имя ученика, пригодное для файла на Windows."""
+    name = "".join("-" if (ch in _BAD_CHARS or ord(ch) < 32) else ch
+                   for ch in str(student or ""))
+    name = name.strip(" .")
+    if not name:
+        return "Ученик"
+    if name.upper() in _RESERVED:
+        name = "_" + name
+    return name[:60].strip(" .") or "Ученик"
+
+
+def file_for(student: str) -> Path:
+    """Файл переписки с учеником: History/<имя>.txt."""
+    return history_dir() / f"{safe_name(student)}.txt"
 
 
 def _escape(text: str) -> str:
@@ -53,9 +80,8 @@ def _unescape(text: str) -> str:
     return "".join(out)
 
 
-def load() -> list[dict]:
+def load_file(path: Path) -> list[dict]:
     """Читает историю. Битые строки пропускаются — файл может быть повреждён."""
-    path = history_path()
     messages: list[dict] = []
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -81,9 +107,13 @@ def load() -> list[dict]:
     return messages[-MAX_MESSAGES:]
 
 
-def save(messages: list[dict]) -> None:
+def load(student: str) -> list[dict]:
+    """Переписка с учеником из его файла. Нет файла — пустой список."""
+    return load_file(file_for(student))
+
+
+def save_file(messages: list[dict], path: Path) -> None:
     """Перезаписывает файл целиком. Ошибка не роняет программу."""
-    path = history_path()
     lines = []
     for m in messages[-MAX_MESSAGES:]:
         lines.append("\t".join((
@@ -94,6 +124,7 @@ def save(messages: list[dict]) -> None:
         )))
     tmp = path.with_name(path.name + ".tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
             if lines:
@@ -105,6 +136,11 @@ def save(messages: list[dict]) -> None:
             tmp.unlink()
         except OSError:
             pass
+
+
+def save(messages: list[dict], student: str) -> None:
+    """Сохраняет переписку с учеником в его файл."""
+    save_file(messages, file_for(student))
 
 
 def page(messages: list[dict], before_id: str = "",
