@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import __version__, audio, config, media, updater
+from . import __version__, audio, config, media, runlog, updater
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
@@ -1749,6 +1749,9 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
+        # То же, что видно в строке состояния, ложится в majorlad.log:
+        # по этому файлу видно, что случилось до ошибки.
+        runlog.write(text)
         announce(self.status_label, text)
 
     def _log_threadsafe(self, text: str) -> None:

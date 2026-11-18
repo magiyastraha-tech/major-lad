@@ -16,3 +16,6 @@ received/
 .venv/
 venv/
 Media/
+majorlad.log
+majorlad.log.1
+error_log.txt

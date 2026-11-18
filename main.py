@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from gcapp import __version__, config, updater
+from gcapp import __version__, config, runlog, updater
 from gcapp.ui import MainWindow
 
 
@@ -40,6 +40,7 @@ def _install_error_handler() -> None:
                 fh.write(f"\n{datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
         except Exception:
             pass
+        runlog.write_block(text)
         try:
             QMessageBox.critical(
                 None, "Мажорный лад",
@@ -104,6 +105,7 @@ def main(forced_role: str | None = None) -> int:
     app.setApplicationName("Мажорный лад")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("Мажорный лад")
+    runlog.start(role=forced_role or "", version=__version__)
     _install_error_handler()
 
     # Файл прошлой версии после обновления больше не нужен.
@@ -127,6 +129,7 @@ def main(forced_role: str | None = None) -> int:
             cfg["name"] = "Преподаватель"
         config.save(cfg)
 
+    runlog.write(f"Роль: {cfg.get('role')}.")
     window = MainWindow(cfg)
     window.show()
 
