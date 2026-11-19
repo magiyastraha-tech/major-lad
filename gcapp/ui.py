@@ -948,7 +948,8 @@ class SettingsDialog(QDialog):
         self.update_button.setEnabled(False)
         self.update_button.setText("Скачиваю…")
         self._set_update_status(
-            "Скачиваю обновление. Это займёт несколько минут, окно закроется само."
+            "Скачиваю обновление. Это займёт несколько минут. Окно закроется "
+            "само, а после замены программа откроется снова."
         )
         threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
 
@@ -983,7 +984,11 @@ class SettingsDialog(QDialog):
         if info.get("error"):
             self.update_button.setEnabled(True)
             self.update_button.setText("Проверить обновления")
-            self._set_update_status(f"Скачать обновление не удалось: {info['error']}")
+            self._set_update_status(
+                f"Скачать обновление не удалось: {info['error']}. Нажмите "
+                "«Проверить обновления» ещё раз: скачивание продолжится с того "
+                "же места, а не начнётся заново."
+            )
             return
         self._set_update_status("Обновление скачано. Перезапускаю программу.")
         ok, error = updater.install_and_restart(Path(info.get("path", "")))
