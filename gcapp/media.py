@@ -1,6 +1,6 @@
 """Плеер и папка Media.
 
-Треки лежат рядом с программой, в папке Media: положил туда файл — он
+Треки лежат в папке Data/Media рядом с программой: положил туда файл — он
 появился в списке, нажал «Играть» — его слышат и наушники преподавателя,
 и ученик на другом конце. Отдельного канала для музыки нет: звук трека
 подмешивается в тот же поток, что и микрофон с MIDI, поэтому задержка у
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import app_dir
+from .config import data_dir
 
 SAMPLE_RATE = 48000
 # Длиннее этого трек не открываем: весь файл держится в памяти ради
@@ -24,8 +24,8 @@ SUPPORTED = (".mp3", ".wav", ".flac", ".ogg")
 
 
 def media_dir() -> Path:
-    """Папка с треками рядом с программой."""
-    path = app_dir() / "Media"
+    """Папка с треками в Data рядом с программой."""
+    path = data_dir() / "Media"
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError:

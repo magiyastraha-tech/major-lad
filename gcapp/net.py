@@ -15,14 +15,16 @@ import time
 import uuid
 from pathlib import Path
 
-from . import history, media
+from . import config, history, media
 
 APP_PORT = 45800
 UDP_PORT = 45801
 # Сколько ждём решения преподавателя, если место занято. Дольше держать
 # ученика в неведении нечестно: он лучше узнает ответ и попробует позже.
 WAIT_DECISION = 120
-SAVE_DIR = Path(__file__).resolve().parent.parent / "received"
+# Принятые по чату файлы тоже живут в Data: рядом с программой
+# остаются только сам exe и папка Data.
+SAVE_DIR = config.data_dir() / "received"
 
 
 def _chat_id() -> str:

@@ -1,7 +1,7 @@
 """История переписки преподавателя — по файлу на ученика.
 
-Рядом с программой преподавателя лежит папка `History`, в ней по файлу на
-каждого ученика: имя ученика и есть имя файла. В файле вся переписка с ним —
+В папке Data рядом с программой преподавателя лежит папка `History`, в ней
+по файлу на каждого ученика: имя ученика и есть имя файла. В файле вся переписка с ним —
 и его сообщения, и ответы преподавателя. Между занятиями ничего не пропадает.
 
 У ученика своих файлов нет: при подключении он получает историю от
@@ -15,11 +15,10 @@
 from __future__ import annotations
 
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import runlog
+from . import config, runlog
 
 # Дальше этого история не растёт: старые сообщения отрезаются с начала.
 # Пяти тысяч строк хватает на годы занятий, а файл остаётся небольшим.
@@ -32,12 +31,8 @@ _BAD_CHARS = '<>:"/\\|?*'
 
 
 def history_dir() -> Path:
-    """Папка истории: рядом с exe, а при запуске из исходников — в проекте."""
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).parent
-    else:
-        base = Path(__file__).resolve().parent.parent
-    return base / "History"
+    """Папка истории: Data/History рядом с программой."""
+    return config.data_dir() / "History"
 
 
 def safe_name(student: str) -> str:
@@ -157,12 +152,15 @@ def retire_legacy_file() -> Path | None:
     переносим целиком, ничего не теряя. Возвращает новый путь, если файл
     был, иначе None.
     """
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).parent
-    else:
-        base = Path(__file__).resolve().parent.parent
-    legacy = base / "History.txt"
-    if not legacy.is_file():
+    # Миграция переносит History.txt в Data, но если перенести не удалось
+    # (файл был занят), старый экземпляр ищем и рядом с exe.
+    legacy = None
+    for base in (config.data_dir(), config.app_dir()):
+        candidate = base / "History.txt"
+        if candidate.is_file():
+            legacy = candidate
+            break
+    if legacy is None:
         return None
     folder = history_dir()
     target = folder / _LEGACY_NAME

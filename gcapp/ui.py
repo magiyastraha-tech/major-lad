@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import (__version__, audio, cameras, config, effects, history, media,
-               runlog, shortcuts, sounds, updater)
+               runlog, shortcuts, sounds, students, updater)
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
 
@@ -1100,6 +1100,51 @@ class ChatList(QListWidget):
             self.sig_delete.emit()
 
 
+class VideoWindow(QWidget):
+    """Отдельное окно с видео собеседника на весь экран.
+
+    Открывается кнопкой «Развернуть видео». Картинка занимает весь экран
+    поверх программы, а сама программа продолжает работать и показывает
+    маленькое видео на главном окне. Escape или кнопка «Свернуть видео»
+    закрывают окно — всё остаётся как было.
+    """
+
+    closed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(None)
+        self.setWindowTitle("Мажорный лад — видео собеседника")
+        self.setAccessibleName("Видео собеседника, отдельное окно")
+        layout = QVBoxLayout(self)
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setAccessibleName("Видео собеседника")
+        self.label.setMinimumSize(320, 240)
+        layout.addWidget(self.label, 1)
+        self.close_button = QPushButton("Свернуть видео")
+        self.close_button.setAccessibleName("Свернуть видео")
+        self.close_button.clicked.connect(self.close)
+        layout.addWidget(self.close_button)
+
+    def show_frame(self, pixmap) -> None:
+        self.label.setPixmap(
+            pixmap.scaled(self.label.size(), Qt.KeepAspectRatio,
+                          Qt.SmoothTransformation))
+
+    def clear_frame(self) -> None:
+        self.label.clear()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     sig_status = Signal(str)
     sig_chat = Signal(str, str, str)
@@ -1190,6 +1235,8 @@ class MainWindow(QMainWindow):
             self.volume_mode = "local"
         self._mic_muted = bool(getattr(self.engine, "mic_muted", False))
         self._cam_on = False
+        # Отдельное окно с видео на весь экран, пока оно открыто.
+        self.video_window: VideoWindow | None = None
         self._shortcut_filter: _ShortcutFilter | None = None
         # Сочетание клавиш → действие. Собирается из настроек.
         self._shortcut_map: dict[str, str] = {}
@@ -1197,6 +1244,12 @@ class MainWindow(QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
         self._save_timer.timeout.connect(lambda: config.save(self.cfg))
+        # Громкости ученика пишутся отдельным, чуть более редким таймером:
+        # ползунок во время движения шлёт десятки значений подряд.
+        self._student_save_timer = QTimer(self)
+        self._student_save_timer.setSingleShot(True)
+        self._student_save_timer.setInterval(800)
+        self._student_save_timer.timeout.connect(self._save_student_settings)
 
         self.setWindowTitle(f"Мажорный лад {__version__}")
         self.resize(900, 680)
@@ -1239,7 +1292,7 @@ class MainWindow(QMainWindow):
 
         if self.is_teacher:
             # Общий History.txt из версий до 0.2.5 переезжает в папку
-            # History: переписка не теряется, а рядом с программой
+            # History: переписка не теряется, а в папке программы
             # не остаётся файла, который больше ни к чему не относится.
             history.retire_legacy_file()
             # Чат при запуске пустой: переписка появляется, когда вошёл
@@ -1275,6 +1328,17 @@ class MainWindow(QMainWindow):
         self.video_label.setVisible(bool(self.cfg["video"].get("enabled")
                                          and self.cfg["video"].get("show_remote", True)))
         layout.addWidget(self.video_label, 1)
+        # Рядом с видео — кнопка «на весь экран»: ученику смотреть урок
+        # в маленьком квадратике неудобно. Свёрнутая картинка остаётся
+        # на главном окне, программа работает как обычно.
+        self.video_button = QPushButton("Развернуть видео")
+        self.video_button.setAccessibleName("Развернуть видео на весь экран")
+        self.video_button.setToolTip("Открыть видео отдельным окном на весь экран")
+        self.video_button.clicked.connect(self._toggle_video_window)
+        # Кнопка появляется вместе с первым кадром: пока видео нет,
+        # разворачивать нечего.
+        self.video_button.setVisible(False)
+        layout.addWidget(self.video_button, 0, Qt.AlignLeft)
 
         # Громкости
         vol_group = QGroupBox("Громкость")
@@ -1680,6 +1744,9 @@ class MainWindow(QMainWindow):
         started = self._lesson_start
         if started is None:
             return
+        # Громкости уходят в файл ученика до того, как имя урока сбросится:
+        # следующий урок начнётся с этих значений.
+        self._save_student_settings()
         self._lesson_start = None
         length = _duration_word((datetime.now() - started).total_seconds())
         name = self._lesson_student or self._history_student_name()
@@ -1799,6 +1866,7 @@ class MainWindow(QMainWindow):
         self.client = None
         self.connected = False
         self._stop_video()
+        self._close_video_window()
         self._cam_on = False
         self._update_cam_button()
         self.connect_button.setText("Подключиться")
@@ -1811,6 +1879,7 @@ class MainWindow(QMainWindow):
         self.connected = bool(present)
         if not present:
             self._stop_video()
+            self._close_video_window()
             self.engine.student.clear()
             if self.is_teacher:
                 # Кабинет остаётся открытым: местный звук, метроном и MIDI
@@ -1829,10 +1898,14 @@ class MainWindow(QMainWindow):
             # Если прошлый урок ещё не закрыт отдельным сигналом (ученика
             # заменили), фиксируем его до начала нового.
             self._lesson_finish()
-            self._lesson_begin(
-                getattr(self.server, "active_name", "") if self.server else "")
+            name = getattr(self.server, "active_name", "") if self.server else ""
+            restored = self._restore_student_settings(name) if name else False
+            self._lesson_begin(name)
             sounds.play("connect")
-            self._set_status("Ученик подключился.")
+            text = "Ученик подключился."
+            if restored:
+                text += " Громкости с прошлого урока восстановлены."
+            self._set_status(text)
             self._append_chat("система", "Ученик подключился.")
             if self.engine.running:
                 self._start_video()
@@ -1957,6 +2030,41 @@ class MainWindow(QMainWindow):
         """Собеседник выключил камеру — убираем застывший кадр."""
         if not on:
             self.video_label.clear()
+            self.video_button.setVisible(False)
+            self._close_video_window()
+
+    def _close_video_window(self) -> None:
+        """Закрывает развёрнутое видео, если оно открыто."""
+        if self.video_window is not None:
+            self.video_window.close()
+
+    def _toggle_video_window(self) -> None:
+        """Открывает видео отдельным окном на весь экран или закрывает его."""
+        if self.video_window is not None:
+            self.video_window.close()
+            return
+        window = VideoWindow()
+        window.closed.connect(self._on_video_window_closed)
+        self.video_window = window
+        # Уже показанный кадр виден сразу, не ждём следующего.
+        pixmap = self.video_label.pixmap()
+        if pixmap is not None and not pixmap.isNull():
+            window.label.setPixmap(pixmap)
+        window.showFullScreen()
+        window.raise_()
+        window.activateWindow()
+        window.close_button.setFocus()
+        self.video_button.setText("Свернуть видео")
+        self.video_button.setAccessibleName("Свернуть видео")
+        self._set_status(
+            "Видео открыто на весь экран. Escape или кнопка «Свернуть видео» "
+            "вернут маленькую картинку.")
+
+    def _on_video_window_closed(self) -> None:
+        self.video_window = None
+        self.video_button.setText("Развернуть видео")
+        self.video_button.setAccessibleName("Развернуть видео на весь экран")
+        self._set_status("Видео свёрнуто. Программа работает как обычно.")
 
     # -- микрофон -----------------------------------------------------------
 
@@ -2032,6 +2140,7 @@ class MainWindow(QMainWindow):
         self._volume_bus()[key] = int(value)
         self.slider_values[key].setText(f"{value} процентов")
         self._save_timer.start()
+        self._student_save_timer.start()
 
     def _apply_volumes(self) -> None:
         # Открыли звук — применяем обе стороны: ползунки показывают только
@@ -2046,6 +2155,7 @@ class MainWindow(QMainWindow):
         self.volume_mode = "local" if self.volume_mode == "peer" else "peer"
         self.cfg["audio"]["volume_mode"] = self.volume_mode
         self._save_timer.start()
+        self._student_save_timer.start()
         self._refresh_volume_mode()
         self._set_status(f"{self.volume_mode_button.text()}.")
 
@@ -2066,6 +2176,45 @@ class MainWindow(QMainWindow):
             slider.blockSignals(False)
             self.slider_values[key].setText(f"{slider.value()} процентов")
         self._refresh_volume_visibility()
+
+    def _save_student_settings(self) -> None:
+        """Громкости текущего урока — в файл этого ученика."""
+        if not self.is_teacher or not self._lesson_student:
+            return
+        audio_cfg = self.cfg["audio"]
+        students.save(
+            self._lesson_student,
+            audio_cfg.get("volumes") or {},
+            audio_cfg.get("volumes_peer") or {},
+            self.volume_mode,
+        )
+
+    def _restore_student_settings(self, student: str) -> bool:
+        """Возвращает громкости, с которыми шёл прошлый урок с этим учеником."""
+        data = students.load(student)
+        if not data:
+            return False
+        for field in ("volumes", "volumes_peer"):
+            saved = data.get(field)
+            if not isinstance(saved, dict):
+                continue
+            bus = self.cfg["audio"].setdefault(field, {})
+            for key, value in saved.items():
+                if key not in bus:
+                    continue
+                try:
+                    bus[key] = max(0, min(100, int(value)))
+                except (TypeError, ValueError):
+                    continue
+        mode = str(data.get("volume_mode") or "")
+        if mode in ("local", "peer"):
+            self.volume_mode = mode
+            self.cfg["audio"]["volume_mode"] = mode
+        if self.engine.running:
+            self._apply_volumes()
+        self._refresh_volume_mode()
+        self._save_timer.start()
+        return True
 
     # -- метроном -----------------------------------------------------------
 
@@ -2222,7 +2371,7 @@ class MainWindow(QMainWindow):
         last = added[-1].name
         if len(added) == 1:
             text = (f"Трек добавлен: {last}. "
-                    "Он лежит в папке Media рядом с программой.")
+                    "Он лежит в папке Data\\Media рядом с программой.")
         else:
             text = f"Добавлено треков: {len(added)}. Выбран последний: {last}."
         if "player" in appeared:
@@ -3061,11 +3210,14 @@ class MainWindow(QMainWindow):
         if not self.cfg["video"].get("show_remote", True):
             return
         self.video_label.setVisible(True)
+        self.video_button.setVisible(True)
         pixmap = QPixmap.fromImage(image)
         self.video_label.setPixmap(
             pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio,
                           Qt.SmoothTransformation)
         )
+        if self.video_window is not None:
+            self.video_window.show_frame(pixmap)
 
     # -- сочетания клавиш ---------------------------------------------------
 

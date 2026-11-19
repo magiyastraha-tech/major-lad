@@ -24,9 +24,7 @@ from gcapp.ui import MainWindow
 
 
 def _error_log_path() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "error_log.txt"
-    return Path(__file__).resolve().parent / "error_log.txt"
+    return config.data_dir() / "error_log.txt"
 
 
 def _install_error_handler() -> None:
@@ -50,7 +48,7 @@ def _install_error_handler() -> None:
                 "Что-то пошло не так.\n\n"
                 f"{exc_type.__name__}: {exc}\n\n"
                 "Программа продолжает работать. Подробности записаны "
-                "в файл error_log.txt рядом с программой.",
+                "в файл error_log.txt в папке Data рядом с программой.",
             )
         except Exception:
             pass
@@ -158,11 +156,16 @@ def main(forced_role: str | None = None) -> int:
     wait_pid = _take_wait_pid()
     if wait_pid:
         _wait_previous(wait_pid)
+    # Прежние версии держали рабочие папки россыпью рядом с exe. Переносим
+    # их в Data до первого чтения настроек: дальше весь код смотрит в Data.
+    moved = config.migrate()
     app = QApplication(sys.argv)
     app.setApplicationName("Мажорный лад")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("Мажорный лад")
     runlog.start(role=forced_role or "", version=__version__)
+    if moved:
+        runlog.write("Перенесено в Data: " + ", ".join(moved) + ".")
     _install_error_handler()
 
     # Файл прошлой версии после обновления больше не нужен.

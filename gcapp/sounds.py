@@ -1,6 +1,6 @@
 """Рабочие звуки программы.
 
-Звуки лежат рядом с программой в папке Sound. При первом запуске туда
+Звуки лежат в папке Data/Sound рядом с программой. При первом запуске туда
 записываются четыре файла по умолчанию; их можно заменить в любой момент
 своими WAV с теми же именами — файл читается заново на каждое событие,
 перезапускать программу не нужно.
@@ -10,13 +10,12 @@
 """
 from __future__ import annotations
 
-import sys
 import wave
 from pathlib import Path
 
 import numpy as np
 
-from . import runlog
+from . import config, runlog
 
 SOUND_RATE = 44100
 _DEFAULT_DIR = "Sound"
@@ -42,12 +41,8 @@ OLD_FILES = {
 
 
 def sound_dir() -> Path:
-    """Папка Sound рядом с программой."""
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).parent
-    else:
-        base = Path(__file__).resolve().parent.parent
-    return base / _DEFAULT_DIR
+    """Папка Sound в Data рядом с программой."""
+    return config.data_dir() / _DEFAULT_DIR
 
 
 def _tone(freq: float, seconds: float, volume: float = 0.3,

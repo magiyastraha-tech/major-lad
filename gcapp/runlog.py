@@ -17,6 +17,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from . import config
+
 MAX_BYTES = 1_000_000
 
 _lock = threading.Lock()
@@ -24,10 +26,8 @@ _state: dict = {"path": None}
 
 
 def log_path() -> Path:
-    """Путь к журналу: рядом с exe, а при запуске из исходников — в проекте."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "majorlad.log"
-    return Path(__file__).resolve().parent.parent / "majorlad.log"
+    """Путь к журналу: в папке Data рядом с программой."""
+    return config.data_dir() / "majorlad.log"
 
 
 def _rotate(path: Path) -> None:

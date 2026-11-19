@@ -1,7 +1,8 @@
 """Конфигурация программы «Мажорный лад».
 
-Файл config.json лежит рядом с программой — это делает сборку портативной:
-скопировал папку на другой компьютер, настройки переехали вместе с ней.
+Файл настроек лежит в папке Data рядом с программой — это делает сборку
+портативной: скопировал папку на другой компьютер, настройки переехали
+вместе с ней.
 """
 from __future__ import annotations
 
@@ -101,6 +102,19 @@ DEFAULTS = {
 }
 
 
+DATA_DIR = "Data"
+
+# Что прежние версии держали россыпью рядом с программой. При первом
+# запуске всё это переезжает в Data; список остаётся здесь, чтобы миграция
+# читалась в одном месте с путями.
+_LEGACY_DIRS = ("Media", "History", "Sound", "Student settings",
+                "received")
+_LEGACY_FILES = (
+    "config.json", "MajorLad-Teacher.json", "MajorLad-Student.json",
+    "History.txt", "majorlad.log", "majorlad.log.1", "error_log.txt",
+)
+
+
 def app_dir() -> Path:
     """Папка программы. Для собранного exe — папка exe, для исходников — корень проекта."""
     if getattr(sys, "frozen", False):
@@ -108,15 +122,100 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def data_dir() -> Path:
+    """Рабочая папка программы: всё, что программа создаёт, живёт здесь.
+
+    Рядом с exe остаются только сам exe и папка Data: скопировал папку
+    программы на другой компьютер — вместе с ней переехали настройки,
+    треки, история, звуки и громкости учеников.
+    """
+    path = app_dir() / DATA_DIR
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def _merge_tree(src: Path, dst: Path) -> None:
+    """Переносит содержимое папки, не затирая уже существующие файлы."""
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    try:
+        items = list(src.iterdir())
+    except OSError:
+        return
+    for item in items:
+        target = dst / item.name
+        try:
+            if item.is_dir() and target.is_dir():
+                _merge_tree(item, target)
+            elif not target.exists():
+                item.replace(target)
+        except OSError:
+            pass
+    try:
+        if not any(src.iterdir()):
+            src.rmdir()
+    except OSError:
+        pass
+
+
+def migrate() -> list[str]:
+    """Переносит рабочие папки и настройки прежних версий в Data.
+
+    Запускается при старте, до чтения настроек. Повторный запуск ничего не
+    портит: уже перенесённое остаётся на месте, а файл, который Windows не
+    отдала (занят другой копией программы), переедет при следующем старте.
+    Возвращает список имён — что перенесено в этот раз.
+    """
+    base = app_dir()
+    data = data_dir()
+    moved: list[str] = []
+    if base == data:
+        return moved
+    for name in _LEGACY_DIRS:
+        src = base / name
+        if not src.is_dir():
+            continue
+        dst = data / name
+        if not dst.exists():
+            try:
+                src.rename(dst)
+                moved.append(name)
+                continue
+            except OSError:
+                pass
+        _merge_tree(src, dst)
+    names = list(_LEGACY_FILES)
+    if getattr(sys, "frozen", False):
+        stem = f"{Path(sys.executable).stem}.json"
+        if stem not in names:
+            names.append(stem)
+    for name in names:
+        src = base / name
+        dst = data / name
+        if not src.is_file() or dst.exists():
+            continue
+        try:
+            src.replace(dst)
+            moved.append(name)
+        except OSError:
+            pass
+    return moved
+
+
 def config_path() -> Path:
-    """Настройки лежат рядом с программой.
+    """Настройки лежат в папке Data.
 
     У сборки exe файл называется по имени exe: у «Преподавателя» и «Ученика»
     настройки разные, и их можно держать в одной папке.
     """
     if getattr(sys, "frozen", False):
-        return app_dir() / f"{Path(sys.executable).stem}.json"
-    return app_dir() / "config.json"
+        return data_dir() / f"{Path(sys.executable).stem}.json"
+    return data_dir() / "config.json"
 
 
 def _merge(base: dict, data: dict) -> dict:
