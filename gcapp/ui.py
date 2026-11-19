@@ -336,7 +336,7 @@ class SettingsDialog(QDialog):
     """Настройки. Открывается по Control+P, дерево на четыре раздела."""
 
     sig_update = Signal(dict)
-    sig_progress = Signal(int)
+    sig_progress = Signal(int, int)
     sig_download = Signal(dict)
 
     def __init__(self, cfg: dict, parent=None, is_teacher: bool | None = None):
@@ -347,6 +347,7 @@ class SettingsDialog(QDialog):
         # Сочетания правятся в копии: «Отмена» не должна ничего менять.
         self.shortcut_map = dict(cfg.get("shortcuts") or {})
         self._downloading = False
+        self._progress_step = 0
         self.sig_update.connect(self._on_update_result)
         self.sig_progress.connect(self._on_progress)
         self.sig_download.connect(self._on_download_done)
@@ -942,6 +943,7 @@ class SettingsDialog(QDialog):
         self._start_download(info.get("url", ""))
 
     def _start_download(self, url: str) -> None:
+        self._progress_step = 0
         self._downloading = True
         self.update_button.setEnabled(False)
         self.update_button.setText("Скачиваю…")
@@ -958,8 +960,23 @@ class SettingsDialog(QDialog):
             return
         self.sig_download.emit({"path": str(path)})
 
-    def _on_progress(self, percent: int) -> None:
+    def _on_progress(self, done: int, total: int) -> None:
+        if total <= 0:
+            return
+        percent = min(100, int(done * 100 / total))
         self.update_status.setText(f"Скачиваю обновление: {percent} процентов.")
+        # Смена текста в строке состояния диктору не слышна: объявляем
+        # каждые десять процентов словами, а не дёргаем его на каждом куске.
+        step = percent // 10
+        if step > self._progress_step:
+            self._progress_step = step
+            if step < 10:
+                done_mb = done // (1024 * 1024)
+                total_mb = max(1, total // (1024 * 1024))
+                announce(
+                    self.update_status,
+                    f"Скачано {percent} процентов, {done_mb} из {total_mb} мегабайт.",
+                )
 
     def _on_download_done(self, info: dict) -> None:
         self._downloading = False

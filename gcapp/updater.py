@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -26,6 +27,9 @@ ASSETS = {
 }
 
 USER_AGENT = "MajorLad-Updater"
+
+# Сколько раз пробуем докачать файл после обрыва связи.
+_DOWNLOAD_TRIES = 8
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -79,26 +83,77 @@ def latest_release(role: str, current: str) -> dict:
 
 
 def download(url: str, progress=None) -> Path:
-    """Скачивает новый exe в папку обновления. Возвращает путь к файлу."""
+    """Скачивает новый exe в папку обновления. Возвращает путь к файлу.
+
+    Файл пишется в `.part` и переименовывается только целиком скачанным.
+    Если связь оборвалась, следующая попытка продолжает с того же места
+    (запрос Range): из России GitHub отдаёт большие файлы медленно и рвёт
+    соединение, а начинать 122 мегабайта заново каждый раз — мучение.
+    `progress` получает число скачанных и общее число байт.
+    """
     folder = Path(tempfile.gettempdir()) / "majorlad-update"
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / "MajorLad-new.exe"
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    part = folder / "MajorLad-new.exe.part"
+    try:
+        if target.exists():
+            target.unlink()
+    except OSError:
+        pass
+
+    last_error: Exception | None = None
+    for attempt in range(1, _DOWNLOAD_TRIES + 1):
+        done = part.stat().st_size if part.exists() else 0
+        try:
+            total = _fetch(url, part, done, progress)
+        except Exception as exc:
+            last_error = exc
+            if attempt < _DOWNLOAD_TRIES:
+                time.sleep(min(15, 3 * attempt))
+            continue
+        size = part.stat().st_size if part.exists() else 0
+        if total and size < total:
+            last_error = OSError(
+                f"скачано {size} байт из {total}")
+            time.sleep(min(15, 3 * attempt))
+            continue
+        os.replace(part, target)
+        if progress and total:
+            progress(total, total)
+        return target
+    raise last_error or OSError("скачивание не удалось")
+
+
+def _fetch(url: str, part: Path, done: int, progress=None) -> int:
+    """Докачивает файл в `part` с позиции `done`. Возвращает полный размер.
+
+    Сервер может не уметь докачку (ответ 200 вместо 206) — тогда файл
+    начинается заново, иначе в него попали бы два куска подряд.
+    """
+    headers = {"User-Agent": USER_AGENT}
+    if done:
+        headers["Range"] = f"bytes={done}-"
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
-        total = int(response.headers.get("Content-Length") or 0)
-        done = 0
-        with open(target, "wb") as fh:
+        partial = getattr(response, "status", 200) == 206
+        length = int(response.headers.get("Content-Length") or 0)
+        if done and not partial:
+            done = 0
+            length = int(response.headers.get("Content-Length") or 0)
+        total = done + length if length else 0
+        mode = "ab" if done else "wb"
+        with open(part, mode) as fh:
+            if progress:
+                progress(done, total)
             while True:
                 chunk = response.read(256 * 1024)
                 if not chunk:
                     break
                 fh.write(chunk)
                 done += len(chunk)
-                if progress and total:
-                    progress(min(100, int(done * 100 / total)))
-    if progress:
-        progress(100)
-    return target
+                if progress:
+                    progress(done, total)
+    return total
 
 
 def backup_path() -> Path | None:
