@@ -1327,6 +1327,14 @@ class MainWindow(QMainWindow):
         # Плеер: есть ли треки в Media и не идёт ли сейчас загрузка файла.
         self._tracks_available = False
         self._loading_track = False
+        # Нужно ли включать звук, когда трек догрузится: при переключении
+        # «Выше» и «Ниже» новый трек должен вести себя так же, как вёл
+        # себя прежний — играл, стоял на паузе или ждал кнопки «Играть».
+        self._load_play = True
+        # Трек, который нажали выбрать, пока грузился прошлый: загрузится
+        # сразу после него, чтобы быстрые нажатия не терялись.
+        self._pending_track = ""
+        self._pending_play = True
         # Подписи кнопок плеера переставляются только при смене состояния.
         self._player_button_state: tuple[bool, bool, int] = (False, False, 0)
         # Скорость и тон трека. Трек пересчитывается в фоне от исходного
@@ -2704,30 +2712,34 @@ class MainWindow(QMainWindow):
         self._set_status(f"Пауза. Позиция {_clock(player.position())}.")
 
     def _step_track(self, direction: int) -> None:
-        """«Выше» и «Ниже»: предыдущий и следующий трек списка."""
+        """«Выше» и «Ниже»: переключение на предыдущий и следующий трек.
+
+        Кнопка меняет не только выделение в списке, но и сам трек в плеере.
+        Если музыка играла, включается следующий; если стояла на паузе или
+        звук ещё не запущен, трек просто переключается и ждёт кнопки
+        «Играть» — молча включить музыку было бы сюрпризом.
+        """
         count = self.track_combo.count()
         if count == 0:
             self._set_status("Список треков пуст. Добавьте трек.")
             return
-        index = self.track_combo.currentIndex()
-        new = (index + direction) % count
         if count == 1:
             self._set_status("В списке всего один трек.")
             return
+        index = self.track_combo.currentIndex()
+        new = (index + direction) % count if index >= 0 else 0
         # Переключение делаем молча: объявим один раз, уже с новым треком.
         self.track_combo.blockSignals(True)
         self.track_combo.setCurrentIndex(new)
         self.track_combo.blockSignals(False)
-        self.cfg.setdefault("player", {})["last"] = self._selected_track()
+        path = self._selected_track()
+        self.cfg.setdefault("player", {})["last"] = path
         self._save_timer.start()
-        name = Path(self._selected_track()).name
-        word = "Предыдущий" if direction < 0 else "Следующий"
-        if not self.engine.running:
-            self._set_status(f"{word} трек: {name}. Звук не запущен, "
-                             "трек пока не играет.")
-            return
-        self._set_status(f"{word} трек: {name}.")
-        self._play_selected()
+        player = self.engine.player
+        # Играло — играет и новый трек. Стояло на паузе или звук не открыт —
+        # новый трек занимает место прежнего, но сам не включается.
+        play = self.engine.running and player.playing
+        self._load_and_play(path, play=play)
 
     def _delete_key_targets_track(self) -> bool:
         """Нажата ли клавиша Delete там, где выбран трек списка."""
@@ -2743,11 +2755,16 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
-    def _load_and_play(self, path: str) -> None:
+    def _load_and_play(self, path: str, play: bool = True) -> None:
+        """Загружает трек в плеер. play — включать ли звук сразу."""
         if self._loading_track:
-            self._set_status("Трек уже загружается, подождите.")
+            # Нажали ещё раз, пока грузится прошлый: запоминаем последний
+            # выбор — он и загрузится, когда закончится текущая загрузка.
+            self._pending_track = path
+            self._pending_play = play
             return
         self._loading_track = True
+        self._load_play = play
         self._set_status(f"Загружаю трек {Path(path).name}…")
         threading.Thread(target=self._load_track_worker, args=(path,),
                          daemon=True).start()
@@ -2762,6 +2779,14 @@ class MainWindow(QMainWindow):
 
     def _on_track_ready(self, path: str, data) -> None:
         self._loading_track = False
+        # Пока грузился этот трек, успели выбрать другой, а то и вернуться
+        # к этому же: приоритет у последнего нажатия.
+        pending, self._pending_track = self._pending_track, ""
+        if pending and pending != path:
+            self._load_and_play(pending, self._pending_play)
+            return
+        if pending:
+            self._load_play = self._pending_play
         # Исходный звук храним отдельно: скорость и тон всегда считаются
         # от него, а не от уже обработанного варианта.
         self._track_source = data
@@ -2775,22 +2800,35 @@ class MainWindow(QMainWindow):
             self._set_status("Применяю эффект…")
             self._start_effects_worker()
             return
-        self._start_playing_loaded(path, data)
+        self._start_playing_loaded(path, data, play=self._load_play)
 
     def _start_playing_loaded(self, path: str, data, prefix: str = "",
-                              applied_speed: float = 1.0) -> None:
+                              applied_speed: float = 1.0,
+                              play: bool = True) -> None:
         player = self.engine.player
         player.set_track(path, data)
         self._effects_applied_speed = applied_speed
-        player.play()
-        self._update_player_buttons()
+        self._load_play = True
         duration = _clock(player.duration())
         self.track_position_label.setText(f"0:00 из {duration}")
+        if not play:
+            # Трек переключён, но сам не зазвучал: следующий шаг — «Играть».
+            self._update_player_buttons()
+            text = (f"Выбран трек: {player.name}. Не играет. "
+                    f"Позиция 0:00 из {duration}. Кнопка Играть включит его.")
+            self._set_status(f"{prefix} {text}" if prefix else text)
+            return
+        player.play()
+        self._update_player_buttons()
         text = f"Играет: {player.name}. Позиция 0:00 из {duration}."
         self._set_status(f"{prefix} {text}" if prefix else text)
 
     def _on_track_error(self, text: str) -> None:
         self._loading_track = False
+        pending, self._pending_track = self._pending_track, ""
+        if pending:
+            self._load_and_play(pending, self._pending_play)
+            return
         self._set_status(text)
 
     # -- эффекты плеера ------------------------------------------------------
@@ -2968,7 +3006,8 @@ class MainWindow(QMainWindow):
             if hint:
                 prefix = f"{prefix} {hint}"
             self._start_playing_loaded(path, data, prefix=prefix,
-                                       applied_speed=speed_used)
+                                       applied_speed=speed_used,
+                                       play=self._load_play)
             return
         was_playing = player.playing
         # Место в исходном треке: текущая позиция умножается на скорость,
