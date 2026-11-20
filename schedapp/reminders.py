@@ -121,11 +121,14 @@ class ReminderService(QObject):
 
 
 def soon_text(lesson: Lesson, kind: str) -> str:
-    """Фраза напоминания до урока — одна на все три вида."""
-    when = f"{lesson.time}"
-    name = lesson.student
+    """Фраза напоминания до урока — одна на все три вида.
+
+    Имя стоит отдельно, без «с»: склонять фамилии программа не умеет,
+    а «урок с Андрей Булкин» диктор прочитает как ошибку.
+    """
+    who = f"{lesson.student}, в {lesson.time}."
     if kind == "день":
-        return f"Завтра урок с {name} в {when}."
+        return f"Завтра урок. {who}"
     if kind == "час":
-        return f"Через час урок с {name} в {when}."
-    return f"Через десять минут урок с {name} в {when}."
+        return f"Через час урок. {who}"
+    return f"Через десять минут урок. {who}"

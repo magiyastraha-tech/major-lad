@@ -104,19 +104,24 @@ class StudentDialog(QDialog):
             self.direction.setCurrentText(student.direction)
         form.addRow("Направление", self.direction)
 
-        self.lessons = QSpinBox()
-        self.lessons.setRange(0, 500)
-        self.lessons.setAccessibleName("Сколько уроков куплено")
+        # Абонемент спрашивается только у нового ученика. У существующего
+        # уроки добавляются кнопкой «Докупить уроки» в карточке — иначе
+        # правка контактов молча обнуляла бы счётчик.
+        self.lessons = None
+        self.price = None
         if adding:
+            self.lessons = QSpinBox()
+            self.lessons.setRange(0, 500)
+            self.lessons.setAccessibleName("Сколько уроков куплено")
             self.lessons.setValue(8)
-        form.addRow("Куплено уроков", self.lessons)
+            form.addRow("Куплено уроков", self.lessons)
 
-        self.price = QSpinBox()
-        self.price.setRange(0, 500_000)
-        self.price.setSingleStep(500)
-        self.price.setSuffix(" ₽")
-        self.price.setAccessibleName("Цена абонемента")
-        form.addRow("Цена абонемента", self.price)
+            self.price = QSpinBox()
+            self.price.setRange(0, 500_000)
+            self.price.setSingleStep(500)
+            self.price.setSuffix(" ₽")
+            self.price.setAccessibleName("Цена абонемента")
+            form.addRow("Цена абонемента", self.price)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -148,9 +153,14 @@ class StudentDialog(QDialog):
             self.created = student
             count = self.lessons.value()
             if count > 0:
+                price = self.price.value()
                 self.store.add_subscription(
-                    student.name, count, price=self.price.value(),
+                    student.name, count, price=price,
                     direction=student.direction)
+                if price > 0:
+                    word = plural(count, "урок", "урока", "уроков")
+                    self.store.add_payment(
+                        student.name, f"Абонемент, {count} {word}", price)
             self.accept()
             return
         student = self.student
@@ -203,6 +213,62 @@ class LessonPayDialog(QDialog):
 
     def accept(self) -> None:
         self.amount = self.money.value()
+        super().accept()
+
+
+class TopUpDialog(QDialog):
+    """Докупить уроки к действующему абонементу.
+
+    Докупка не заводит второй абонемент: уроки прибавляются к текущему,
+    поэтому счётчик остаётся понятным — «уроки 3 из 16». Деньги при этом
+    уходят отдельной строкой в журнал оплат.
+    """
+
+    def __init__(self, student: str, used: int, total: int, parent=None):
+        super().__init__(parent)
+        self.lessons = 0
+        self.price = 0
+        self.setWindowTitle("Докупить уроки")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        if total:
+            text = (f"{student}. Сейчас уроки {used} из {total}. "
+                    f"Сколько уроков докупить?")
+        else:
+            text = f"{student}. Абонемента нет. Сколько уроков купить?"
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setAccessibleName(text)
+        lay.addWidget(label)
+
+        form = QFormLayout()
+        self.count = QSpinBox()
+        self.count.setRange(1, 500)
+        self.count.setValue(8)
+        self.count.setAccessibleName("Сколько уроков докупить")
+        form.addRow("Уроков", self.count)
+
+        self.money = QSpinBox()
+        self.money.setRange(0, 500_000)
+        self.money.setSingleStep(500)
+        self.money.setSuffix(" ₽")
+        self.money.setAccessibleName("Сумма оплаты")
+        form.addRow("Оплата", self.money)
+        lay.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Докупить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.count.setFocus()
+        self.count.selectAll()
+
+    def accept(self) -> None:
+        self.lessons = self.count.value()
+        self.price = self.money.value()
         super().accept()
 
 
@@ -407,6 +473,7 @@ class StudentCard(QDialog):
                 ("Подтвердить урок", self.confirm_lesson),
                 ("Добавить дату", self.add_date),
                 ("Добавить расписание", self.add_schedule),
+                ("Докупить уроки", self.top_up),
                 ("Добавить услугу", self.add_service)):
             button = QPushButton(text)
             button.clicked.connect(slot)
@@ -448,10 +515,7 @@ class StudentCard(QDialog):
 
     def confirm_lesson(self) -> None:
         name = self.student.name
-        amount = 0
         sub = self.store.current_subscription(name)
-        if sub is not None:
-            amount = 0
         dialog = LessonPayDialog(name, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             announce(self, "Урок не отмечен.")
@@ -509,6 +573,31 @@ class StudentCard(QDialog):
         word = plural(count, "урок", "урока", "уроков")
         self._done(f"{self.student.name}, на месяц вперёд записано "
                    f"{count} {word}.")
+
+    def top_up(self) -> None:
+        name = self.student.name
+        used, total = self.store.balance(name)
+        dialog = TopUpDialog(name, used, total, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Уроки не добавлены.")
+            return
+        count = dialog.lessons
+        word = plural(count, "урок", "урока", "уроков")
+        sub = self.store.current_subscription(name)
+        if sub is None:
+            self.store.add_subscription(
+                name, count, price=dialog.price,
+                direction=self.student.direction)
+        else:
+            sub.total += count
+            sub.price += max(0, dialog.price)
+            self.store.save_subscriptions()
+        if dialog.price > 0:
+            self.store.add_payment(
+                name, f"Абонемент, {count} {word}", dialog.price)
+        used, total = self.store.balance(name)
+        self._done(f"{name}, докуплено {count} {word}. "
+                   f"Уроки {used} из {total}.")
 
     def add_service(self) -> None:
         dialog = ServiceDialog(self.store, self.student, self)
@@ -721,8 +810,8 @@ class MainWindow(QMainWindow):
 
     def on_ask_start(self, lesson: data.Lesson) -> None:
         now = datetime.now()
-        text = (f"Сейчас {now:%H:%M}. Вы подтверждаете, что у вас идёт "
-                f"урок с {lesson.student}?")
+        text = (f"Сейчас {now:%H:%M}. Вы подтверждаете, что урок идёт? "
+                f"{lesson.student}, в {lesson.time}.")
         box = QMessageBox(self)
         box.setWindowTitle("Начало урока")
         box.setText(text)
@@ -741,7 +830,8 @@ class MainWindow(QMainWindow):
             announce(self, "Напомню через час.")
 
     def on_ask_finish(self, lesson: data.Lesson) -> None:
-        text = (f"Вы подтверждаете, что урок с {lesson.student} прошёл?")
+        text = (f"Вы подтверждаете, что урок прошёл? "
+                f"{lesson.student}, в {lesson.time}.")
         QApplication.beep()
         announce(self, text, assertive=True)
         dialog = LessonPayDialog(lesson.student, self, amount=lesson.price,
@@ -752,7 +842,8 @@ class MainWindow(QMainWindow):
             self.store.update_lesson(lesson)
             self.reminders.mark_cancelled(lesson)
             self.refresh_all()
-            announce(self, f"Урок с {lesson.student} отменён.", assertive=True)
+            announce(self, f"Урок отменён. {lesson.student}, "
+                           f"в {lesson.time}.", assertive=True)
             return
         amount = dialog.amount
         lesson.status = LESSON_DONE

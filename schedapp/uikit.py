@@ -95,16 +95,21 @@ def announce(widget: QWidget, text: str, assertive: bool = False) -> None:
     text = (text or "").strip()
     if not text:
         return
-    top = widget.window()
-    announcer = getattr(top, "announcer", None)
-    if isinstance(announcer, Announcer):
-        announcer.speak(text, assertive)
-        return
-    # Окно без своего Announcer — ищем по дереву виджетов.
-    found = top.findChild(Announcer)
-    if found is not None:
-        found.speak(text, assertive)
-        return
+    # Сначала окно виджета, потом его родители: диалог может быть дочерним
+    # окном главного окна, и объявлять должен общий Announcer.
+    seen = []
+    current = widget
+    while current is not None and current not in seen:
+        seen.append(current)
+        announcer = getattr(current, "announcer", None)
+        if isinstance(announcer, Announcer):
+            announcer.speak(text, assertive)
+            return
+        found = current.findChild(Announcer)
+        if found is not None:
+            found.speak(text, assertive)
+            return
+        current = current.parentWidget()
     # Совсем некуда — хотя бы имени виджета дадим текст: диктор прочитает
     # его при следующем заходе на элемент.
     widget.setAccessibleName(text)
