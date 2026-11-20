@@ -222,6 +222,11 @@ class Player:
         with self._lock:
             self._playing = False
             self._paused = False
+            # Место стираем здесь же. Раньше кнопка «Стоп» вела себя как
+            # пауза: звук замолкал, а следующее включение продолжало с того
+            # же места.
+            self._pos = 0
+            self._finished = False
 
     def pause(self) -> bool:
         """Пауза: звук замолкает, место в треке остаётся."""

@@ -203,6 +203,16 @@ def _alert(widget: QWidget) -> None:
 
 def announce(widget: QWidget, text: str) -> None:
     """Объявляет изменение экранному диктору. Ошибки не критичны."""
+    # Кнопки состояния (микрофон, камера) сначала получают новое доступное
+    # имя, и диктор проговаривает его сам по изменению имени у элемента, на
+    # котором стоит фокус. Наше объявление говорило бы то же самое второй
+    # раз — микрофон так и читался дважды. Поэтому такой текст не повторяем.
+    try:
+        if (widget.hasFocus()
+                and widget.accessibleName().strip() == text.strip()):
+            return
+    except Exception:
+        pass
     widget.setAccessibleDescription(text)
     if _announcer is not None:
         _announcer.say(text)
@@ -2657,7 +2667,7 @@ class MainWindow(QMainWindow):
         if player.playing:
             player.stop()
             self._update_player_buttons()
-            self._set_status("Трек остановлен.")
+            self._set_status("Трек остановлен. Следующее включение — с начала.")
             return
         if player.paused:
             name = player.name or "трек"
@@ -2843,14 +2853,17 @@ class MainWindow(QMainWindow):
         self._apply_effects()
 
     def _reset_speed(self) -> None:
-        if abs(self._speed - 1.0) < 1e-6:
+        # Проверяем не только настройку, но и то, какой вариант сейчас
+        # звучит: настройка и звук могут разойтись, и тогда сброс должен
+        # всё равно вернуть исходный трек.
+        if abs(self._speed - 1.0) < 1e-6 and self._effects_key[0] == 1.0:
             self._set_status("Скорость уже обычная.")
             return
         self._speed = 1.0
         self._apply_effects()
 
     def _reset_pitch(self) -> None:
-        if not self._pitch:
+        if not self._pitch and self._effects_key[1] == 0:
             self._set_status("Тон уже обычный.")
             return
         self._pitch = 0
@@ -3611,6 +3624,12 @@ class MainWindow(QMainWindow):
             # первое по списку.
             mapping.setdefault(combo, action_id)
         self._shortcut_map = mapping
+        # Действующие сочетания — в журнал: если назначенное сочетание не
+        # срабатывает, по этой строке сразу видно, что именно записано.
+        runlog.write("Сочетания клавиш: " + (
+            ", ".join(f"{action}={combo}"
+                      for combo, action in sorted(mapping.items()))
+            or "ни одного"))
         self.settings_button.setText(f"Настройки{self._hint('settings')}")
         self.settings_button.setAccessibleName(self.settings_button.text())
         self._update_mic_button()
@@ -3623,6 +3642,7 @@ class MainWindow(QMainWindow):
 
     def _run_shortcut(self, action_id: str) -> None:
         """Выполняет действие, назначенное на сочетание клавиш."""
+        runlog.write(f"Сочетание клавиш: {action_id}")
         if action_id.startswith("volume_"):
             kind, _sep, key = action_id.partition(":")
             slider = self.sliders.get(key)
