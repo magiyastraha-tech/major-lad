@@ -120,18 +120,51 @@ class Announcer(QLabel):
     этой строки.
     """
 
+    # Объявление уходит диктору не в момент вызова, а следующей очередью
+    # событий. Так Qt не обращается к Windows из середины обработки
+    # сообщения: именно такая вложенная связь давала сбой 0x8001010d при
+    # запуске программы.
+    _queued = Signal(str, bool)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(1, 1)
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAccessibleName("Объявления программы")
+        # За один проход может прийти несколько объявлений: диктору хватает
+        # последнего, остальные он всё равно не успел бы прочитать.
+        self._pending: list[tuple[str, bool]] = []
+        self._queued.connect(self._collect, Qt.QueuedConnection)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(0)
+        self._timer.timeout.connect(self._flush)
 
     def say(self, text: str, polite: bool = True) -> None:
         if not text:
             return
+        # Доступное имя меняем сразу: диктор может прочитать его в любой
+        # момент, а вот событие отправляем очередью.
         self.setAccessibleName(text)
         self.setAccessibleDescription(text)
+        self._queued.emit(text, polite)
+
+    def _collect(self, text: str, polite: bool) -> None:
+        self._pending.append((text, polite))
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        # Срочное объявление важнее вежливого, даже если пришло раньше.
+        urgent = any(not polite for _, polite in self._pending)
+        text = self._pending[-1][0]
+        self._pending.clear()
+        self._deliver(text, not urgent)
+
+    def _deliver(self, text: str, polite: bool) -> None:
         if QAccessibleAnnouncementEvent is not None:
             if self._announce(text, polite):
                 return
@@ -160,17 +193,31 @@ class Announcer(QLabel):
             return False
 
 
+def _alert(widget: QWidget) -> None:
+    for kind in (QAccessible.Event.NameChanged, QAccessible.Event.Alert):
+        try:
+            QAccessible.updateAccessibility(QAccessibleEvent(widget, kind))
+        except Exception:
+            pass
+
+
 def announce(widget: QWidget, text: str) -> None:
     """Объявляет изменение экранному диктору. Ошибки не критичны."""
     widget.setAccessibleDescription(text)
     if _announcer is not None:
         _announcer.say(text)
         return
-    for kind in (QAccessible.Event.NameChanged, QAccessible.Event.Alert):
+
+    # Главная строка объявлений ещё не создана: сообщаем событием самого
+    # элемента — тоже следующим проходом очереди, не из середины обработки
+    # текущего сообщения Windows.
+    def later() -> None:
         try:
-            QAccessible.updateAccessibility(QAccessibleEvent(widget, kind))
-        except Exception:
+            _alert(widget)
+        except RuntimeError:  # элемент к этому моменту уже закрыт
             pass
+
+    QTimer.singleShot(0, later)
 
 
 def _explain(exc: Exception) -> str:
