@@ -193,6 +193,23 @@ def cleanup_backup() -> None:
         pass
 
 
+def _clean_env() -> dict[str, str]:
+    """Окружение для новой копии без путей распакованной старой.
+
+    Собранная одним файлом программа живёт во временной папке _MEI… и
+    передаёт её путь дочерним процессам через переменные окружения. Новая
+    копия, запущенная из старой, получала этот путь и работала в чужой
+    временной папке; когда старая закрывалась, папка удалялась и новая
+    падала с «No such file or directory: …_MEI…\\base_library.zip».
+    Убираем эти переменные — новая копия распакуется в свою папку.
+    """
+    env = dict(os.environ)
+    for name in ("_MEIPASS", "_MEIPASS2", "_PYI_APPLICATION_HOME_DIR",
+                 "_PYI_ARCHIVE_FILE", "PYINSTALLER_RESET_ENVIRONMENT"):
+        env.pop(name, None)
+    return env
+
+
 def _start_later(exe: Path) -> bool:
     """Запускает новую копию, которая сама дождётся выхода старой.
 
@@ -212,7 +229,7 @@ def _start_later(exe: Path) -> bool:
                 subprocess, "CREATE_NO_WINDOW", 0
             )
         subprocess.Popen(args, cwd=str(exe.parent), close_fds=True,
-                         creationflags=flags)
+                         creationflags=flags, env=_clean_env())
     except Exception:
         return False
     return True
@@ -242,7 +259,7 @@ def install_and_restart(new_file: Path) -> tuple[bool, str]:
             if os.name == "nt":
                 flags = getattr(subprocess, "DETACHED_PROCESS", 0)
             subprocess.Popen([str(exe)], cwd=str(exe.parent), close_fds=True,
-                             creationflags=flags)
+                             creationflags=flags, env=_clean_env())
         except Exception as exc:
             return False, f"Файл заменён, но запустить программу не удалось: {exc}"
     return True, ""

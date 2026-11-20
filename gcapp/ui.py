@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAccessible, QAccessibleEvent, QPixmap
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAccessible, QAccessibleEvent, QBrush, QColor, QDesktopServices, QPixmap,
+)
 
 try:  # Qt 6.8 и новее: «объявление» диктору не зависит от того, где фокус
     from PySide6.QtGui import QAccessibleAnnouncementEvent
@@ -189,6 +192,28 @@ def label_for(text: str, buddy: QWidget | None = None) -> QLabel:
     if buddy is not None:
         lbl.setBuddy(buddy)
     return lbl
+
+
+# Ссылка в сообщении: адрес с http/https или короткая запись с www.
+# Концевая пунктуация в адрес не входит — точка в конце фразы остаётся
+# частью предложения, а не ссылки.
+_LINK_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.IGNORECASE)
+
+
+def find_link(text: str) -> str:
+    """Первая ссылка из текста сообщения. Пусто — ссылки нет."""
+    match = _LINK_RE.search(str(text or ""))
+    if match is None:
+        return ""
+    link = match.group(0).rstrip(".,;:!?)]}»\"'")
+    if link.lower().startswith("www."):
+        link = "https://" + link
+    return link
+
+
+def link_color() -> QColor:
+    """Цвет ссылки: тот же синий, что у обычных ссылок Windows."""
+    return QColor("#1a5fb4")
 
 
 class _ShortcutFilter(QObject):
@@ -1084,6 +1109,8 @@ class ChatList(QListWidget):
 
     sig_delete = Signal()
     sig_edit = Signal()
+    sig_open_link = Signal()
+    sig_download = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1103,6 +1130,20 @@ class ChatList(QListWidget):
             self.sig_edit.emit()
             event.accept()
             return
+        # Enter на сообщении со ссылкой открывает её, на сообщении с файлом
+        # скачивает файл. Так до ссылки можно добраться без мыши: стрелками
+        # встать на сообщение и нажать Enter.
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            item = self.currentItem()
+            if item is not None:
+                if find_link(str(item.data(Qt.UserRole + 3) or "")):
+                    self.sig_open_link.emit()
+                    event.accept()
+                    return
+                if item.data(Qt.UserRole + 4):
+                    self.sig_download.emit()
+                    event.accept()
+                    return
         super().keyPressEvent(event)
 
     def contextMenuEvent(self, event) -> None:
@@ -1113,13 +1154,25 @@ class ChatList(QListWidget):
         self.setCurrentItem(item)
         menu = QMenu(self)
         menu.setAccessibleName("Действия с сообщением")
+        open_link = None
+        download = None
+        if find_link(str(item.data(Qt.UserRole + 3) or "")):
+            open_link = menu.addAction("Открыть ссылку")
         edit = menu.addAction("Редактировать")
         delete = menu.addAction("Удалить")
+        if item.data(Qt.UserRole + 4):
+            download = menu.addAction("Скачать файл")
         chosen = menu.exec(self.viewport().mapToGlobal(event.pos()))
-        if chosen is edit:
+        if chosen is None:
+            return
+        if chosen is open_link:
+            self.sig_open_link.emit()
+        elif chosen is edit:
             self.sig_edit.emit()
         elif chosen is delete:
             self.sig_delete.emit()
+        elif chosen is download:
+            self.sig_download.emit()
 
 
 class VideoWindow(QWidget):
@@ -1184,6 +1237,8 @@ class MainWindow(QMainWindow):
     sig_effects_error = Signal(str, int)
     sig_media_list = Signal(object)
     sig_media_saved = Signal(str)
+    # Пришёл файл: кто прислал и где он лежит на диске.
+    sig_file_message = Signal(str, str)
     sig_peer_video = Signal(bool)
     # Порция прошлой переписки от преподавателя: список сообщений и
     # признак «раньше есть ещё».
@@ -1220,6 +1275,10 @@ class MainWindow(QMainWindow):
         # потом ложится строкой в чат и в историю ученика.
         self._lesson_start: datetime | None = None
         self._lesson_student = ""
+        # Ученик хочет быть в кабинете: пока это так, обрыв связи не
+        # закрывает программу — она ждёт сеть и переподключается сама.
+        self._want_connection = False
+        self._waiting_network = False
         # Плеер: есть ли треки в Media и не идёт ли сейчас загрузка файла.
         self._tracks_available = False
         self._loading_track = False
@@ -1272,6 +1331,12 @@ class MainWindow(QMainWindow):
         self._student_save_timer.setSingleShot(True)
         self._student_save_timer.setInterval(800)
         self._student_save_timer.timeout.connect(self._save_student_settings)
+        # Повтор подключения, пока сети нет. Раз в пять секунд — редкий
+        # опрос: человеку не нужна строка в чате на каждую попытку.
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.setInterval(5000)
+        self._retry_timer.timeout.connect(self._retry_connect)
 
         self.setWindowTitle(f"Мажорный лад {__version__}")
         self.resize(900, 680)
@@ -1453,9 +1518,12 @@ class MainWindow(QMainWindow):
         self.add_track_button.setAccessibleName("Добавить трек")
         track_row.addWidget(self.add_track_button)
         # Ученик забирает треки из кабинета преподавателя в свою Media.
-        self.import_button = QPushButton("Импортировать аудио")
-        self.import_button.setAccessibleName("Импортировать аудио")
-        self.import_button.setVisible(not self.is_teacher)
+        # Кнопка нужна обеим сторонам: ученик берёт трек из Media
+        # преподавателя, преподаватель — из Media ученика.
+        import_label = ("Импортировать аудио от ученика" if self.is_teacher
+                        else "Импортировать аудио")
+        self.import_button = QPushButton(import_label)
+        self.import_button.setAccessibleName(import_label)
         track_row.addWidget(self.import_button)
         player_layout.addLayout(track_row)
 
@@ -1550,10 +1618,16 @@ class MainWindow(QMainWindow):
         self.send_button.setAccessibleName("Отправить сообщение")
         self.file_button = QPushButton("Отправить файл")
         self.file_button.setAccessibleName("Отправить файл собеседнику")
+        self.download_button = QPushButton("Скачать")
+        self.download_button.setAccessibleName(
+            "Скачать файл из выбранного сообщения в папку Media")
+        self.download_button.setToolTip(
+            "Сохраняет файл из выбранного сообщения в папку Media")
         input_row.addWidget(label_for("Сообщение", self.message_edit))
         input_row.addWidget(self.message_edit, 1)
         input_row.addWidget(self.send_button)
         input_row.addWidget(self.file_button)
+        input_row.addWidget(self.download_button)
         chat_layout.addLayout(input_row)
         layout.addWidget(chat_group, 2)
 
@@ -1578,6 +1652,7 @@ class MainWindow(QMainWindow):
         self.message_edit.returnPressed.connect(self._send_message)
         self.send_button.clicked.connect(self._send_message)
         self.file_button.clicked.connect(self._send_file)
+        self.download_button.clicked.connect(lambda: self._download_chat_file())
         self.settings_button.clicked.connect(self.open_settings)
         self.join_button.clicked.connect(self._join)
         self.connect_button.clicked.connect(self._on_connect_button)
@@ -1617,6 +1692,9 @@ class MainWindow(QMainWindow):
         self.chat_list.currentRowChanged.connect(self._on_chat_row_changed)
         self.chat_list.sig_delete.connect(self._delete_chat_message)
         self.chat_list.sig_edit.connect(self._edit_chat_message)
+        self.chat_list.sig_open_link.connect(self._open_chat_link)
+        self.chat_list.sig_download.connect(self._download_chat_file)
+        self.sig_file_message.connect(self._on_file_message)
         self.sig_peer.connect(self._on_peer)
         self.sig_ready.connect(self._on_ready)
         self.sig_busy.connect(self._on_busy)
@@ -1637,8 +1715,9 @@ class MainWindow(QMainWindow):
             on_chat=self.sig_chat.emit,
             on_chat_delete=self.sig_chat_delete.emit,
             on_chat_edit=self.sig_chat_edit.emit,
-            on_file=lambda who, path: self.sig_chat.emit(
-                "система", f"{who} прислал файл: {os.path.basename(path)}", ""),
+            on_file=self.sig_file_message.emit,
+            on_media_list=self.sig_media_list.emit,
+            on_media_saved=self.sig_media_saved.emit,
             on_peer=self.sig_peer.emit,
             on_join_request=self.sig_join_request.emit,
             on_video_state=self.sig_peer_video.emit,
@@ -1669,20 +1748,29 @@ class MainWindow(QMainWindow):
         if self.cfg.get("autoconnect", True):
             self._connect()
 
-    def _connect(self) -> None:
+    def _connect(self, silent: bool = False) -> None:
+        """Подключается к кабинету преподавателя.
+
+        silent — повторная попытка, пока нет сети: без окна и без
+        «Подключаюсь» в статусе, чтобы ожидание не шумело.
+        """
         host = self.cfg.get("server_ip", "").strip()
         if not host:
+            self._stop_waiting()
             self._set_status("Не задан адрес преподавателя. Откройте настройки, Control+P.")
-            QMessageBox.information(
-                self, "Нужен адрес",
-                "В настройках, раздел «Общее», укажите адрес преподавателя. "
-                "Он выдаёт этот адрес ученикам."
-            )
+            if not silent:
+                QMessageBox.information(
+                    self, "Нужен адрес",
+                    "В настройках, раздел «Общее», укажите адрес преподавателя. "
+                    "Он выдаёт этот адрес ученикам."
+                )
             return
         name = self.cfg.get("name", "").strip() or self.name_edit.text().strip()
         if not name:
+            self._stop_waiting()
             self._set_status("Сначала введите имя.")
             return
+        self._want_connection = True
         self.client = Client(
             name, host,
             port=int(self.cfg.get("server_port", 45800)),
@@ -1690,8 +1778,7 @@ class MainWindow(QMainWindow):
             on_chat=self.sig_chat.emit,
             on_chat_delete=self.sig_chat_delete.emit,
             on_chat_edit=self.sig_chat_edit.emit,
-            on_file=lambda who, path: self.sig_chat.emit(
-                "система", f"{who} прислал файл: {os.path.basename(path)}", ""),
+            on_file=self.sig_file_message.emit,
             on_ready=self.sig_ready.emit,
             on_busy=self.sig_busy.emit,
             on_peer=self.sig_peer.emit,
@@ -1701,9 +1788,43 @@ class MainWindow(QMainWindow):
             on_video_state=self.sig_peer_video.emit,
             on_history=self.sig_history.emit,
         )
-        self._set_status(f"Подключаюсь к {host}…")
+        if not silent:
+            self._set_status(f"Подключаюсь к {host}…")
         # connect() может ждать до шести секунд — не держим интерфейс.
         threading.Thread(target=self.client.connect, daemon=True).start()
+
+    def _retry_connect(self) -> None:
+        """Очередная попытка подключиться, пока сети не было."""
+        if not self._waiting_network or self.client is not None:
+            return
+        self._connect(silent=True)
+
+    def _enter_waiting(self) -> None:
+        """Связь пропала: программа не закрывается, а ждёт её возвращения."""
+        first = not self._waiting_network
+        self._waiting_network = True
+        self.client = None
+        self.connected = False
+        self._stop_video()
+        self._close_video_window()
+        self._cam_on = False
+        self._update_cam_button()
+        # Кнопка остаётся «Отключиться»: она теперь отменяет ожидание.
+        self.connect_button.setText("Отключиться")
+        self.connect_button.setAccessibleName("Отключиться")
+        text = ("Связь с преподавателем прервалась. Жду восстановления "
+                "интернета и подключусь заново сам. Программа остаётся "
+                "открытой; «Отключиться» завершает урок.")
+        self._set_status(text)
+        if first:
+            sounds.play("disconnect")
+            self._append_chat("система", text)
+            announce(self.status_label, text)
+        self._retry_timer.start()
+
+    def _stop_waiting(self) -> None:
+        self._waiting_network = False
+        self._retry_timer.stop()
 
     # -- обработчики --------------------------------------------------------
 
@@ -1735,8 +1856,22 @@ class MainWindow(QMainWindow):
             else:
                 self._start_teacher()
         else:
-            if self.client is not None:
-                self.client.stop()
+            if self.client is not None or self._waiting_network:
+                # «Отключиться» во время ожидания сети тоже закрывает урок.
+                self._want_connection = False
+                if self._waiting_network:
+                    self._stop_waiting()
+                    if self._lesson_start is not None:
+                        length = _duration_word(
+                            (datetime.now()
+                             - self._lesson_start).total_seconds())
+                        self._lesson_start = None
+                        self._lesson_student = ""
+                        self._append_chat(
+                            "система",
+                            f"Урок закончен. Длительность: {length}.")
+                if self.client is not None:
+                    self.client.stop()
                 self.client = None
                 self.engine.stop()
                 self.connected = False
@@ -1785,6 +1920,9 @@ class MainWindow(QMainWindow):
         sounds.play("disconnect")
 
     def _on_ready(self, teacher: str) -> None:
+        restored = self._waiting_network
+        if restored:
+            self._stop_waiting()
         self._set_status(f"Соединение установлено: {teacher}.")
         if not self.is_teacher:
             self._lesson_begin(teacher)
@@ -1807,6 +1945,10 @@ class MainWindow(QMainWindow):
             self._history_more = True
             self._history_pending = False
             self._request_history("")
+        if restored:
+            text = "Связь восстановлена. Урок продолжается."
+            self._set_status(text)
+            announce(self.status_label, text)
 
     def _on_busy(self) -> None:
         # Кабинет занят: программа уже спросила преподавателя. Окно не
@@ -1871,8 +2013,18 @@ class MainWindow(QMainWindow):
             "refused": "Подождите, кабинет пока закрыт. Преподаватель скоро его откроет.",
             "timeout": "Преподаватель не отвечает. Проверьте адрес в настройках, "
                        "Control+P.",
+            "network": "Нет связи с сетью или интернетом. Жду восстановления "
+                       "подключения.",
         }
         text = texts.get(reason, texts["lost"])
+        # Обрыв связи посреди урока: не сдаёмся и не закрываем окно —
+        # ждём сеть и переподключаемся сами. Остальные причины (закрытый
+        # кабинет, отказ, молчание преподавателя) остаются как были.
+        if self._waiting_network or (reason in ("lost", "network")
+                                     and self._want_connection):
+            self._enter_waiting()
+            return
+        self._want_connection = False
         if self._lesson_start is not None:
             # Ученик видит, сколько шёл урок, — та же строка уходит
             # в переписку преподавателя.
@@ -2106,9 +2258,17 @@ class MainWindow(QMainWindow):
         self._set_status("Микрофон выключен." if self._mic_muted
                          else "Микрофон включён.")
 
-    # -- импорт треков от преподавателя -------------------------------------
+    # -- импорт треков: в обе стороны ---------------------------------------
 
     def _import_audio(self) -> None:
+        """Просит у собеседника список треков из его папки Media."""
+        if self.is_teacher:
+            if self.server is None or not self.connected:
+                self._set_status("Импорт доступен, когда ученик в кабинете.")
+                return
+            if self.server.request_media_list():
+                self._set_status("Запрашиваю у ученика список треков.")
+            return
         if self.client is None:
             self._set_status("Импорт доступен при подключении к преподавателю.")
             return
@@ -2119,13 +2279,16 @@ class MainWindow(QMainWindow):
         # Сеть присылает уже готовые имена, но старые сборки могли отдавать
         # словари — принимаем оба вида, чтобы импорт не падал с
         # «'str' object has no attribute 'get'».
+        who = "у ученика" if self.is_teacher else "у преподавателя"
         names = []
         for t in (tracks or []):
             name = str(t.get("name") or "") if isinstance(t, dict) else str(t or "")
             if name:
                 names.append(name)
         if not names:
-            self._set_status("У преподавателя нет треков в папке Media.")
+            text = f"В папке Media {who} нет треков."
+            self._set_status(text)
+            announce(self.media_combo, text)
             return
         if len(names) == 1:
             choice = names[0]
@@ -2134,7 +2297,13 @@ class MainWindow(QMainWindow):
                 self, "Импортировать аудио", "Трек:", names, 0, False)
             if not ok or not choice:
                 return
-        if self.client is None or not self.client.request_media(choice):
+        if self.is_teacher:
+            asked = (self.server is not None
+                     and self.server.request_media(choice))
+        else:
+            asked = (self.client is not None
+                     and self.client.request_media(choice))
+        if not asked:
             self._set_status("Не удалось запросить трек: нет соединения.")
             return
         self._set_status(f"Скачиваю трек: {choice}.")
@@ -2879,19 +3048,86 @@ class MainWindow(QMainWindow):
         elif self.client is not None:
             sent = self.client.send_file(path)
         if sent:
-            self._append_chat("система", f"Файл отправлен: {Path(path).name}")
+            self._append_chat("система", f"Файл отправлен: {Path(path).name}",
+                              file_path=path)
         else:
             self._set_status("Файл не отправлен: нет соединения.")
 
+    def _on_file_message(self, who: str, path: str) -> None:
+        """Пришёл файл: строка в чате с привязкой к файлу на диске.
+
+        Сам файл уже сохранён в папке Data/received. Путь к нему записан
+        в строку: по нему кнопка «Скачать» и меню кладут файл в Media.
+        """
+        name = os.path.basename(str(path or ""))
+        self._append_chat("система", f"{who} прислал файл: {name}",
+                          file_path=str(path or ""))
+
+    def _open_chat_link(self) -> None:
+        """Открывает ссылку из выбранного сообщения в браузере."""
+        item = self.chat_list.currentItem()
+        if item is None:
+            announce(self.chat_list, "Нет выбранного сообщения.")
+            return
+        link = find_link(str(item.data(Qt.UserRole + 3) or ""))
+        if not link:
+            announce(self.chat_list, "В этом сообщении нет ссылки.")
+            return
+        if not QDesktopServices.openUrl(QUrl(link)):
+            text = f"Не удалось открыть ссылку: {link}"
+            self._set_status(text)
+            announce(self.chat_list, text)
+            return
+        announce(self.chat_list, f"Открываю ссылку: {link}")
+
+    def _download_chat_file(self, item=None) -> None:
+        """Кладёт файл из выбранного сообщения в папку Media.
+
+        Присланный файл уже лежит в Data/received — «скачать» значит
+        скопировать его в Media, откуда он сразу виден в плеере.
+        """
+        if not isinstance(item, QListWidgetItem):
+            item = self.chat_list.currentItem()
+        if item is None:
+            announce(self.chat_list, "Выберите сообщение с файлом.")
+            return
+        path = str(item.data(Qt.UserRole + 4) or "")
+        if not path:
+            announce(self.chat_list, "У этого сообщения нет файла. "
+                                     "Выберите сообщение, где написано, "
+                                     "что прислан файл.")
+            return
+        name = os.path.basename(path)
+        if not os.path.exists(path):
+            text = f"Файл {name} не найден: его могли удалить."
+            self._set_status(text)
+            announce(self.chat_list, text)
+            return
+        announce(self.chat_list, f"Скачивание файла {name} началось.")
+        self._set_status(f"Скачиваю файл: {name}.")
+        try:
+            target = media.add_track(path)
+        except OSError as exc:
+            text = f"Не удалось скачать файл {name}: {exc}"
+            self._set_status(text)
+            announce(self.chat_list, text)
+            return
+        self._refresh_tracks(select=str(target))
+        text = f"Файл скачан в папку Media: {target.name}."
+        self._set_status(text)
+        announce(self.chat_list, text)
+
     def _add_chat_item(self, sender: str, text: str, mid: str = "",
                        when: datetime | None = None,
-                       row: int | None = None) -> QListWidgetItem:
+                       row: int | None = None,
+                       file_path: str = "") -> QListWidgetItem:
         """Создаёт строку чата. row задан — вставляет на это место."""
         item = QListWidgetItem()
         item.setData(Qt.UserRole, mid or f"local-{uuid.uuid4().hex}")
         item.setData(Qt.UserRole + 1, when or datetime.now())
         item.setData(Qt.UserRole + 2, sender)
         item.setData(Qt.UserRole + 3, text)
+        item.setData(Qt.UserRole + 4, file_path)
         if row is None:
             self.chat_list.addItem(item)
         else:
@@ -2899,7 +3135,8 @@ class MainWindow(QMainWindow):
         return item
 
     def _append_chat(self, sender: str, text: str, mid: str = "",
-                     keep: bool = False, owner: str = "") -> None:
+                     keep: bool = False, owner: str = "",
+                     file_path: str = "") -> None:
         """Добавляет строку в чат.
 
         У каждой строки есть номер отправителя и время. Время пишется после
@@ -2907,9 +3144,9 @@ class MainWindow(QMainWindow):
         чтобы было понятно, в какой день шёл разговор. keep — строку надо
         сохранить в историю, даже если это заметка программы (конец урока).
         owner — в файл какого ученика её писать, если кабинет уже перешёл
-        к следующему.
+        к следующему. file_path — файл, который пришёл или ушёл этой строкой.
         """
-        self._add_chat_item(sender, text, mid)
+        self._add_chat_item(sender, text, mid, file_path=file_path)
         self._record_history(sender, text, mid, keep=keep, owner=owner)
         self._refresh_chat()
         self.chat_list.scrollToBottom()
@@ -3130,6 +3367,10 @@ class MainWindow(QMainWindow):
                 line = f"{line} — {stamp}"
             if item.text() != line:
                 item.setText(line)
+            # Сообщение со ссылкой синее: так видно, что Enter или меню
+            # откроют адрес в браузере. Текст диктор читает как обычно.
+            item.setForeground(QBrush(link_color()) if find_link(text)
+                               else QBrush())
 
     def _chat_item(self, mid: str) -> QListWidgetItem | None:
         for row in range(self.chat_list.count()):
@@ -3356,7 +3597,47 @@ class MainWindow(QMainWindow):
             self.name_edit.setText(self.cfg["name"])
         self._set_status(message)
 
+    def _confirm_close(self) -> bool:
+        """Спрашивает перед закрытием во время урока.
+
+        Случайное нажатие крестика не должно обрывать урок: закрываем
+        только по явному выбору, а по умолчанию остаёмся на месте.
+        """
+        if self.is_teacher:
+            if self.server is None or not self.connected:
+                return True
+            who = getattr(self.server, "active_name", "") or "ученик"
+            text = (f"Сейчас идёт урок с {who}. Если закрыть программу, "
+                    "урок закончится.")
+        else:
+            if self.client is None and not self._waiting_network:
+                return True
+            if self._waiting_network:
+                text = ("Связь пропала, программа ждёт её возвращения. "
+                        "Если закрыть, урок закончится.")
+            else:
+                text = ("Вы в кабинете у преподавателя. Если закрыть "
+                        "программу, урок закончится.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Закрыть программу?")
+        box.setIcon(QMessageBox.Question)
+        box.setText(text)
+        box.setAccessibleName("Подтверждение закрытия программы")
+        quit_button = box.addButton("Закрыть программу",
+                                    QMessageBox.DestructiveRole)
+        stay = box.addButton("Остаться", QMessageBox.RejectRole)
+        box.setDefaultButton(stay)
+        box.setEscapeButton(stay)
+        announce(self.status_label, text + " Остаться — по умолчанию.")
+        box.exec()
+        return box.clickedButton() is quit_button
+
     def closeEvent(self, event) -> None:
+        if not self._confirm_close():
+            event.ignore()
+            return
+        self._want_connection = False
+        self._stop_waiting()
         config.save(self.cfg)
         if self.is_teacher:
             # Урок мог идти в момент закрытия: сначала заметка о конце,
@@ -3379,4 +3660,7 @@ class MainWindow(QMainWindow):
             self.server.stop()
         if self.client is not None:
             self.client.stop()
+        # Метка в журнале: если строки нет, а программа пропала из процессов,
+        # значит закрылась она не сама — это видно по журналу и crash.log.
+        runlog.write("Программа закрыта.")
         super().closeEvent(event)

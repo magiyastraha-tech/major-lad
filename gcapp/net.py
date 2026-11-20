@@ -115,7 +115,8 @@ class Server:
     def __init__(self, name: str, on_status=None, on_chat=None, on_file=None,
                  on_peer=None, on_join_request=None, on_video_state=None,
                  on_chat_delete=None, on_chat_edit=None,
-                 on_history_loaded=None,
+                 on_history_loaded=None, on_media_list=None,
+                 on_media_saved=None,
                  chat_history: list | None = None,
                  port: int = APP_PORT):
         self.name = name
@@ -131,6 +132,10 @@ class Server:
         self.on_chat_delete = on_chat_delete or (lambda *a: None)
         self.on_chat_edit = on_chat_edit or (lambda *a: None)
         self.on_file = on_file or (lambda *a: None)
+        # Треки ученика: преподаватель просит список и получает выбранный
+        # трек в ту же папку Media, что и свои.
+        self.on_media_list = on_media_list or (lambda *a: None)
+        self.on_media_saved = on_media_saved or (lambda *a: None)
         self.on_peer = on_peer or (lambda *a: None)
         self.on_video_state = on_video_state or (lambda *a: None)
         # Второй ученик не входит молча и не висит в очереди: преподаватель
@@ -316,6 +321,22 @@ class Server:
             return False
         return session.send_file(path)
 
+    def request_media_list(self) -> bool:
+        """Просит ученика прислать список его треков."""
+        session = self.current()
+        if session is None:
+            self.on_status("В кабинете никого нет — список треков не получен.")
+            return False
+        return session.send_json({"type": "media_list_req"})
+
+    def request_media(self, name: str) -> bool:
+        """Просит ученика прислать конкретный трек."""
+        session = self.current()
+        if session is None:
+            self.on_status("В кабинете никого нет — трек не получен.")
+            return False
+        return session.send_json({"type": "media_get_req", "name": name})
+
     def send_video_state(self, on: bool) -> bool:
         """Сообщаем ученику, что камера включается или гаснет.
 
@@ -444,23 +465,45 @@ class _Session:
                     data = recv_exact(self.conn, size)
                 except Exception:
                     break
-                path = save_received(str(msg.get("name") or "файл"), data)
-                self.server.on_file(self.name, path)
-                self.send_json({
-                    "type": "chat",
-                    "id": _chat_id(),
-                    "from": "система",
-                    "text": f"Файл получен: {os.path.basename(path)}",
-                })
-            elif kind == "media_list":
-                # Ученик просит список треков из папки Media преподавателя.
-                tracks = []
-                for p in media.list_tracks():
+                if msg.get("media"):
+                    # Ответ на запрос преподавателя: трек из папки Media
+                    # ученика кладём в свою Media, а не в принятые файлы.
                     try:
-                        tracks.append({"name": p.name, "size": p.stat().st_size})
-                    except OSError:
-                        continue
-                self.send_json({"type": "media_list", "tracks": tracks})
+                        path = media.import_track(str(msg.get("name") or ""),
+                                                  data)
+                    except OSError as exc:
+                        self.server.on_status(
+                            f"Не удалось сохранить трек: {exc}")
+                    else:
+                        self.server.on_media_saved(str(path))
+                else:
+                    path = save_received(str(msg.get("name") or "файл"), data)
+                    self.server.on_file(self.name, path)
+                    # Подтверждение уходит ученику строкой в чат: он должен
+                    # видеть, что файл дошёл.
+                    self.send_json({
+                        "type": "chat",
+                        "id": _chat_id(),
+                        "from": "система",
+                        "text": "Файл получен преподавателем: "
+                                f"{os.path.basename(path)}",
+                    })
+            elif kind == "media_list":
+                if "tracks" in msg:
+                    # Ответ ученика на просьбу преподавателя: список его
+                    # треков. Окно преподавателя покажет их для выбора.
+                    self.server.on_media_list(list(msg.get("tracks") or []))
+                else:
+                    # Ученик просит список треков из папки Media
+                    # преподавателя.
+                    tracks = []
+                    for p in media.list_tracks():
+                        try:
+                            tracks.append({"name": p.name,
+                                           "size": p.stat().st_size})
+                        except OSError:
+                            continue
+                    self.send_json({"type": "media_list", "tracks": tracks})
             elif kind == "media_get":
                 # Ученик выбрал трек — отдаём его файлом, чтобы он лёг
                 # в его собственную папку Media.
@@ -588,6 +631,9 @@ class Client:
                 self.on_ended("timeout")
             else:
                 self.on_status(f"Не удалось подключиться к {self.host}: {exc}")
+                # Сети нет вовсе (не «кабинет закрыт» и не «не отвечает»):
+                # интерфейс перейдёт в ожидание и попробует ещё раз.
+                self.on_ended("network")
             return False
 
         self._sock = sock
@@ -715,14 +761,31 @@ class Client:
                         path = save_received(str(msg.get("name") or "файл"),
                                              data)
                         self.on_file("Преподаватель", path)
-                        self.on_chat("система",
-                                     f"Файл получен: {os.path.basename(path)}",
-                                     _chat_id())
                 elif kind == "media_list":
                     tracks = [str(t.get("name") or "")
                               for t in (msg.get("tracks") or [])
                               if t.get("name")]
                     self.on_media_list(tracks)
+                elif kind == "media_list_req":
+                    # Преподаватель просит список треков из нашей Media.
+                    tracks = []
+                    for p in media.list_tracks():
+                        try:
+                            tracks.append({"name": p.name,
+                                           "size": p.stat().st_size})
+                        except OSError:
+                            continue
+                    send_json(sock, {"type": "media_list", "tracks": tracks},
+                              self._send_lock)
+                elif kind == "media_get_req":
+                    # Преподаватель выбрал трек — отдаём его файлом.
+                    name = str(msg.get("name") or "")
+                    path = next((p for p in media.list_tracks()
+                                 if p.name == name), None)
+                    if path is None:
+                        self.on_status("Трек не найден в папке Media.")
+                    else:
+                        self.send_media(str(path))
                 elif kind == "media_error":
                     self.on_status(str(msg.get("text") or "Трек не получен."))
                 elif kind == "video":
@@ -809,6 +872,28 @@ class Client:
             data = p.read_bytes()
             send_json(sock, {"type": "file_start", "name": p.name,
                              "size": len(data)}, self._send_lock)
+            with self._send_lock:
+                sock.sendall(data)
+            return True
+        except OSError:
+            self.disconnect()
+            return False
+
+    def send_media(self, path: str) -> bool:
+        """Отправляет трек преподавателю по его просьбе.
+
+        Файл помечен media: у преподавателя он ляжет в папку Media,
+        а не в принятые файлы.
+        """
+        sock = self._sock
+        if sock is None or not self._connected:
+            return False
+        p = Path(path)
+        try:
+            data = p.read_bytes()
+            send_json(sock, {"type": "file_start", "name": p.name,
+                             "size": len(data), "media": True},
+                      self._send_lock)
             with self._send_lock:
                 sock.sendall(data)
             return True

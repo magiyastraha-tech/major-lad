@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import faulthandler
 import os
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
     QVBoxLayout,
@@ -25,6 +26,47 @@ from gcapp.ui import MainWindow
 
 def _error_log_path() -> Path:
     return config.data_dir() / "error_log.txt"
+
+
+# Ссылки держим модульными: QLockFile освобождает замок в своём
+# деструкторе, и объект нельзя отдавать сборщику мусора. Файл crash.log
+# тоже должен жить до конца программы — в него пишет faulthandler.
+_lock: QLockFile | None = None
+_crash_file = None
+
+
+def _install_crash_log() -> None:
+    """Пишет в Data/crash.log стек жёсткого падения.
+
+    Если программа закрывается сама — сбой в Qt, в звуковом потоке, —
+    ни один обработчик Python не успевает сработать, в журнале остаётся
+    только «Программа закрыта.» без причины. faulthandler дописывает
+    стек с места сбоя.
+    """
+    global _crash_file
+    try:
+        _crash_file = open(config.data_dir() / "crash.log", "a",
+                           encoding="utf-8")
+        faulthandler.enable(file=_crash_file, all_threads=True)
+    except Exception:
+        _crash_file = None
+
+
+def _take_single_lock() -> bool:
+    """True, если это единственная копия программы.
+
+    Двойной щелчок по exe запускал два окна, и преподаватель получал две
+    заявки от одного ученика. Замок — файл в Data рядом с настройками,
+    поэтому у «Преподавателя» и «Ученика» он свой и друг другу они не
+    мешают. Если прошлая копия ещё закрывается, ждём её до двух секунд.
+    """
+    global _lock
+    path = config.config_path().with_suffix(".lock")
+    lock = QLockFile(str(path))
+    if not lock.tryLock(2000):
+        return False
+    _lock = lock
+    return True
 
 
 def _install_error_handler() -> None:
@@ -163,7 +205,18 @@ def main(forced_role: str | None = None) -> int:
     app.setApplicationName("Мажорный лад")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("Мажорный лад")
+    if not _take_single_lock():
+        # Второй экземпляр не открывается вовсе: иначе с одного компьютера
+        # уходят две заявки и кабинет видит «двух» учеников.
+        runlog.start(role=forced_role or "", version=__version__)
+        runlog.write("Второй экземпляр программы — окно не открываю.")
+        QMessageBox.information(
+            None, "Мажорный лад",
+            "Программа уже запущена. Второе окно не открываю — "
+            "работайте в том, что уже открыто.")
+        return 0
     runlog.start(role=forced_role or "", version=__version__)
+    _install_crash_log()
     if moved:
         runlog.write("Перенесено в Data: " + ", ".join(moved) + ".")
     _install_error_handler()
