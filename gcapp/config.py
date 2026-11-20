@@ -21,7 +21,7 @@ DEFAULT_DEVICE = "__default__"
 DEFAULTS = {
     # Версия схемы настроек: по ней load() понимает, какие старые
     # умолчания пора привести к новым.
-    "settings_version": 3,
+    "settings_version": 4,
     "role": "",
     "name": "",
     "server_ip": "",
@@ -62,10 +62,6 @@ DEFAULTS = {
             "player": 80,
         },
         "volume_mode": "local",
-        # Чья сторона играет минус и метроном. «local» — моя, «peer» —
-        # собеседника: тогда его поток уже содержит дорожку и клик, а мой
-        # плеер и метроном молчат, чтобы не было рассинхрона по таймингу.
-        "backing_source": "local",
         # Размер буфера обмена звуком: low (20–40 мс), normal (40–80 мс),
         # stable (80–160 мс). Чем больше, тем устойчивее связь и тем длиннее
         # задержка.
@@ -255,6 +251,12 @@ def load() -> dict:
                 audio_cfg["device1"] = DEFAULT_DEVICE
             cfg.setdefault("video", {})["enabled"] = True
         cfg["settings_version"] = 3
+    # 0.4.7: переключателя «чья сторона играет» больше нет. Минус и метроном
+    # всегда играет тот, у кого они включены, и его звук уходит собеседнику.
+    # Старый ключ убираем, чтобы он не всплывал в сохранённом файле.
+    if int(cfg.get("settings_version", 1) or 1) < 4:
+        cfg.get("audio", {}).pop("backing_source", None)
+        cfg["settings_version"] = 4
     return cfg
 
 

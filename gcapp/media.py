@@ -131,6 +131,9 @@ class Player:
         self._data = np.zeros(0, dtype=np.float32)
         self._pos = 0
         self._playing = False
+        # Пауза: звук не идёт, но место в треке сохраняется. Отличается от
+        # остановки, после которой кнопка снова играет с начала.
+        self._paused = False
         self._finished = False
         self.path = ""
         self.name = ""
@@ -147,6 +150,11 @@ class Player:
         with self._lock:
             return self._playing
 
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
     def duration(self) -> float:
         with self._lock:
             return self._data.size / self.rate if self._data.size else 0.0
@@ -162,6 +170,7 @@ class Player:
             self._data = np.ascontiguousarray(data, dtype=np.float32)
             self._pos = 0
             self._playing = False
+            self._paused = False
             self._finished = False
             self.path = str(path)
             self.name = Path(path).name
@@ -190,6 +199,7 @@ class Player:
             self._data = np.zeros(0, dtype=np.float32)
             self._pos = 0
             self._playing = False
+            self._paused = False
             self._finished = False
             self.path = ""
             self.name = ""
@@ -203,12 +213,24 @@ class Player:
             if self._pos >= self._data.size:
                 self._pos = 0
             self._playing = True
+            self._paused = False
             self._finished = False
             return True
 
     def stop(self) -> None:
+        """Остановка: следующий запуск начнёт с начала."""
         with self._lock:
             self._playing = False
+            self._paused = False
+
+    def pause(self) -> bool:
+        """Пауза: звук замолкает, место в треке остаётся."""
+        with self._lock:
+            if not self._playing:
+                return False
+            self._playing = False
+            self._paused = True
+            return True
 
     def seek(self, seconds: float) -> float:
         """Сдвиг относительно текущего места. Возвращает новую позицию."""

@@ -881,7 +881,6 @@ class AudioEngine:
         # Чья сторона играет минус и метроном. «local» — моя, «peer» —
         # собеседника: тогда его поток уже содержит дорожку и клик, а свой
         # плеер и метроном молчат, чтобы не было рассинхрона.
-        self.backing_source = "local"
         # Компенсация задержки. Голос проходит микрофон и входной буфер и
         # приходит позже, а клик, MIDI и трек рождаются в микшере и уходят
         # сразу. Задерживаем передающую копию этих сигналов на задержку
@@ -893,6 +892,11 @@ class AudioEngine:
         # туда-сюда, а подтягивать задержку за каждым колебанием незачем:
         # важна средняя задержка голоса.
         self._tx_fill = 0.0
+        # Составляющие компенсации последнего расчёта, в миллисекундах:
+        # выход, вход, буфер и итог. Раз в минуту уходят в журнал, чтобы
+        # расхождение можно было проверить по числам, а не на слух.
+        self._tx_parts = (0.0, 0.0, 0.0, 0)
+        self._tx_log_t = 0.0
         # Сколько отсчётов принял каждый вход: по приросту видно молчащий
         # микрофон.
         self._source_frames: dict[str, int] = {}
@@ -1177,11 +1181,6 @@ class AudioEngine:
         self._midi_last_try = now
         self._open_midi()
 
-    def set_backing_source(self, value: str) -> str:
-        """Чья сторона играет минус и метроном: «local» или «peer»."""
-        self.backing_source = "peer" if value == "peer" else "local"
-        return self.backing_source
-
     def set_metronome(self, enabled: bool, bpm: int = 90, beats: int = 4) -> None:
         self.metronome.configure(enabled, bpm, beats)
 
@@ -1276,29 +1275,48 @@ class AudioEngine:
         self.tx_delay_ms = max(0, min(1000, int(ms)))
         return self._apply_tx_delay()
 
+    def _out_latency(self) -> float:
+        """Задержка вывода в секундах: на столько позже выходит звук клика.
+
+        Музыкант слышит клик через наушники не в момент его рождения в
+        микшере, а на задержку вывода позже — и играет ровно на столько
+        же позже. Значит, и клик в поток собеседнику надо задержать на неё
+        тоже: иначе у собеседника клик опережает голос.
+        """
+        value = _stream_latency(self._out) if self._out is not None else None
+        return value if value is not None and value > 0 else 0.0
+
+    def _in_latency(self) -> float:
+        """Задержка самого медленного входа в секундах."""
+        in_lat = 0.0
+        for source in self.sources.values():
+            value = _stream_latency(source.stream)
+            if value is not None and value > in_lat:
+                in_lat = value
+        return in_lat
+
     def _measure_tx_delay(self) -> int:
         """Автоматическая задержка тракта в миллисекундах.
 
         Голос появляется в отправляемом потоке позже клика ровно на столько:
-        задержка входного устройства плюс заполнение входного буфера.
-        Задержка вывода сюда не входит — она одинакова для всего потока.
+        задержка вывода (пока музыкант услышит клик и сыграет) плюс задержка
+        входа и заполнение входного буфера. Выход обязателен: без него клик
+        у собеседника опережает голос на всю задержку наушников, а на
+        медленном MME-драйвере это сто миллисекунд и больше.
         Заполнение берём фактическое, если оно уже измерено; до первых
         звуков — середину между границами гистерезиса.
         """
         if not self.sources:
             # Входов нет — выравнивать не с чем.
             return 0
-        in_lat = 0.0
-        for source in self.sources.values():
-            value = _stream_latency(source.stream)
-            if value is not None and value > in_lat:
-                in_lat = value
         if self._tx_fill > 0:
             ring_frames = self._tx_fill
         else:
             keep, maximum = input_bounds()
             ring_frames = 0.5 * (keep + maximum)
-        return int(round(in_lat * 1000.0 + ring_frames * 1000.0 / SAMPLE_RATE))
+        total = (self._out_latency() * 1000.0 + self._in_latency() * 1000.0
+                 + ring_frames * 1000.0 / SAMPLE_RATE)
+        return int(round(total))
 
     def _apply_tx_delay(self) -> int:
         """Пересчитывает задержку и перестраивает линию задержки."""
@@ -1318,21 +1336,49 @@ class AudioEngine:
         миллисекунд. Берём то, что в буфере лежит, и сглаживаем: важен
         средний уровень, а не колебание на размер блока.
         """
-        manual = self.tx_delay_ms * SAMPLE_RATE / 1000.0
+        out_lat = self._out_latency()
+        in_lat = 0.0
+        for source in self.sources.values():
+            value = source.latency
+            if value is not None and value > in_lat:
+                in_lat = value
         if self.tx_delay_ms > 0:
-            return manual
+            self._tx_parts = (out_lat * 1000.0, in_lat * 1000.0,
+                              fill * 1000.0 / SAMPLE_RATE, self.tx_delay_ms)
+            return self.tx_delay_ms * SAMPLE_RATE / 1000.0
         if fill <= 0:
             return float(self._tx_delay.frames)
         if self._tx_fill <= 0.0:
             self._tx_fill = float(fill)
         else:
             self._tx_fill += (float(fill) - self._tx_fill) * 0.05
-        in_lat = 0.0
-        for source in self.sources.values():
-            value = source.latency
-            if value is not None and value > in_lat:
-                in_lat = value
-        return self._tx_fill + in_lat * SAMPLE_RATE
+        total = self._tx_fill + (in_lat + out_lat) * SAMPLE_RATE
+        self._tx_parts = (out_lat * 1000.0, in_lat * 1000.0,
+                          self._tx_fill * 1000.0 / SAMPLE_RATE,
+                          int(round(total * 1000.0 / SAMPLE_RATE)))
+        return total
+
+    def _log_tx_parts(self, frames: int) -> None:
+        """Раз в минуту пишет в журнал, из чего сложилась компенсация.
+
+        По числам видно, что именно разъехалось: медленный драйвер вывода,
+        вход или переполненный буфер. Без этого разбирать рассинхрон
+        приходится только на слух.
+        """
+        self._tx_log_t += frames / SAMPLE_RATE
+        if self._tx_log_t < 60.0:
+            return
+        self._tx_log_t = 0.0
+        out_ms, in_ms, fill_ms, total_ms = self._tx_parts
+        how = "вручную" if self.tx_delay_ms > 0 else "авто"
+        if not self.sources:
+            return
+        try:
+            self.log(f"Компенсация ({how}): выход {out_ms:.0f} мс, "
+                     f"вход {in_ms:.0f} мс, буфер {fill_ms:.0f} мс, "
+                     f"итого {total_ms} мс.")
+        except Exception:
+            pass
 
     # -- микшер -------------------------------------------------------------
 
@@ -1367,22 +1413,21 @@ class AudioEngine:
                 synth_out = synth.render(frames)
             except Exception:
                 synth_out = None
-        # Чья сторона ведёт минус и метроном. Если ведёт собеседник, свой
-        # клик и свой трек здесь молчат: они уже пришли в его потоке, а
-        # второй экземпляр разъехался бы по фазе и дал эхо.
-        backing = self.backing_source != "peer"
+        # Минус и метроном всегда играет только та сторона, у которой они
+        # включены. Звук рождается здесь и уходит в поток — у собеседника
+        # свой метроном и плеер молчат, он слышит только пришедшее. Поэтому
+        # переключателя «чья сторона» нет: включил у себя — играет у обоих.
         midi_local = self.volumes.get("midi", 0.8)
         midi_peer = self.volumes_peer.get("midi", 0.8)
-        metro_local = self.volumes.get("metronome", 0.6) if backing else 0.0
-        metro_peer = self.volumes_peer.get("metronome", 0.6) if backing else 0.0
-        clicks = (self.metronome.render(frames) if backing
-                  else np.zeros(frames, dtype=np.float32))
+        metro_local = self.volumes.get("metronome", 0.6)
+        metro_peer = self.volumes_peer.get("metronome", 0.6)
+        clicks = self.metronome.render(frames)
 
         # Трек рендерится ровно один раз (внутри позиция) и идёт в обе
         # стороны: в наушники и в поток собеседнику. Поэтому у ученика нет
         # своего плеера, который надо синхронизировать — он слышит трек в
         # общем потоке с той же задержкой, что и голос.
-        track = self.player.render(frames) if backing else None
+        track = self.player.render(frames)
         track_local = track_peer = None
         if track is not None:
             if self.volumes.get("player", 0.8) > 0:
@@ -1449,6 +1494,7 @@ class AudioEngine:
         for source in self.sources.values():
             fill = max(fill, source.fill())
         self._tx_delay.set_target(int(round(self._tx_target(fill))))
+        self._log_tx_parts(frames)
         mix_l = self._tx_delay.process(gen)
         mix_r = mix_l.copy()
         stereo_out = False

@@ -249,6 +249,13 @@ class _ShortcutFilter(QObject):
             return False
         if event.isAutoRepeat() or not self.window.isActiveWindow():
             return False
+        # Delete на выбранном треке. Не сочетание, а прямая клавиша списка:
+        # кнопки «Удалить трек» больше нет, удаление подтверждается.
+        if (event.key() == Qt.Key.Key_Delete
+                and not (event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier)
+                and self.window._delete_key_targets_track()):
+            self.window._delete_track()
+            return True
         if not self.window._shortcut_map:
             return False
         # Пока человек набирает текст, обычные клавиши остаются за полем
@@ -629,23 +636,6 @@ class SettingsDialog(QDialog):
             "малой задержкой. Включи, если нужного устройства в списке нет.")
         self.all_drivers_box.toggled.connect(self._refresh_device_lists)
         layout.addWidget(self.all_drivers_box)
-
-        # Чья сторона играет минус и метроном. Когда дорожка звучит только
-        # на одной стороне, она приходит собеседнику в общем потоке — с
-        # задержкой связи, но точно в одном тайминге с голосом.
-        self.backing_combo = QComboBox()
-        self.backing_combo.setAccessibleName("Минус и метроном")
-        self.backing_combo.addItem("Играет моя сторона", "local")
-        self.backing_combo.addItem("Играет сторона собеседника", "peer")
-        index = self.backing_combo.findData(
-            str(self.cfg["audio"].get("backing_source", "local")))
-        self.backing_combo.setCurrentIndex(index if index >= 0 else 0)
-        self.backing_combo.setAccessibleDescription(
-            "Если минус запускаешь ты, оставь «моя сторона»: ученик услышит "
-            "трек в твоём потоке. Если минус запускает ученик, выбери «сторона "
-            "собеседника» — твой плеер и метроном замолчат.")
-        layout.addWidget(label_for("Минус и метроном", self.backing_combo))
-        layout.addWidget(self.backing_combo)
 
         hint = QLabel(
             "Список устройств обновляется при открытии настроек. "
@@ -1061,8 +1051,6 @@ class SettingsDialog(QDialog):
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
         cfg["audio"]["midi_fixed_velocity"] = self.midi_fixed_box.isChecked()
         cfg["audio"]["show_all_drivers"] = self.all_drivers_box.isChecked()
-        cfg["audio"]["backing_source"] = (
-            self.backing_combo.currentData() or "local")
         cfg["audio"]["buffer"] = str(self.buffer_combo.currentData() or "normal")
         cfg["audio"]["tx_delay_ms"] = int(self.tx_delay_spin.value())
         cfg["shortcuts"] = dict(self.shortcut_map)
@@ -1283,7 +1271,7 @@ class MainWindow(QMainWindow):
         self._tracks_available = False
         self._loading_track = False
         # Подписи кнопок плеера переставляются только при смене состояния.
-        self._player_button_state: tuple[bool, int] = (False, 0)
+        self._player_button_state: tuple[bool, bool, int] = (False, False, 0)
         # Скорость и тон трека. Трек пересчитывается в фоне от исходного
         # звука, который хранится в _track_source: так несколько нажатий
         # подряд не накапливают искажения.
@@ -1350,7 +1338,6 @@ class MainWindow(QMainWindow):
         self._wire_signals()
         self._apply_volumes()
         self._apply_metronome()
-        self._apply_backing_source()
         self._refresh_tracks()
 
         # Позиция трека и «трек закончился» читаются опросом: сам плеер
@@ -1520,35 +1507,49 @@ class MainWindow(QMainWindow):
         # Ученик забирает треки из кабинета преподавателя в свою Media.
         # Кнопка нужна обеим сторонам: ученик берёт трек из Media
         # преподавателя, преподаватель — из Media ученика.
-        import_label = ("Импортировать аудио от ученика" if self.is_teacher
-                        else "Импортировать аудио")
+        # Текст один и тот же в обеих версиях; от кого именно трек, диктор
+        # читает из доступного имени — по кнопке сразу понятно.
+        import_label = "Импорт трека"
+        import_name = ("Импорт трека от ученика" if self.is_teacher
+                       else "Импорт трека от преподавателя")
         self.import_button = QPushButton(import_label)
-        self.import_button.setAccessibleName(import_label)
+        self.import_button.setAccessibleName(import_name)
         track_row.addWidget(self.import_button)
         player_layout.addLayout(track_row)
 
         self.player_buttons_row = QWidget()
         buttons_row = QHBoxLayout(self.player_buttons_row)
         buttons_row.setContentsMargins(0, 0, 0, 0)
+        # Одна главная кнопка: «Играть» — «Стоп» — «Продолжить». Пауза
+        # вынесена отдельно: распознать двойное нажатие можно только с
+        # задержкой в четверть секунды, и одиночное нажатие тогда тоже
+        # срабатывало бы с этой задержкой.
         self.play_button = QPushButton("Играть")
         self.play_button.setAccessibleName("Играть трек")
+        self.pause_button = QPushButton("Пауза")
+        self.pause_button.setAccessibleName("Пауза")
+        self.pause_button.setEnabled(False)
+        # Подписи «Выше» и «Ниже» короткие, как просил владелец; диктор
+        # говорит по доступному имени, что именно переключается.
+        self.prev_button = QPushButton("Выше")
+        self.prev_button.setAccessibleName("Предыдущий трек")
+        self.next_button = QPushButton("Ниже")
+        self.next_button.setAccessibleName("Следующий трек")
         self.back_button = QPushButton("Назад")
         self.back_button.setAccessibleName("Назад")
         self.forward_button = QPushButton("Вперёд")
         self.forward_button.setAccessibleName("Вперёд")
-        self.delete_track_button = QPushButton("Удалить трек")
-        self.delete_track_button.setAccessibleName("Удалить трек")
-        self.effects_button = QPushButton("Эффекты")
-        self.effects_button.setAccessibleName("Эффекты")
-        buttons_row.addWidget(self.play_button)
-        buttons_row.addWidget(self.back_button)
-        buttons_row.addWidget(self.forward_button)
-        buttons_row.addWidget(self.delete_track_button)
-        buttons_row.addWidget(self.effects_button)
+        self.effects_button = QPushButton("Скорость и тон")
+        self.effects_button.setAccessibleName("Скорость и тон")
+        for button in (self.play_button, self.pause_button,
+                       self.prev_button, self.next_button,
+                       self.back_button, self.forward_button,
+                       self.effects_button):
+            buttons_row.addWidget(button)
         buttons_row.addStretch(1)
         player_layout.addWidget(self.player_buttons_row)
 
-        # Кнопки эффектов прячутся за кнопкой «Эффекты»: в обычной работе
+        # Кнопки эффектов прячутся за кнопкой «Скорость и тон»: в обычной работе
         # они не нужны и только удлиняют обход. Внизу — сбросы, они
         # появляются, только когда скорость или тон действительно изменены.
         self.effects_row = QWidget()
@@ -1637,10 +1638,10 @@ class MainWindow(QMainWindow):
         self.settings_button.setAccessibleName("Настройки, Control P")
         self.connect_button = QPushButton("Открыть кабинет" if self.is_teacher else "Подключиться")
         self.connect_button.setAccessibleName(self.connect_button.text())
-        self.mic_button = QPushButton("Выключить микрофон (Control+A)")
-        self.mic_button.setAccessibleName("Выключить микрофон")
-        self.cam_button = QPushButton("Включить камеру (Control+V)")
-        self.cam_button.setAccessibleName("Включить камеру")
+        self.mic_button = QPushButton("Микрофон включён")
+        self.mic_button.setAccessibleName("Микрофон включён")
+        self.cam_button = QPushButton("Камера выключена")
+        self.cam_button.setAccessibleName("Камера выключена")
         bottom.addWidget(self.settings_button)
         bottom.addWidget(self.connect_button)
         bottom.addWidget(self.mic_button)
@@ -1665,9 +1666,11 @@ class MainWindow(QMainWindow):
         self.cam_button.clicked.connect(self._toggle_camera)
         self.track_combo.currentIndexChanged.connect(self._on_track_changed)
         self.play_button.clicked.connect(self._toggle_play)
+        self.pause_button.clicked.connect(self._pause_play)
+        self.prev_button.clicked.connect(lambda: self._step_track(-1))
+        self.next_button.clicked.connect(lambda: self._step_track(1))
         self.back_button.clicked.connect(lambda: self._seek(-1))
         self.forward_button.clicked.connect(lambda: self._seek(1))
-        self.delete_track_button.clicked.connect(self._delete_track)
         self.effects_button.clicked.connect(self._toggle_effects)
         self.slow_button.clicked.connect(lambda: self._change_speed(-1))
         self.fast_button.clicked.connect(lambda: self._change_speed(1))
@@ -2128,7 +2131,6 @@ class MainWindow(QMainWindow):
         if ok:
             self._apply_volumes()
             self._apply_metronome()
-            self._apply_backing_source()
             if self.connected:
                 self._start_video()
         return ok
@@ -2181,24 +2183,33 @@ class MainWindow(QMainWindow):
             pass
 
     def _update_cam_button(self) -> None:
-        hint = self._hint("camera")
+        # На кнопке — состояние, а не действие: диктор, попав на неё,
+        # сразу говорит, работает камера или нет. Что сделает нажатие,
+        # объясняет описание.
         if self._cam_on:
-            text = f"Выключить камеру{hint}"
+            text, action = "Камера включена", "Нажмите, чтобы выключить камеру"
         else:
-            text = f"Включить камеру{hint}"
+            text, action = "Камера выключена", "Нажмите, чтобы включить камеру"
+        hint = self._hint("camera")
         self.cam_button.setText(text)
         self.cam_button.setAccessibleName(text)
+        self.cam_button.setAccessibleDescription(
+            action + (f". Сочетание клавиш{hint}" if hint else ""))
 
     def _toggle_camera(self) -> None:
         if self._cam_on or self.video_sender is not None:
             self._stop_video()
             self._set_status("Камера выключена.")
+            announce(self.cam_button, "Камера выключена")
             return
         if self._start_video(force=True):
             self._set_status("Камера включена.")
+            announce(self.cam_button, "Камера включена")
         else:
             self._set_status(
                 "Камера не запустилась. Проверьте камеру в настройках видео.")
+            announce(self.cam_button,
+                     "Камера не запустилась. Проверьте камеру в настройках")
 
     def _on_peer_video(self, on: bool) -> None:
         """Собеседник выключил камеру — убираем застывший кадр."""
@@ -2243,20 +2254,24 @@ class MainWindow(QMainWindow):
     # -- микрофон -----------------------------------------------------------
 
     def _update_mic_button(self) -> None:
-        hint = self._hint("mic")
+        # Так же, как у камеры: на кнопке состояние, действие — в описании.
         if self._mic_muted:
-            text = f"Включить микрофон{hint}"
+            text, action = "Микрофон выключен", "Нажмите, чтобы включить микрофон"
         else:
-            text = f"Выключить микрофон{hint}"
+            text, action = "Микрофон включён", "Нажмите, чтобы выключить микрофон"
+        hint = self._hint("mic")
         self.mic_button.setText(text)
         self.mic_button.setAccessibleName(text)
+        self.mic_button.setAccessibleDescription(
+            action + (f". Сочетание клавиш{hint}" if hint else ""))
 
     def _toggle_mic(self) -> None:
         self._mic_muted = not self._mic_muted
         self.engine.set_mic_muted(self._mic_muted)
         self._update_mic_button()
-        self._set_status("Микрофон выключен." if self._mic_muted
-                         else "Микрофон включён.")
+        text = "Микрофон выключен" if self._mic_muted else "Микрофон включён"
+        self._set_status(text + ".")
+        announce(self.mic_button, text)
 
     # -- импорт треков: в обе стороны ---------------------------------------
 
@@ -2436,36 +2451,6 @@ class MainWindow(QMainWindow):
         self.engine.set_metronome(enabled, bpm, beats)
         self._refresh_volume_visibility()
 
-    def _apply_backing_source(self) -> None:
-        """Кто ведёт минус и метроном: моя сторона или собеседника.
-
-        Когда ведёт собеседник, его поток уже содержит дорожку и клик.
-        Свой плеер и метроном в этот момент не нужны: второй экземпляр
-        разъехался бы по фазе и дал эхо, поэтому кнопки гаснут.
-        """
-        peer = str(self.cfg["audio"].get("backing_source", "local")) == "peer"
-        self.engine.set_backing_source("peer" if peer else "local")
-        if peer:
-            if self.metro_button.isChecked():
-                self.metro_button.blockSignals(True)
-                self.metro_button.setChecked(False)
-                self.metro_button.blockSignals(False)
-                cfg_metro = self.cfg.setdefault("metronome", {})
-                cfg_metro["enabled"] = False
-                self._update_metro_button()
-                self.engine.set_metronome(False, self.bpm_spin.value(),
-                                          self.beats_spin.value())
-            if self.engine.player.playing:
-                self.engine.player.stop()
-                self._update_player_buttons()
-        for widget in (self.metro_button, self.metro_row, self.play_button,
-                       self.back_button, self.forward_button):
-            widget.setEnabled(not peer)
-        hint = ("Минус и метроном сейчас идут со стороны собеседника."
-                if peer else "")
-        for widget in (self.metro_button, self.play_button):
-            widget.setAccessibleDescription(hint)
-
     def _on_metronome_toggle(self, checked: bool) -> None:
         cfg_metro = self.cfg.setdefault("metronome", {})
         cfg_metro["enabled"] = bool(checked)
@@ -2538,6 +2523,11 @@ class MainWindow(QMainWindow):
         if player.playing:
             player.stop()
             self._set_status("Воспроизведение остановлено: выбран другой трек.")
+        elif player.paused:
+            # Пауза относилась к прежнему треку: новый должен начаться
+            # с начала, а не с места, где остановился старый.
+            player.stop()
+            self._set_status("Выбран другой трек, пауза снята.")
         self.cfg.setdefault("player", {})["last"] = self._selected_track()
         self._save_timer.start()
         self._update_player_buttons()
@@ -2584,10 +2574,13 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("Удалить трек")
         box.setIcon(QMessageBox.Question)
-        box.setText(f"Удалить трек {name} из папки Media?")
+        box.setText("Вы уверены, что хотите удалить этот трек?")
+        box.setInformativeText(f"Трек: {name}. Файл удалится из папки Media.")
         box.setAccessibleName("Удаление трека")
-        delete = box.addButton("Удалить", QMessageBox.DestructiveRole)
-        cancel = box.addButton("Отмена", QMessageBox.RejectRole)
+        box.setAccessibleDescription(
+            "Вы уверены, что хотите удалить этот трек? Да или нет.")
+        delete = box.addButton("Да", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Нет", QMessageBox.RejectRole)
         box.setDefaultButton(cancel)
         box.exec()
         if box.clickedButton() is not delete:
@@ -2612,12 +2605,24 @@ class MainWindow(QMainWindow):
         self._set_status(f"Трек удалён: {name}")
 
     def _toggle_play(self) -> None:
+        """Одна кнопка: играть, остановить или продолжить с паузы."""
         player = self.engine.player
         if player.playing:
             player.stop()
             self._update_player_buttons()
             self._set_status("Трек остановлен.")
             return
+        if player.paused:
+            name = player.name or "трек"
+            if player.play():
+                self._update_player_buttons()
+                self._set_status(f"Продолжаю: {name}")
+            return
+        self._play_selected()
+
+    def _play_selected(self) -> None:
+        """Запускает трек, выбранный в списке."""
+        player = self.engine.player
         path = self._selected_track()
         if not path:
             self._set_status("Сначала добавьте трек кнопкой Добавить трек.")
@@ -2632,6 +2637,54 @@ class MainWindow(QMainWindow):
                 self._set_status(f"Играет: {Path(path).name}")
             return
         self._load_and_play(path)
+
+    def _pause_play(self) -> None:
+        player = self.engine.player
+        if not player.pause():
+            self._set_status("Сейчас трек не играет, пауза не нужна.")
+            return
+        self._update_player_buttons()
+        self._set_status(f"Пауза. Позиция {_clock(player.position())}.")
+
+    def _step_track(self, direction: int) -> None:
+        """«Выше» и «Ниже»: предыдущий и следующий трек списка."""
+        count = self.track_combo.count()
+        if count == 0:
+            self._set_status("Список треков пуст. Добавьте трек.")
+            return
+        index = self.track_combo.currentIndex()
+        new = (index + direction) % count
+        if count == 1:
+            self._set_status("В списке всего один трек.")
+            return
+        # Переключение делаем молча: объявим один раз, уже с новым треком.
+        self.track_combo.blockSignals(True)
+        self.track_combo.setCurrentIndex(new)
+        self.track_combo.blockSignals(False)
+        self.cfg.setdefault("player", {})["last"] = self._selected_track()
+        self._save_timer.start()
+        name = Path(self._selected_track()).name
+        word = "Предыдущий" if direction < 0 else "Следующий"
+        if not self.engine.running:
+            self._set_status(f"{word} трек: {name}. Звук не запущен, "
+                             "трек пока не играет.")
+            return
+        self._set_status(f"{word} трек: {name}.")
+        self._play_selected()
+
+    def _delete_key_targets_track(self) -> bool:
+        """Нажата ли клавиша Delete там, где выбран трек списка."""
+        focus = QApplication.focusWidget()
+        if focus is None:
+            return False
+        if focus is self.track_combo:
+            return True
+        try:
+            view = self.track_combo.view()
+            return (focus is view or focus is view.window()
+                    or view.isAncestorOf(focus))
+        except Exception:
+            return False
 
     def _load_and_play(self, path: str) -> None:
         if self._loading_track:
@@ -2977,16 +3030,26 @@ class MainWindow(QMainWindow):
         self._update_player_buttons()
 
     def _update_player_buttons(self) -> None:
-        """Подписи кнопок плеера под текущее состояние и шаг перемотки."""
-        playing = self.engine.player.playing
+        """Подписи кнопок плеера под текущее состояние."""
+        player = self.engine.player
+        playing = player.playing
+        paused = player.paused
         skip = self._skip_seconds()
-        if (playing, skip) == self._player_button_state:
+        state = (playing, paused, skip)
+        if state == self._player_button_state:
             return
-        self._player_button_state = (playing, skip)
-        play_text = "Стоп" if playing else "Играть"
-        self.play_button.setText(play_text)
-        self.play_button.setAccessibleName(
-            "Остановить трек" if playing else "Играть трек")
+        self._player_button_state = state
+        # Одна кнопка на три состояния: остановлен — «Играть», играет —
+        # «Стоп», на паузе — «Продолжить» (трек стоит, место сохранено).
+        if playing:
+            text, name = "Стоп", "Остановить трек"
+        elif paused:
+            text, name = "Продолжить", "Продолжить трек"
+        else:
+            text, name = "Играть", "Играть трек"
+        self.play_button.setText(text)
+        self.play_button.setAccessibleName(name)
+        self.pause_button.setEnabled(playing)
         # Шаг перемотки остаётся в настройках, на кнопке он не нужен.
         self.back_button.setText("Назад")
         self.back_button.setAccessibleName("Назад")
@@ -3531,6 +3594,9 @@ class MainWindow(QMainWindow):
             "add_track": self._add_track,
             "import_audio": self._import_audio,
             "play": self._toggle_play,
+            "pause": self._pause_play,
+            "prev_track": lambda: self._step_track(-1),
+            "next_track": lambda: self._step_track(1),
             "back": lambda: self._seek(-1),
             "forward": lambda: self._seek(1),
             "delete_track": self._delete_track,
@@ -3587,6 +3653,25 @@ class MainWindow(QMainWindow):
                 self.cfg["audio"].get("midi_port", ""),
                 bool(self.cfg["audio"].get("midi_fixed_velocity", False)))
         appeared = self._refresh_volume_visibility()
+        # Пишем, с чем именно сохранились настройки: по этому логу видно,
+        # какой шаг перемотки и размер буфера выбраны, когда владелец
+        # присылает отчёт о проблеме.
+        audio = self.cfg.get("audio", {})
+        runlog.write(
+            "Настройки сохранены: буфер {b}, шаг перемотки {s} с, "
+            "задержка компенсации {d} мс, устройства {dev1} / {dev2} / "
+            "{out}, режим входа {m1} / {m2}, громкость метронома {m}, "
+            "трека {p}.".format(
+                b=audio.get("buffer", "normal"),
+                s=(self.cfg.get("player", {}) or {}).get("skip", 5),
+                d=int(audio.get("tx_delay_ms", 0) or 0),
+                dev1=audio.get("device1", ""),
+                dev2=audio.get("device2", ""),
+                out=audio.get("output", ""),
+                m1=audio.get("mode1", ""),
+                m2=audio.get("mode2", ""),
+                m=(audio.get("volumes", {}) or {}).get("metronome", ""),
+                p=(audio.get("volumes", {}) or {}).get("player", "")))
         message = "Настройки сохранены."
         if devices_changed and self.engine.running:
             message += " Звук перезапущен с новыми устройствами."
