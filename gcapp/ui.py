@@ -302,7 +302,16 @@ class _ShortcutFilter(QObject):
         return False
 
     def eventFilter(self, obj, event) -> bool:
-        if event.type() != QEvent.KeyPress:
+        kind = event.type()
+        # Правое Control — «нажал, сказал, отпустил». Обе клавиши Control
+        # приходят одним Key_Control, поэтому сторону разбираем по
+        # системному коду; отпускание так же возвращает микрофон в mute.
+        if kind == QEvent.Type.KeyPress and self.window._ptt_press(event):
+            return False
+        if kind == QEvent.Type.KeyRelease:
+            self.window._ptt_release(event)
+            return False
+        if kind != QEvent.KeyPress:
             return False
         if event.isAutoRepeat() or not self.window.isActiveWindow():
             return False
@@ -452,6 +461,7 @@ class SettingsDialog(QDialog):
 
         sections = [
             ("Общее", self._page_general()),
+            ("Плеер", self._page_player()),
             ("Аудиовходы", self._page_inputs()),
             ("Аудиовыходы", self._page_outputs()),
             ("Видео", self._page_video()),
@@ -545,16 +555,6 @@ class SettingsDialog(QDialog):
         self.autoconnect_box.setAccessibleName("Автоматическое подключение при запуске")
         form.addRow(self.autoconnect_box)
 
-        self.skip_combo = QComboBox()
-        self.skip_combo.setAccessibleName("Шаг перемотки плеера")
-        for seconds in (5, 10, 20):
-            self.skip_combo.addItem(f"{seconds} секунд", seconds)
-        saved_skip = int((self.cfg.get("player") or {}).get("skip", 5) or 5)
-        skip_index = self.skip_combo.findData(saved_skip)
-        self.skip_combo.setCurrentIndex(skip_index if skip_index >= 0 else 0)
-        form.addRow(label_for("Шаг перемотки плеера", self.skip_combo),
-                    self.skip_combo)
-
         version_row = QHBoxLayout()
         self.version_label = QLabel(f"Версия {__version__}")
         self.version_label.setAccessibleName(f"Версия программы {__version__}")
@@ -570,6 +570,49 @@ class SettingsDialog(QDialog):
         self.update_status.setAccessibleName("Состояние обновления")
         form.addRow(self.update_status)
 
+        return page
+
+    def _page_player(self) -> QWidget:
+        page = QWidget()
+        page.setAccessibleName("Плеер")
+        form = QFormLayout(page)
+        player_cfg = self.cfg.get("player") or {}
+
+        skip_explain = QLabel(
+            "На сколько секунд перематывают кнопки «Назад» и «Вперёд».")
+        skip_explain.setWordWrap(True)
+        skip_explain.setAccessibleName("Шаг перемотки плеера, пояснение")
+        form.addRow(skip_explain)
+
+        self.skip_combo = QComboBox()
+        self.skip_combo.setAccessibleName("Шаг перемотки плеера")
+        for seconds in (5, 10, 20):
+            self.skip_combo.addItem(f"{seconds} секунд", seconds)
+        saved_skip = int(player_cfg.get("skip", 5) or 5)
+        skip_index = self.skip_combo.findData(saved_skip)
+        self.skip_combo.setCurrentIndex(skip_index if skip_index >= 0 else 0)
+        form.addRow(label_for("Шаг перемотки плеера", self.skip_combo),
+                    self.skip_combo)
+
+        algo_explain = QLabel(
+            "Способ, которым программа меняет скорость и тон трека. "
+            "«Плавный» звучит ровнее, особенно на больших растяжениях. "
+            "«Чёткий» лучше держит атаку удара по струне, но на сильном "
+            "замедлении слышны небольшие повторы.")
+        algo_explain.setWordWrap(True)
+        algo_explain.setAccessibleName("Способ растяжения трека, пояснение")
+        form.addRow(algo_explain)
+
+        self.stretch_combo = QComboBox()
+        self.stretch_combo.setAccessibleName("Способ растяжения трека")
+        self.stretch_combo.addItem("Плавный, как в версии 0.4.7", "vocoder")
+        self.stretch_combo.addItem("Чёткий, с ясной атакой", "wsola")
+        saved_algo = str(player_cfg.get("stretch", effects.DEFAULT_ALGO)
+                         or effects.DEFAULT_ALGO)
+        algo_index = self.stretch_combo.findData(saved_algo)
+        self.stretch_combo.setCurrentIndex(algo_index if algo_index >= 0 else 0)
+        form.addRow(label_for("Способ растяжения", self.stretch_combo),
+                    self.stretch_combo)
         return page
 
     def _device_combo(self, current: str, name: str,
@@ -1097,6 +1140,8 @@ class SettingsDialog(QDialog):
         cfg["autoconnect"] = self.autoconnect_box.isChecked()
         player_cfg = cfg.setdefault("player", {})
         player_cfg["skip"] = int(self.skip_combo.currentData() or 5)
+        player_cfg["stretch"] = str(self.stretch_combo.currentData()
+                                    or effects.DEFAULT_ALGO)
 
         cfg["audio"]["device1"] = self.dev1_combo.currentData() or ""
         cfg["audio"]["device2"] = self.dev2_combo.currentData() or ""
@@ -1368,6 +1413,8 @@ class MainWindow(QMainWindow):
         if self.volume_mode not in ("local", "peer"):
             self.volume_mode = "local"
         self._mic_muted = bool(getattr(self.engine, "mic_muted", False))
+        # Зажат ли сейчас правый Control ради короткой фразы.
+        self._ptt_held = False
         self._cam_on = False
         # Отдельное окно с видео на весь экран, пока оно открыто.
         self.video_window: VideoWindow | None = None
@@ -2321,7 +2368,10 @@ class MainWindow(QMainWindow):
     def _update_mic_button(self) -> None:
         # Так же, как у камеры: на кнопке состояние, действие — в описании.
         if self._mic_muted:
-            text, action = "Микрофон выключен", "Нажмите, чтобы включить микрофон"
+            text = "Микрофон выключен"
+            action = ("Нажмите, чтобы включить микрофон. Для короткой фразы "
+                      "можно просто удерживать правый Control: нажал — "
+                      "говоришь, отпустил — микрофон снова выключен")
         else:
             text, action = "Микрофон включён", "Нажмите, чтобы выключить микрофон"
         hint = self._hint("mic")
@@ -2332,11 +2382,63 @@ class MainWindow(QMainWindow):
 
     def _toggle_mic(self) -> None:
         self._mic_muted = not self._mic_muted
+        self._ptt_held = False
         self.engine.set_mic_muted(self._mic_muted)
         self._update_mic_button()
         text = "Микрофон выключен" if self._mic_muted else "Микрофон включён"
         self._set_status(text + ".")
         announce(self.mic_button, text)
+
+    # -- микрофон на зажатом правом Control ----------------------------------
+
+    @staticmethod
+    def _is_right_ctrl(event) -> bool:
+        """Правое Control. В Qt обе клавиши приходят одним Key_Control,
+        сторону различаем по системному коду: у правой он 0x11D, а
+        виртуальная клавиша — VK_RCONTROL."""
+        if event.key() != Qt.Key.Key_Control:
+            return False
+        try:
+            return (int(event.nativeScanCode()) == 0x11D
+                    or int(event.nativeVirtualKey()) == 0xA3)
+        except Exception:
+            return False
+
+    def _ptt_press(self, event) -> bool:
+        """Правый Control зажат: если микрофон выключен, включаем, пока
+        держат. Если он и так включён — ничего не делаем."""
+        if event.isAutoRepeat() or not self.isActiveWindow():
+            return False
+        if not self._is_right_ctrl(event):
+            return False
+        if not self._mic_muted or self._ptt_held:
+            return False
+        self._ptt_held = True
+        # Микрофон считается включённым, пока держат Control: кнопка
+        # и диктор должны говорить о том, что слышит собеседник.
+        self._mic_muted = False
+        self.engine.set_mic_muted(False)
+        self._update_mic_button()
+        self._set_status("Микрофон включён. Отпустите правый Control, "
+                         "чтобы выключить.")
+        announce(self.mic_button, "Микрофон включён")
+        return True
+
+    def _ptt_release(self, event) -> None:
+        if not self._ptt_held or event.key() != Qt.Key.Key_Control:
+            return
+        self._ptt_off()
+
+    def _ptt_off(self) -> None:
+        """Control отпустили или окно потеряло фокус: снова выключаем."""
+        if not self._ptt_held:
+            return
+        self._ptt_held = False
+        self._mic_muted = True
+        self.engine.set_mic_muted(True)
+        self._update_mic_button()
+        self._set_status("Микрофон выключен.")
+        announce(self.mic_button, "Микрофон выключен")
 
     # -- импорт треков: в обе стороны ---------------------------------------
 
@@ -2552,6 +2654,12 @@ class MainWindow(QMainWindow):
             return int((self.cfg.get("player") or {}).get("skip", 5) or 5)
         except (TypeError, ValueError):
             return 5
+
+    def _stretch_algo(self) -> str:
+        """Способ растяжения из настроек: «vocoder» или «wsola»."""
+        algo = str((self.cfg.get("player") or {}).get(
+            "stretch", effects.DEFAULT_ALGO) or effects.DEFAULT_ALGO)
+        return algo if algo in effects.ALGOS else effects.DEFAULT_ALGO
 
     def _selected_track(self) -> str:
         data = self.track_combo.currentData()
@@ -2978,12 +3086,13 @@ class MainWindow(QMainWindow):
         threading.Thread(
             target=self._effects_worker,
             args=(source, self.engine.player.rate, self._speed, self._pitch,
-                  self._effects_gen),
+                  self._effects_gen, self._stretch_algo()),
             daemon=True).start()
 
-    def _effects_worker(self, source, rate, speed, pitch, gen) -> None:
+    def _effects_worker(self, source, rate, speed, pitch, gen,
+                        algo: str) -> None:
         try:
-            data = effects.apply(source, rate, speed, pitch)
+            data = effects.apply(source, rate, speed, pitch, algo=algo)
         except Exception as exc:
             self.sig_effects_error.emit(
                 f"Не удалось применить эффект: {_explain(exc)}", gen)
@@ -3730,9 +3839,17 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         audio_before = dict(self.cfg["audio"])
+        algo_before = self._stretch_algo()
         dialog = SettingsDialog(self.cfg, self, self.is_teacher)
         if dialog.exec() != QDialog.Accepted:
             return
+        # Другой способ растяжения: посчитанные варианты сделаны прежним
+        # и больше не годятся. Номер настройки помечаем заведомо чужим,
+        # чтобы звук пересчитался заново, даже если скорость не менялась.
+        if self._stretch_algo() != algo_before and self._effects_active():
+            self._clear_effects_cache()
+            self._effects_key = (0.0, 0.0)
+            self._apply_effects()
         self._apply_volumes()
         # Новые сочетания клавиш действуют сразу.
         self._apply_shortcuts()
@@ -3765,11 +3882,13 @@ class MainWindow(QMainWindow):
         audio = self.cfg.get("audio", {})
         runlog.write(
             "Настройки сохранены: буфер {b}, шаг перемотки {s} с, "
-            "задержка компенсации {d} мс, устройства {dev1} / {dev2} / "
+            "растяжение {a}, задержка компенсации {d} мс, устройства "
+            "{dev1} / {dev2} / "
             "{out}, режим входа {m1} / {m2}, громкость метронома {m}, "
             "трека {p}.".format(
                 b=audio.get("buffer", "normal"),
                 s=(self.cfg.get("player", {}) or {}).get("skip", 5),
+                a=self._stretch_algo(),
                 d=int(audio.get("tx_delay_ms", 0) or 0),
                 dev1=audio.get("device1", ""),
                 dev2=audio.get("device2", ""),
@@ -3822,6 +3941,15 @@ class MainWindow(QMainWindow):
         announce(self.status_label, text + " Остаться — по умолчанию.")
         box.exec()
         return box.clickedButton() is quit_button
+
+    def changeEvent(self, event) -> None:
+        # Ушли из окна с зажатым правым Control — кнопку отпускания
+        # программа уже не получит, поэтому микрофон возвращаем в mute
+        # здесь же, иначе он останется включённым.
+        if (event.type() == QEvent.Type.ActivationChange
+                and not self.isActiveWindow()):
+            self._ptt_off()
+        super().changeEvent(event)
 
     def closeEvent(self, event) -> None:
         if not self._confirm_close():

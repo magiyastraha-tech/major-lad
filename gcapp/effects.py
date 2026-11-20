@@ -147,11 +147,20 @@ def _wsola(x: np.ndarray, rate: float) -> np.ndarray:
     return out[:out_len]
 
 
-def time_stretch(x: np.ndarray, rate: float) -> np.ndarray:
+# Способы растяжения. «vocoder» — то, что звучало до версии 0.4.8: ровнее
+# на всём диапазоне, но на гитарных атаках чуть смазаннее. «wsola» —
+# склейка похожих кусков: атаки чётче, на больших растяжениях слышны
+# повторы. По умолчанию стоит «vocoder»: владелец сравнил оба и выбрал его.
+ALGOS = ("vocoder", "wsola")
+DEFAULT_ALGO = "vocoder"
+
+
+def time_stretch(x: np.ndarray, rate: float,
+                 algo: str = DEFAULT_ALGO) -> np.ndarray:
     """Растягивает или сжимает звук по времени, не меняя высоту.
 
     rate — во сколько раз быстрее должен звучать трек: 1.1 — на десять
-    процентов быстрее, 0.9 — медленнее.
+    процентов быстрее, 0.9 — медленнее. algo — способ растяжения.
     """
     rate = float(rate)
     if rate <= 0:
@@ -159,7 +168,9 @@ def time_stretch(x: np.ndarray, rate: float) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     if abs(rate - 1.0) < 1e-3 or x.size < _FRAME * 2:
         return x.copy()
-    if _WSOLA_MIN <= rate <= _WSOLA_MAX:
+    # Склейка похожих кусков годится только в своём диапазоне скоростей:
+    # дальше она повторяет куски слишком заметно, и звук ведёт вокодер.
+    if algo == "wsola" and _WSOLA_MIN <= rate <= _WSOLA_MAX:
         return _wsola(x, rate)
     return _phase_vocoder(x, rate)
 
@@ -271,18 +282,20 @@ def _phase_vocoder(x: np.ndarray, rate: float) -> np.ndarray:
     return result
 
 
-def pitch_shift(x: np.ndarray, rate: int, semitones: float) -> np.ndarray:
+def pitch_shift(x: np.ndarray, rate: int, semitones: float,
+                algo: str = DEFAULT_ALGO) -> np.ndarray:
     """Сдвигает высоту на число полутонов, не меняя длительность."""
     semitones = float(semitones)
     if abs(semitones) < 1e-3:
         return np.asarray(x, dtype=np.float32).copy()
     factor = 2.0 ** (semitones / 12.0)
-    stretched = time_stretch(x, 1.0 / factor)
+    stretched = time_stretch(x, 1.0 / factor, algo=algo)
     return resample(stretched, int(rate), max(1, int(round(int(rate) / factor))))
 
 
 def apply(x: np.ndarray, rate: int = 48000,
-          speed: float = 1.0, semitones: float = 0.0) -> np.ndarray:
+          speed: float = 1.0, semitones: float = 0.0,
+          algo: str = DEFAULT_ALGO) -> np.ndarray:
     """Готовит звук с текущими скоростью и тоном.
 
     Оба эффекта сводятся к одному растяжению и одному пересчёту частоты:
@@ -295,7 +308,7 @@ def apply(x: np.ndarray, rate: int = 48000,
     if abs(speed - 1.0) < 1e-3 and abs(semitones) < 1e-3:
         return x.copy()
     factor = 2.0 ** (semitones / 12.0)
-    stretched = time_stretch(x, speed / factor)
+    stretched = time_stretch(x, speed / factor, algo=algo)
     if abs(factor - 1.0) > 1e-3:
         stretched = resample(stretched, int(rate),
                              max(1, int(round(int(rate) / factor))))
