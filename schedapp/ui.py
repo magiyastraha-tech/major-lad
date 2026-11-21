@@ -135,8 +135,8 @@ class StudentDialog(QDialog):
         form.addRow("Направление", self.direction)
 
         # Абонемент спрашивается только у нового ученика. У существующего
-        # уроки добавляются кнопкой «Докупить уроки» в карточке — иначе
-        # правка контактов молча обнуляла бы счётчик.
+        # абонемент заводится кнопкой «Добавить новый абонемент» в карточке —
+        # иначе правка контактов молча обнуляла бы счётчик.
         self.lessons = None
         self.price = None
         self.start = None
@@ -311,72 +311,6 @@ class LessonPayDialog(QDialog):
 
     def accept(self) -> None:
         self.amount = self.money.value()
-        super().accept()
-
-
-class TopUpDialog(QDialog):
-    """Докупить уроки к действующему абонементу.
-
-    Докупка не заводит второй абонемент: уроки прибавляются к текущему,
-    поэтому счётчик остаётся понятным — «уроки 3 из 16». Деньги при этом
-    уходят отдельной строкой в журнал оплат.
-    """
-
-    def __init__(self, student: str, used: int, total: int, parent=None):
-        super().__init__(parent)
-        self.lessons = 0
-        self.price = 0
-        self.started: date | None = None
-        self.setWindowTitle("Докупить уроки")
-        self.setMinimumWidth(440)
-        lay = QVBoxLayout(self)
-        if total:
-            text = (f"{student}. Сейчас уроки {used} из {total}. "
-                    f"Сколько уроков докупить?")
-        else:
-            text = f"{student}. Абонемента нет. Сколько уроков купить?"
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setAccessibleName(text)
-        lay.addWidget(label)
-
-        form = QFormLayout()
-        self.count = QSpinBox()
-        self.count.setRange(1, 500)
-        self.count.setValue(8)
-        self.count.setAccessibleName("Сколько уроков докупить")
-        form.addRow("Уроков", self.count)
-
-        self.money = QSpinBox()
-        self.money.setRange(0, 500_000)
-        self.money.setSingleStep(500)
-        self.money.setSuffix(" ₽")
-        self.money.setAccessibleName("Сумма оплаты")
-        form.addRow("Оплата", self.money)
-
-        # Начало абонемента спрашиваем, только когда абонемент заводится
-        # с нуля: при докупке уроки прибавляются к уже идущему.
-        self.start = None
-        if not total:
-            self.start = make_date_edit("С какого числа действует абонемент")
-            form.addRow("Абонемент с числа", self.start)
-        lay.addLayout(form)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Докупить")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        lay.addWidget(buttons)
-        self.count.setFocus()
-        self.count.selectAll()
-
-    def accept(self) -> None:
-        self.lessons = self.count.value()
-        self.price = self.money.value()
-        if self.start is not None:
-            self.started = picked_date(self.start)
         super().accept()
 
 
@@ -749,32 +683,41 @@ class SubscriptionDialog(QDialog):
         self.accept()
 
 
-class TrialLessonDialog(QDialog):
-    """Пробный урок: дата, формат и направление.
+class OneOffLessonDialog(QDialog):
+    """Одно занятие: пробный или разовый урок.
 
-    Пробный урок — одно занятие, а не абонемент: уроков всегда один,
-    денег в кассе нет. В историю он попадает сразу законченным, чтобы
-    не занимать действующий абонемент ученика.
+    Пробный и разовый уроки — не абонементы: урок всегда один. Пробный
+    бесплатный, у разового своя цена. В историю урок попадает сразу
+    законченным, чтобы не занимать действующий абонемент ученика.
     """
 
-    def __init__(self, store: Store, student: data.Student, parent=None):
+    def __init__(self, store: Store, student: data.Student,
+                 kind: str = "trial", parent=None):
         super().__init__(parent)
         self.store = store
         self.student = student
+        self.kind = kind
         self.subscription: data.Subscription | None = None
-        self.setWindowTitle("Добавить пробный урок")
+        title = "Пробный" if kind == "trial" else "Разовый"
+        self.setWindowTitle(f"Добавить {title.lower()} урок")
         self.setMinimumWidth(460)
         lay = QVBoxLayout(self)
-        text = (f"{student.name}. Пробный урок — одно занятие: без счёта "
-                "уроков и без оплаты.")
+        if kind == "trial":
+            text = (f"{student.name}. Пробный урок — одно занятие: без "
+                    "счёта уроков и без оплаты.")
+        else:
+            text = (f"{student.name}. Разовый урок — одно занятие: уроков "
+                    "считать не нужно.")
         hint = QLabel(text)
         hint.setWordWrap(True)
         hint.setAccessibleName(text)
         lay.addWidget(hint)
 
         form = QFormLayout()
-        self.day = make_date_edit("Дата пробного урока", date.today())
-        form.addRow("Дата пробного урока", self.day)
+        day_name = ("Дата пробного урока" if kind == "trial"
+                    else "Дата разового урока")
+        self.day = make_date_edit(day_name, date.today())
+        form.addRow(day_name, self.day)
 
         self.lesson_format = QComboBox()
         self.lesson_format.addItems(FORMATS)
@@ -787,6 +730,15 @@ class TrialLessonDialog(QDialog):
         self.direction.setCurrentText(student.direction)
         self.direction.setAccessibleName("Направление")
         form.addRow("Направление", self.direction)
+
+        self.price = None
+        if kind != "trial":
+            self.price = QSpinBox()
+            self.price.setRange(0, 500_000)
+            self.price.setSingleStep(500)
+            self.price.setSuffix(" ₽")
+            self.price.setAccessibleName("Стоимость разового урока")
+            form.addRow("Стоимость", self.price)
         lay.addLayout(form)
 
         buttons = QDialogButtonBox(
@@ -801,10 +753,18 @@ class TrialLessonDialog(QDialog):
     def _add(self) -> None:
         day = picked_date(self.day)
         self.subscription = self.store.add_subscription(
-            self.student.name, 1, price=0,
+            self.student.name, 1,
+            price=self.price.value() if self.price is not None else 0,
             direction=self.direction.currentText(),
-            bought=day, started=day, finished=True, trial=True,
+            bought=day, started=day, finished=True,
+            trial=self.kind == "trial", single=self.kind == "single",
             lesson_format=self.lesson_format.currentText())
+        # Разовый урок оплачен: деньги идут в журнал оплат отдельной
+        # строкой, как за абонемент. Пробный бесплатный.
+        if self.kind == "single" and self.subscription.price > 0:
+            self.store.add_payment(
+                self.student.name, "Разовый урок",
+                self.subscription.price, day)
         self.accept()
 
 
@@ -823,12 +783,18 @@ class SubscriptionEditDialog(QDialog):
         # True, если после правки уроки досчитались до конца и абонемент
         # сам перешёл в законченные.
         self.closed_itself = False
-        self.setWindowTitle("Изменить пробный урок" if sub.trial
-                            else "Изменить абонемент")
+        if sub.trial:
+            title = "Изменить пробный урок"
+        elif sub.single:
+            title = "Изменить разовый урок"
+        else:
+            title = "Изменить абонемент"
+        self.setWindowTitle(title)
         self.setMinimumWidth(460)
         lay = QVBoxLayout(self)
-        if sub.trial:
-            text = (f"{sub.student}. Пробный урок "
+        if sub.one_off:
+            what = "Пробный урок" if sub.trial else "Разовый урок"
+            text = (f"{sub.student}. {what} "
                     f"{dates.fmt_date(sub.bought)}, "
                     + ("проведён." if sub.used else "записан."))
         elif sub.total:
@@ -844,9 +810,11 @@ class SubscriptionEditDialog(QDialog):
         lay.addWidget(hint)
 
         form = QFormLayout()
-        if sub.trial:
-            self.bought = make_date_edit("Дата пробного урока", sub.bought)
-            form.addRow("Дата пробного урока", self.bought)
+        if sub.one_off:
+            day_name = ("Дата пробного урока" if sub.trial
+                        else "Дата разового урока")
+            self.bought = make_date_edit(day_name, sub.bought)
+            form.addRow(day_name, self.bought)
 
             self.lesson_format = QComboBox()
             self.lesson_format.addItems(FORMATS)
@@ -860,7 +828,16 @@ class SubscriptionEditDialog(QDialog):
             self.direction.setCurrentText(sub.direction)
             self.direction.setAccessibleName("Направление")
             form.addRow("Направление", self.direction)
-            self.start = self.count = self.price = None
+            self.start = self.count = None
+            self.price = None
+            if sub.single:
+                self.price = QSpinBox()
+                self.price.setRange(0, 500_000)
+                self.price.setSingleStep(500)
+                self.price.setSuffix(" ₽")
+                self.price.setValue(sub.price)
+                self.price.setAccessibleName("Стоимость разового урока")
+                form.addRow("Стоимость", self.price)
             self.finished_box = None
         else:
             self.bought = make_date_edit("Дата покупки абонемента", sub.bought)
@@ -893,7 +870,7 @@ class SubscriptionEditDialog(QDialog):
             form.addRow("Стоимость", self.price)
         lay.addLayout(form)
 
-        if not sub.trial:
+        if not sub.one_off:
             self.finished_box = QCheckBox("Абонемент закончен")
             self.finished_box.setChecked(sub.finished)
             self.finished_box.setAccessibleName("Абонемент закончен")
@@ -913,8 +890,8 @@ class SubscriptionEditDialog(QDialog):
             self.bought.setFocus()
 
     def _save(self) -> None:
-        if self.sub.trial:
-            self._save_trial()
+        if self.sub.one_off:
+            self._save_one_off()
             return
         count = self.count.value()
         if count and count < self.sub.used:
@@ -946,18 +923,22 @@ class SubscriptionEditDialog(QDialog):
             return
         self.accept()
 
-    def _save_trial(self) -> None:
+    def _save_one_off(self) -> None:
         sub = self.sub
-        old = (sub.bought, sub.started, sub.direction, sub.lesson_format)
+        old = (sub.bought, sub.started, sub.direction, sub.lesson_format,
+               sub.price)
         day = picked_date(self.bought)
         sub.bought = day
         sub.started = day
         sub.direction = self.direction.currentText()
         sub.lesson_format = self.lesson_format.currentText()
+        if self.price is not None:
+            sub.price = self.price.value()
         try:
             self.store.update_subscription(sub)
         except ValueError as error:
-            (sub.bought, sub.started, sub.direction, sub.lesson_format) = old
+            (sub.bought, sub.started, sub.direction, sub.lesson_format,
+             sub.price) = old
             announce(self, str(error), assertive=True)
             return
         self.accept()
@@ -977,8 +958,9 @@ class DoneLessonDialog(QDialog):
         self.setMinimumWidth(440)
         lay = QVBoxLayout(self)
         begin = dates.fmt_date(sub.begins)
-        if sub.trial:
-            text = (f"{sub.student}. Пробный урок {begin}: "
+        if sub.one_off:
+            what = "Пробный урок" if sub.trial else "Разовый урок"
+            text = (f"{sub.student}. {what} {begin}: "
                     + ("уже проведён." if sub.used else "ещё не проведён."))
         elif sub.total:
             text = (f"{sub.student}. Абонемент с {begin}, уроки "
@@ -1004,7 +986,8 @@ class DoneLessonDialog(QDialog):
         self.count.setRange(1, top)
         self.count.setValue(1)
         self.count.setAccessibleName("Количество уроков за этот день")
-        form.addRow("Количество уроков", self.count)
+        if not sub.one_off:
+            form.addRow("Количество уроков", self.count)
         lay.addLayout(form)
 
         hint = QLabel("Программа сама поставит уроки на нужное место в списке "
@@ -1043,8 +1026,9 @@ class LessonPickDialog(QDialog):
         self.setWindowTitle(title)
         self.setMinimumWidth(460)
         lay = QVBoxLayout(self)
-        if sub.trial:
-            text = (f"{sub.student}, пробный урок "
+        if sub.one_off:
+            what = "пробный урок" if sub.trial else "разовый урок"
+            text = (f"{sub.student}, {what} "
                     f"{dates.fmt_date(sub.bought)}. Выбери урок в списке.")
         else:
             if sub.total:
@@ -1233,9 +1217,6 @@ class StudentCard(QDialog):
         self.old_sub_button = QPushButton("Добавить законченный абонемент")
         self.old_sub_button.clicked.connect(self.add_old_subscription)
         history_lay.addWidget(self.old_sub_button)
-        self.old_trial_button = QPushButton("Добавить пробный урок")
-        self.old_trial_button.clicked.connect(self.add_trial_lesson)
-        history_lay.addWidget(self.old_trial_button)
         history_lay.addStretch(1)
         self.tabs.addTab(history, "Законченные абонементы")
 
@@ -1246,7 +1227,8 @@ class StudentCard(QDialog):
                 ("Подтвердить урок", self.confirm_lesson),
                 ("Добавить дату", self.add_date),
                 ("Добавить уроки по расписанию", self.add_schedule),
-                ("Докупить уроки", self.top_up),
+                ("Добавить пробный урок", self.add_trial_lesson),
+                ("Добавить разовый урок", self.add_single_lesson),
                 ("Добавить услугу", self.add_service)):
             button = QPushButton(text)
             button.clicked.connect(slot)
@@ -1291,8 +1273,8 @@ class StudentCard(QDialog):
         sub = self.store.current_subscription(self.student.name)
         if sub is None:
             active = ("Действующего абонемента нет. Его можно завести кнопкой "
-                      "«Добавить новый абонемент» или докупить уроки кнопкой "
-                      "«Докупить уроки».")
+                      "«Добавить новый абонемент» или добавить одно занятие "
+                      "кнопкой «Добавить разовый урок».")
         elif sub.total:
             active = (f"Абонемент с {dates.fmt_date(sub.begins)}, куплен "
                       f"{dates.fmt_date(sub.bought)}. Уроки {sub.used} из "
@@ -1312,13 +1294,14 @@ class StudentCard(QDialog):
         history = self.store.finished_subscriptions(self.student.name)
         if not history:
             text = ("Законченных абонементов нет. Старые абонементы вписываются "
-                    "по одному кнопкой «Добавить законченный абонемент», "
-                    "пробный урок — кнопкой «Добавить пробный урок».")
+                    "по одному кнопкой «Добавить законченный абонемент». "
+                    "Пробный и разовый уроки добавляются кнопками "
+                    "«Добавить пробный урок» и «Добавить разовый урок».")
         else:
             word = plural(len(history), "абонемент", "абонемента", "абонементов")
-            text = (f"Законченных {word}: {len(history)}. Пробный урок "
-                    "добавляется кнопкой «Добавить пробный урок». Выбери "
-                    "абонемент в списке.")
+            text = (f"Законченных {word}: {len(history)}. Пробный и разовый "
+                    "уроки добавляются кнопками «Добавить пробный урок» и "
+                    "«Добавить разовый урок». Выбери запись в списке.")
         self.history_info.setText(text)
         self.history_info.setAccessibleName(text)
 
@@ -1326,8 +1309,9 @@ class StudentCard(QDialog):
         self.history_pick.blockSignals(True)
         self.history_pick.clear()
         for item in history:
-            if item.trial:
-                label = (f"Пробный урок {dates.fmt_date(item.bought)}: "
+            if item.one_off:
+                title = "Пробный урок" if item.trial else "Разовый урок"
+                label = (f"{title} {dates.fmt_date(item.bought)}: "
                          + ("проведён." if item.used else "записан."))
             elif item.total:
                 label = (f"Абонемент с {dates.fmt_date(item.begins)}: отмечено "
@@ -1387,16 +1371,27 @@ class StudentCard(QDialog):
                    f"добавлен. Отметь в нём проведённые уроки кнопкой "
                    f"«Добавить проведённый урок».")
 
-    def add_trial_lesson(self) -> None:
-        dialog = TrialLessonDialog(self.store, self.student, parent=self)
+    def add_one_off_lesson(self, kind: str) -> None:
+        title = "Пробный" if kind == "trial" else "Разовый"
+        dialog = OneOffLessonDialog(self.store, self.student, kind=kind,
+                                    parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            announce(self, "Пробный урок не добавлен.")
+            announce(self, f"{title} урок не добавлен.")
             return
         sub = dialog.subscription
         self.tabs.setCurrentIndex(1)
-        self._done(f"Пробный урок на {dates.fmt_date(sub.bought)} добавлен. "
-                   f"Отметь его проведённым кнопкой «Добавить проведённый "
-                   f"урок».")
+        text = f"{title} урок на {dates.fmt_date(sub.bought)} добавлен."
+        if sub.price:
+            text += f" Стоимость: {money(sub.price)} рублей."
+        text += (" Отметь его проведённым кнопкой «Добавить проведённый "
+                 "урок».")
+        self._done(text)
+
+    def add_trial_lesson(self) -> None:
+        self.add_one_off_lesson("trial")
+
+    def add_single_lesson(self) -> None:
+        self.add_one_off_lesson("single")
 
     def add_done_lesson(self) -> None:
         sub = self.store.current_subscription(self.student.name)
@@ -1577,32 +1572,6 @@ class StudentCard(QDialog):
         word = plural(count, "урок", "урока", "уроков")
         self._done(f"{self.student.name}, на месяц вперёд записано "
                    f"{count} {word}.")
-
-    def top_up(self) -> None:
-        name = self.student.name
-        used, total = self.store.balance(name)
-        dialog = TopUpDialog(name, used, total, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            announce(self, "Уроки не добавлены.")
-            return
-        count = dialog.lessons
-        word = plural(count, "урок", "урока", "уроков")
-        sub = self.store.current_subscription(name)
-        if sub is None:
-            self.store.add_subscription(
-                name, count, price=dialog.price,
-                direction=self.student.direction,
-                started=dialog.started)
-        else:
-            sub.total += count
-            sub.price += max(0, dialog.price)
-            self.store.save_subscriptions()
-        if dialog.price > 0:
-            self.store.add_payment(
-                name, f"Абонемент, {count} {word}", dialog.price)
-        used, total = self.store.balance(name)
-        self._done(f"{name}, докуплено {count} {word}. "
-                   f"Уроки {used} из {total}.")
 
     def add_service(self) -> None:
         dialog = ServiceDialog(self.store, self.student, self)
@@ -2684,6 +2653,10 @@ class MainWindow(QMainWindow):
             trial_button.clicked.connect(
                 lambda _checked=False: self.add_trial_lesson())
             row.addWidget(trial_button)
+            single_button = QPushButton("Добавить разовый урок")
+            single_button.clicked.connect(
+                lambda _checked=False: self.add_single_lesson())
+            row.addWidget(single_button)
         edit_button = QPushButton("Редактировать абонемент")
         edit_button.clicked.connect(
             lambda _checked=False: self.edit_subscription())
@@ -2700,12 +2673,14 @@ class MainWindow(QMainWindow):
 
     def sub_line(self, sub: data.Subscription) -> str:
         """Абонемент одной фразой: как его прочитает диктор."""
-        if sub.trial:
-            parts = [sub.student,
-                     f"пробный урок {dates.fmt_date(sub.bought)}"]
+        if sub.one_off:
+            title = "пробный урок" if sub.trial else "разовый урок"
+            parts = [sub.student, f"{title} {dates.fmt_date(sub.bought)}"]
             if sub.lesson_format:
                 parts.append(sub.lesson_format.casefold())
             parts.append(sub.direction)
+            if sub.single and sub.price:
+                parts.append(f"{money(sub.price)} рублей")
             parts.append("проведён" if sub.used else "записан")
             return ", ".join(parts)
         parts = [sub.student,
@@ -2795,9 +2770,10 @@ class MainWindow(QMainWindow):
         menu.setAccessibleName(
             f"Абонемент {sub.student}" if sub is not None else "Абонементы")
         add = menu.addAction("Добавить абонемент")
-        trial = None
+        trial = single = None
         if lst is self.finished_subs_list:
             trial = menu.addAction("Добавить пробный урок")
+            single = menu.addAction("Добавить разовый урок")
         edit = remove = export = None
         if sub is not None:
             menu.addSeparator()
@@ -2811,6 +2787,8 @@ class MainWindow(QMainWindow):
             self.add_subscription()
         elif chosen is trial:
             self.add_trial_lesson()
+        elif chosen is single:
+            self.add_single_lesson()
         elif chosen is edit:
             self.edit_subscription(sub)
         elif chosen is remove:
@@ -2867,35 +2845,48 @@ class MainWindow(QMainWindow):
                 text += " Расписание не записано: ни один день не отмечен."
         announce(self, text, assertive=True)
 
-    def add_trial_lesson(self) -> None:
-        """Пробный урок: ученик, дата, формат и направление.
+    def add_one_off_lesson(self, kind: str) -> None:
+        """Одно занятие: пробный или разовый урок.
 
-        Урока в расписании не появляется — это запись в истории. Проведён
-        он или ещё нет, видно по отметке в карточке ученика.
+        Спрашиваем ученика, дату, формат, направление, а для разового —
+        ещё и цену. Урока в расписании не появляется — это запись в
+        истории. Проведён он или ещё нет, видно по отметке в карточке.
         """
+        title = "Пробный" if kind == "trial" else "Разовый"
+        low = "пробный" if kind == "trial" else "разовый"
         if not self.store.students:
             announce(self, "Учеников нет. Сначала добавь ученика на вкладке "
                            "Ученики.", assertive=True)
             return
         picker = StudentPickDialog(
-            self.store, "Пробный урок",
-            "Чей пробный урок добавить? Выбери ученика в списке и нажми "
+            self.store, f"{title} урок",
+            f"Чей {low} урок добавить? Выбери ученика в списке и нажми "
             "«Дальше».", self)
         if picker.exec() != QDialog.DialogCode.Accepted \
                 or picker.picked is None:
-            announce(self, "Пробный урок не добавлен.")
+            announce(self, f"{title} урок не добавлен.")
             return
         student = picker.picked
-        dialog = TrialLessonDialog(self.store, student, parent=self)
+        dialog = OneOffLessonDialog(self.store, student, kind=kind,
+                                    parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            announce(self, "Пробный урок не добавлен.")
+            announce(self, f"{title} урок не добавлен.")
             return
         sub = dialog.subscription
         self.refresh_all()
         self.tabs.setCurrentWidget(self.finished_subs_page)
-        announce(self, f"Пробный урок {student.name} на "
-                       f"{dates.fmt_date(sub.bought)} добавлен. Отметь его "
-                       f"проведённым в карточке ученика.", assertive=True)
+        text = (f"{title} урок {student.name} на "
+                f"{dates.fmt_date(sub.bought)} добавлен.")
+        if sub.price:
+            text += f" Стоимость: {money(sub.price)} рублей."
+        text += " Отметь его проведённым в карточке ученика."
+        announce(self, text, assertive=True)
+
+    def add_trial_lesson(self) -> None:
+        self.add_one_off_lesson("trial")
+
+    def add_single_lesson(self) -> None:
+        self.add_one_off_lesson("single")
 
     def edit_subscription(
             self, sub: data.Subscription | None = None) -> None:
@@ -3223,10 +3214,11 @@ class MainWindow(QMainWindow):
             "Все действующие абонементы, новые сверху. " + sub_tip + " "
             + sub_menu)
         self.finished_subs_hint.setText(
-            "Все законченные абонементы и пробные уроки, новые сверху. "
-            "Пробный урок добавляется кнопкой «Добавить пробный урок»: "
-            "ученик, дата, очно или онлайн, направление. " + sub_tip + " "
-            + sub_menu)
+            "Все законченные абонементы, пробные и разовые уроки, новые "
+            "сверху. Пробный или разовый урок добавляется кнопками "
+            "«Добавить пробный урок» и «Добавить разовый урок»: ученик, "
+            "дата, очно или онлайн, направление, у разового ещё цена. "
+            + sub_tip + " " + sub_menu)
         self.services_hint.setText(
             "Оплаченные услуги, новые сверху. Кнопки под списком и меню по "
             "правому щелчку или клавише «Меню»: добавить, редактировать, "

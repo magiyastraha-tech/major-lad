@@ -90,11 +90,13 @@ def _student_lines(store, student) -> list[str]:
     else:
         lines.append(f"Законченных абонементов: {len(history)}.")
         for item in history:
-            if item.trial:
-                tail = ", ".join(part for part in
-                                 (item.lesson_format.casefold(),
-                                  item.direction) if part)
-                line = f"Пробный урок: {dates.fmt_date(item.bought)}"
+            if item.one_off:
+                title = "Пробный урок" if item.trial else "Разовый урок"
+                parts = [item.lesson_format.casefold(), item.direction]
+                if item.single and item.price:
+                    parts.append(f"{_money(item.price)} рублей")
+                tail = ", ".join(part for part in parts if part)
+                line = f"{title}: {dates.fmt_date(item.bought)}"
                 if tail:
                     line += f", {tail}"
                 line += ", проведён." if item.used else "."

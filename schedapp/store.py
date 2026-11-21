@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     price INTEGER NOT NULL DEFAULT 0,
     finished INTEGER NOT NULL DEFAULT 0,
     trial INTEGER NOT NULL DEFAULT 0,
+    single INTEGER NOT NULL DEFAULT 0,
     lesson_format TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS lessons (
@@ -134,10 +135,18 @@ class Subscription:
     finished: bool = False
     # Пробный урок. Не абонемент, а одно занятие: уроков всегда один,
     # денег нет, в истории он так и называется — «пробный урок».
-    # Формат («Очно», «Онлайн») нужен только ему: у абонемента он у
-    # ученика, а пробный урок бывает разовым.
+    # Формат («Очно», «Онлайн») нужен только разовым занятиям: у
+    # абонемента он у ученика, а такой урок бывает отдельным.
     trial: bool = False
+    # Разовый урок. Тоже одно занятие, но оплаченное: цена своя, в
+    # историю он попадает сразу и действующий абонемент не закрывает.
+    single: bool = False
     lesson_format: str = ""
+
+    @property
+    def one_off(self) -> bool:
+        """Одно занятие вместо абонемента: пробный или разовый урок."""
+        return self.trial or self.single
 
     @property
     def left(self) -> int:
@@ -324,6 +333,10 @@ class Store:
             statements.append(
                 "ALTER TABLE subscriptions ADD COLUMN trial "
                 "INTEGER NOT NULL DEFAULT 0")
+        if "single" not in sub_columns:
+            statements.append(
+                "ALTER TABLE subscriptions ADD COLUMN single "
+                "INTEGER NOT NULL DEFAULT 0")
         if "lesson_format" not in sub_columns:
             statements.append(
                 "ALTER TABLE subscriptions ADD COLUMN lesson_format "
@@ -449,7 +462,7 @@ class Store:
                 direction=row["direction"], total=_int(row["total"]),
                 used=_int(row["used"]), price=_int(row["price"]),
                 started=started, finished=bool(row["finished"]),
-                trial=bool(row["trial"]),
+                trial=bool(row["trial"]), single=bool(row["single"]),
                 lesson_format=row["lesson_format"] or ""))
 
         self.lessons = []
@@ -593,12 +606,12 @@ class Store:
         self._write("subscriptions",
                     ("uid", "bought", "started", "student", "direction",
                      "total", "used", "price", "finished", "trial",
-                     "lesson_format"),
+                     "single", "lesson_format"),
                     [(s.uid, dates.fmt_date(s.bought),
                       dates.fmt_date(s.begins), s.student,
                       s.direction, s.total, s.used, s.price,
                       1 if s.finished else 0, 1 if s.trial else 0,
-                      s.lesson_format)
+                      1 if s.single else 0, s.lesson_format)
                      for s in self.subscriptions])
         self._refresh_files()
 
@@ -643,11 +656,13 @@ class Store:
             if history:
                 lines.append(f"Законченных абонементов: {len(history)}.")
             for sub in history:
-                if sub.trial:
-                    line = f"Пробный урок: {dates.fmt_date(sub.bought)}"
-                    tail = ", ".join(part for part in
-                                     (sub.lesson_format.casefold(),
-                                      sub.direction) if part)
+                if sub.one_off:
+                    title = "Пробный урок" if sub.trial else "Разовый урок"
+                    line = f"{title}: {dates.fmt_date(sub.bought)}"
+                    parts = [sub.lesson_format.casefold(), sub.direction]
+                    if sub.single and sub.price:
+                        parts.append(f"{money(sub.price)} рублей")
+                    tail = ", ".join(part for part in parts if part)
                     if tail:
                         line += f", {tail}"
                     line += ", проведён." if sub.used else "."
@@ -702,16 +717,25 @@ class Store:
             for bad in '<>:"/\\|?*':
                 name = name.replace(bad, "-")
             name = name.strip().strip(".") or "Без имени"
-            prefix = "Пробный урок" if sub.trial else "Абонемент"
+            if sub.trial:
+                prefix = "Пробный урок"
+            elif sub.single:
+                prefix = "Разовый урок"
+            else:
+                prefix = "Абонемент"
             target = self.folder / SUBS_DIR / (
                 f"{prefix} {name} {dates.fmt_date(sub.bought)}.txt")
-        if sub.trial:
-            lines = ["Мажорный лад Расписание. Пробный урок.", ""]
+        if sub.one_off:
+            title = "Пробный урок" if sub.trial else "Разовый урок"
+            date_label = "Дата пробного урока" if sub.trial else "Дата разового урока"
+            lines = [f"Мажорный лад Расписание. {title}.", ""]
             lines.append(f"Ученик: {sub.student}.")
             lines.append(f"Направление: {sub.direction}.")
             if sub.lesson_format:
                 lines.append(f"Формат: {sub.lesson_format}.")
-            lines.append(f"Дата пробного урока: {dates.fmt_date(sub.bought)}.")
+            lines.append(f"{date_label}: {dates.fmt_date(sub.bought)}.")
+            if sub.price:
+                lines.append(f"Стоимость: {money(sub.price)} рублей.")
             lines.append("Состояние: "
                          + ("проведён." if sub.used else "записан."))
             lines.append("")
@@ -835,6 +859,7 @@ class Store:
                          started: date | None = None,
                          finished: bool = False,
                          trial: bool = False,
+                         single: bool = False,
                          lesson_format: str = "") -> Subscription:
         """Завести абонемент.
 
@@ -847,10 +872,16 @@ class Store:
         смыслу это история, поэтому он сразу законченный и действующего
         абонемента ученику не закрывает. Уроков у него всегда один,
         цена не спрашивается и в журнал оплат не идёт.
+
+        `single=True` — разовый урок: тоже одно занятие, но оплаченное,
+        с собственной ценой. Устроен так же: сразу в истории, действующий
+        абонемент не закрывает.
         """
         bought_day = bought or date.today()
         if trial:
             total, price, finished = 1, 0, True
+        elif single:
+            total, finished = 1, True
         if not finished:
             for other in self.subscriptions:
                 if other.student == student and not other.finished:
@@ -866,7 +897,8 @@ class Store:
             started=started or bought_day,
             finished=finished,
             trial=trial,
-            lesson_format=lesson_format if trial else "",
+            single=single,
+            lesson_format=lesson_format if (trial or single) else "",
         )
         self.subscriptions.append(item)
         self.save_subscriptions()
@@ -1015,6 +1047,7 @@ class Store:
                 sub.finished = True
                 changed = True
             elif (was_full and not full and sub.finished
+                  and not sub.one_off
                   and latest.get(sub.student) is sub):
                 sub.finished = False
                 changed = True
@@ -1120,7 +1153,9 @@ class Store:
                 day=day,
                 time="",
                 student=sub.student,
-                lesson_format=owner.lesson_format if owner else FORMATS[0],
+                lesson_format=(sub.lesson_format
+                               or (owner.lesson_format if owner
+                                   else FORMATS[0])),
                 direction=sub.direction
                 or (owner.direction if owner else DIRECTIONS[2]),
                 status=LESSON_DONE,
@@ -1171,7 +1206,7 @@ class Store:
         if sub is not None:
             was_full = sub.total > 0 and sub.used >= sub.total
             sub.used = max(0, sub.used - 1)
-            if was_full:
+            if was_full and not sub.one_off:
                 mine = [s for s in self.subscriptions if s.student == sub.student]
                 latest = max(mine, key=lambda s: (s.bought, s.uid), default=None)
                 if latest is not None and latest.uid == sub.uid:
