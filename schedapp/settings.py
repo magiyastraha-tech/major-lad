@@ -1,4 +1,4 @@
-"""Настройки программы — пока только сочетания клавиш.
+"""Настройки программы — сочетания клавиш и громкость сигналов.
 
 Файл `Data/Настройки.txt` устроен по-простому: слева действие, справа
 клавиши. Такой файл можно прочитать диктором и поправить блокнотом, а
@@ -7,6 +7,7 @@
     card = F2
     today = F3
     export =
+    volume = 80
 
 Пустая правая часть — действие без клавиши. Незнакомые строки
 пропускаются: файл не должен ломать запуск.
@@ -16,6 +17,11 @@ from __future__ import annotations
 from pathlib import Path
 
 FILE = "Настройки.txt"
+
+# Громкость сигналов хранится в том же файле отдельной строкой:
+#     volume = 80
+VOLUME_KEY = "volume"
+DEFAULT_VOLUME = 80
 
 # (код, название для диктора, клавиши по умолчанию)
 ACTIONS = (
@@ -65,12 +71,43 @@ def load(folder: Path) -> dict[str, str]:
     return result
 
 
-def save(folder: Path, bindings: dict[str, str]) -> Path:
+def volume_value(text: str | int | None) -> int:
+    """Громкость в процентах: 0–100, что попало — приводим к норме."""
+    try:
+        value = int(str(text).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_VOLUME
+    return max(0, min(100, value))
+
+
+def load_volume(folder: Path) -> int:
+    """Громкость сигналов из файла настроек; нет строки — по умолчанию."""
     path = Path(folder) / FILE
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return DEFAULT_VOLUME
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        code, _, value = line.partition("=")
+        if code.strip() == VOLUME_KEY:
+            return volume_value(value.split("#", 1)[0])
+    return DEFAULT_VOLUME
+
+
+def save(folder: Path, bindings: dict[str, str],
+         volume: int | None = None) -> Path:
+    path = Path(folder) / FILE
+    if volume is None:
+        volume = load_volume(folder)
     lines = [HEADER]
     for code, title, _ in ACTIONS:
         lines.append(f"# {title}")
         lines.append(f"{code} = {bindings.get(code, '')}")
+    lines.append("# Громкость сигналов, проценты (0 — без звука)")
+    lines.append(f"{VOLUME_KEY} = {volume_value(volume)}")
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     tmp.replace(path)

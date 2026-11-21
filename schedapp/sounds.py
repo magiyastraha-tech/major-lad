@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import math
 import shutil
+import sys
+import tempfile
 import wave
 from array import array
 from pathlib import Path
@@ -146,8 +148,66 @@ def ensure(folder: Path | None = None) -> None:
         pass
 
 
-def play(kind: str, folder: Path | None = None) -> bool:
-    """Проиграть звук. False — не вышло, пусть вызывающий пищит."""
+def _volume(value) -> int:
+    """Громкость 0–100; что попало — к ближайшей границе."""
+    try:
+        level = int(value)
+    except (TypeError, ValueError):
+        return 100
+    return max(0, min(100, level))
+
+
+def _quiet_copy(path: Path, level: int) -> Path | None:
+    """Сделать приглушённую копию WAV: у winsound своей громкости нет.
+
+    Масштабируем отсчёты 16-битного WAV во временный файл. Имя копии
+    привязано к дате изменения исходника, поэтому заменённый звук не
+    проиграется из старого кэша.
+    """
+    try:
+        stamp = int(path.stat().st_mtime)
+    except OSError:
+        stamp = 0
+    target = (Path(tempfile.gettempdir())
+              / f"major-lad-{path.stem}-{level}-{stamp}.wav")
+    if target.exists() and target.stat().st_size > 44:
+        return target
+    try:
+        with wave.open(str(path), "rb") as source:
+            channels = source.getnchannels()
+            width = source.getsampwidth()
+            rate = source.getframerate()
+            frames = source.readframes(source.getnframes())
+    except (OSError, wave.Error, EOFError):
+        return None
+    if width != 2:
+        return None
+    samples = array("h")
+    samples.frombytes(frames)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    scale = level / 100.0
+    for index, sample in enumerate(samples):
+        samples[index] = int(sample * scale)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    try:
+        with wave.open(str(target), "wb") as handle:
+            handle.setnchannels(channels)
+            handle.setsampwidth(width)
+            handle.setframerate(rate)
+            handle.writeframes(samples.tobytes())
+    except OSError:
+        return None
+    return target
+
+
+def play(kind: str, folder: Path | None = None, volume: int = 100) -> bool:
+    """Проиграть звук. False — не вышло, пусть вызывающий пищит.
+
+    Громкость 0 значит «без звука»: возвращаем True, чтобы вызывающий не
+    пищал вместо выключенного сигнала.
+    """
     name = FILES.get(kind)
     if not name:
         return False
@@ -155,15 +215,42 @@ def play(kind: str, folder: Path | None = None) -> bool:
     path = target / name
     if not path.exists():
         return False
+    level = _volume(volume)
+    if level == 0:
+        return True
     try:
         import winsound
     except ImportError:
         return False
+    played = path
+    if level < 100:
+        quiet = _quiet_copy(path, level)
+        if quiet is None:
+            return False
+        played = quiet
     try:
         winsound.PlaySound(
-            str(path),
+            str(played),
             winsound.SND_FILENAME | winsound.SND_ASYNC
             | winsound.SND_NODEFAULT)
         return True
     except RuntimeError:
         return False
+
+
+def length(kind: str, folder: Path | None = None) -> float:
+    """Сколько секунд звучит сигнал; 0 — файла нет или он не читается.
+
+    Нужна, чтобы диктор начинал говорить после сигнала, а не вместе с ним.
+    """
+    name = FILES.get(kind)
+    if not name:
+        return 0.0
+    target = Path(folder) if folder is not None else paths.sound_dir()
+    path = target / name
+    try:
+        with wave.open(str(path), "rb") as handle:
+            rate = handle.getframerate() or RATE
+            return handle.getnframes() / float(rate)
+    except (OSError, wave.Error, EOFError):
+        return 0.0

@@ -1339,14 +1339,17 @@ class KeyCaptureDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """Настройки: «Общее» и «Сочетания клавиш» одним столбцом, без вкладок."""
+    """Настройки: «Общее», «Звуки» и «Сочетания клавиш» одним столбцом."""
 
     bindings_changed = Signal(dict)
+    volume_changed = Signal(int)
 
-    def __init__(self, store: Store, bindings: dict[str, str], parent=None):
+    def __init__(self, store: Store, bindings: dict[str, str],
+                 volume: int = settings.DEFAULT_VOLUME, parent=None):
         super().__init__(parent)
         self.store = store
         self.bindings = dict(bindings)
+        self.volume = settings.volume_value(volume)
         self._worker: UpdateWorker | None = None
         self.setWindowTitle("Настройки")
         self.setMinimumWidth(560)
@@ -1384,6 +1387,26 @@ class SettingsDialog(QDialog):
         folder = QPushButton("Открыть папку Данные")
         folder.clicked.connect(self.open_data_folder)
         column.addWidget(folder)
+
+        # --- звуки
+        column.addSpacing(12)
+        column.addWidget(section_label("Звуки"))
+        volume_hint = QLabel("Громкость сигналов напоминаний. "
+                             "Ноль — совсем без звука.")
+        volume_hint.setWordWrap(True)
+        column.addWidget(volume_hint)
+
+        self.volume_box = QSpinBox()
+        self.volume_box.setRange(0, 100)
+        self.volume_box.setSingleStep(5)
+        self.volume_box.setValue(self.volume)
+        self.volume_box.setAccessibleName("Громкость сигналов в процентах")
+        column.addWidget(self.volume_box)
+
+        test = QPushButton("Проверить звук")
+        test.setAccessibleName("Проверить звук напоминания")
+        test.clicked.connect(self.test_sound)
+        column.addWidget(test)
 
         # --- сочетания клавиш
         column.addSpacing(12)
@@ -1471,6 +1494,18 @@ class SettingsDialog(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.folder)))
         announce(self, "Открыта папка Дата.")
 
+    # --- звук -------------------------------------------------------------
+
+    def test_sound(self) -> None:
+        """Проиграть сигнал с выбранной громкостью, не закрывая настройки."""
+        level = settings.volume_value(self.volume_box.value())
+        if level == 0:
+            announce(self, "Громкость ноль, сигналы выключены.", assertive=True)
+            return
+        if not sounds.play("soon", self.store.folder / "Sound", level):
+            QApplication.beep()
+        announce(self, f"Сигнал напоминания, громкость {level} процентов.")
+
     # --- клавиши ----------------------------------------------------------
 
     def _show_keys(self) -> None:
@@ -1508,8 +1543,9 @@ class SettingsDialog(QDialog):
 
     def reset_bindings(self) -> None:
         self.bindings = settings.defaults()
+        self.volume_box.setValue(settings.DEFAULT_VOLUME)
         self._show_keys()
-        announce(self, "Расставлены клавиши по умолчанию. "
+        announce(self, "Расставлены клавиши по умолчанию и средняя громкость. "
                        "Нажми «Сохранить», чтобы применить.")
 
     def save_bindings(self) -> None:
@@ -1526,14 +1562,21 @@ class SettingsDialog(QDialog):
                     return
                 seen[text] = title
             result[code] = text
+        level = settings.volume_value(self.volume_box.value())
         try:
-            settings.save(self.store.folder, result)
+            settings.save(self.store.folder, result, level)
         except OSError:
             announce(self, "Не получилось сохранить настройки.", assertive=True)
             return
         self.bindings = result
+        self.volume = level
         self.bindings_changed.emit(result)
-        announce(self, "Сочетания клавиш сохранены.", assertive=True)
+        self.volume_changed.emit(level)
+        if level:
+            tail = f"Громкость сигналов {level} процентов."
+        else:
+            tail = "Сигналы выключены."
+        announce(self, f"Настройки сохранены. {tail}", assertive=True)
         self.accept()
 
 
@@ -1545,6 +1588,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store = store
         self.bindings = settings.load(store.folder)
+        self.volume = settings.load_volume(store.folder)
         self.setWindowTitle(f"Мажорный лад Расписание {__version__}")
         self.resize(820, 620)
         self.announcer = Announcer(self)
@@ -1718,6 +1762,9 @@ class MainWindow(QMainWindow):
         self.install_shortcuts()
         self.update_hints()
 
+    def apply_volume(self, volume: int) -> None:
+        self.volume = settings.volume_value(volume)
+
     def open_settings(self) -> None:
         # Окно настроек модальное, но ярлыки живут на всё приложение:
         # пока оно открыто, они выключены, чтобы новая клавиша не
@@ -1728,8 +1775,10 @@ class MainWindow(QMainWindow):
         for shortcut in self._shortcuts:
             shortcut.setEnabled(False)
         try:
-            dialog = SettingsDialog(self.store, self.bindings, self)
+            dialog = SettingsDialog(self.store, self.bindings, self.volume,
+                                    self)
             dialog.bindings_changed.connect(self.apply_bindings)
+            dialog.volume_changed.connect(self.apply_volume)
             announce(dialog, f"Настройки. Версия программы {__version__}.")
             dialog.exec()
         finally:
@@ -1826,10 +1875,27 @@ class MainWindow(QMainWindow):
 
     # --- напоминания ------------------------------------------------------
 
-    def on_soon(self, lesson: data.Lesson, kind: str) -> None:
-        if not sounds.play("soon"):
+    def _play_then(self, kind: str, action) -> None:
+        """Сначала сигнал, потом диктор.
+
+        Одновременно они перебивают друг друга: диктор заговаривает
+        сигнал с первых секунд. Поэтому ждём, пока файл отзвучит, и
+        только потом начинаем говорить. Громкость ноль — без задержки.
+        """
+        level = self.volume
+        folder = self.store.folder / "Sound"
+        if level > 0 and not sounds.play(kind, folder, level):
             QApplication.beep()
-        announce(self, soon_text(lesson, kind), assertive=True)
+        wait = sounds.length(kind, folder) + 0.15 if level > 0 else 0.0
+        if wait <= 0:
+            action()
+            return
+        QTimer.singleShot(int(wait * 1000), action)
+
+    def on_soon(self, lesson: data.Lesson, kind: str) -> None:
+        text = soon_text(lesson, kind)
+        self._play_then(
+            "soon", lambda: announce(self, text, assertive=True))
 
     def on_ask_start(self, lesson: data.Lesson) -> None:
         now = datetime.now()
@@ -1842,51 +1908,57 @@ class MainWindow(QMainWindow):
         later = box.addButton("Напомнить через час",
                               QMessageBox.ButtonRole.NoRole)
         box.setDefaultButton(yes)
-        if not sounds.play("start"):
-            QApplication.beep()
-        announce(self, text, assertive=True)
-        box.exec()
-        if box.clickedButton() is yes:
-            self.reminders.mark_started(lesson)
-            announce(self, "Хорошо. Через сорок минут спрошу, прошёл ли урок.")
-        else:
-            self.reminders.snooze(lesson)
-            announce(self, "Напомню через час.")
+
+        def ask() -> None:
+            announce(self, text, assertive=True)
+            box.exec()
+            if box.clickedButton() is yes:
+                self.reminders.mark_started(lesson)
+                announce(
+                    self, "Хорошо. Через сорок минут спрошу, прошёл ли урок.")
+            else:
+                self.reminders.snooze(lesson)
+                announce(self, "Напомню через час.")
+
+        self._play_then("start", ask)
 
     def on_ask_finish(self, lesson: data.Lesson) -> None:
         text = (f"Вы подтверждаете, что урок прошёл? "
                 f"{lesson.student}, в {lesson.time}.")
-        if not sounds.play("finish"):
-            QApplication.beep()
-        announce(self, text, assertive=True)
-        dialog = LessonPayDialog(lesson.student, self, amount=lesson.price,
-                                 question=text)
-        dialog.setWindowTitle("Урок прошёл?")
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            lesson.status = LESSON_CANCELLED
+
+        def ask() -> None:
+            announce(self, text, assertive=True)
+            dialog = LessonPayDialog(lesson.student, self,
+                                     amount=lesson.price, question=text)
+            dialog.setWindowTitle("Урок прошёл?")
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                lesson.status = LESSON_CANCELLED
+                self.store.update_lesson(lesson)
+                self.reminders.mark_cancelled(lesson)
+                self.refresh_all()
+                announce(self, f"Урок отменён. {lesson.student}, "
+                               f"в {lesson.time}.", assertive=True)
+                return
+            amount = dialog.amount
+            lesson.status = LESSON_DONE
+            lesson.price = amount
+            sub = self.store.current_subscription(lesson.student)
+            if sub is not None:
+                lesson.subscription = sub.uid
             self.store.update_lesson(lesson)
-            self.reminders.mark_cancelled(lesson)
+            if sub is not None:
+                self.store.bump_used(sub)
+            if amount > 0:
+                self.store.add_payment(lesson.student, "Урок", amount,
+                                       date.today())
+            self.reminders.mark_finished(lesson)
             self.refresh_all()
-            announce(self, f"Урок отменён. {lesson.student}, "
-                           f"в {lesson.time}.", assertive=True)
-            return
-        amount = dialog.amount
-        lesson.status = LESSON_DONE
-        lesson.price = amount
-        sub = self.store.current_subscription(lesson.student)
-        if sub is not None:
-            lesson.subscription = sub.uid
-        self.store.update_lesson(lesson)
-        if sub is not None:
-            self.store.bump_used(sub)
-        if amount > 0:
-            self.store.add_payment(lesson.student, "Урок", amount,
-                                   date.today())
-        self.reminders.mark_finished(lesson)
-        self.refresh_all()
-        used, total = self.store.balance(lesson.student)
-        tail = f" Уроки {used} из {total}." if total else ""
-        announce(self, f"{lesson.student}, урок проведён.{tail}", assertive=True)
+            used, total = self.store.balance(lesson.student)
+            tail = f" Уроки {used} из {total}." if total else ""
+            announce(self, f"{lesson.student}, урок проведён.{tail}",
+                     assertive=True)
+
+        self._play_then("finish", ask)
 
     # --- трей -------------------------------------------------------------
 
