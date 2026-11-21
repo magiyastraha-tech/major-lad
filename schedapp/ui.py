@@ -701,6 +701,114 @@ class SubscriptionDialog(QDialog):
         self.accept()
 
 
+class SubscriptionEditDialog(QDialog):
+    """Правка уже заведённого абонемента.
+
+    Меняются даты, направление, число уроков, стоимость и пометка
+    «закончен». Уроков меньше, чем уже проведено, поставить нельзя;
+    ноль означает «без ограничения».
+    """
+
+    def __init__(self, store: Store, sub: data.Subscription, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.sub = sub
+        # True, если после правки уроки досчитались до конца и абонемент
+        # сам перешёл в законченные.
+        self.closed_itself = False
+        self.setWindowTitle("Изменить абонемент")
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        if sub.total:
+            text = (f"{sub.student}. Проведено {sub.used} из {sub.total}, "
+                    f"осталось {sub.left}. Уроков меньше {sub.used} "
+                    f"поставить нельзя.")
+        else:
+            text = (f"{sub.student}. Уроков без ограничения, проведено "
+                    f"{sub.used}.")
+        hint = QLabel(text)
+        hint.setWordWrap(True)
+        hint.setAccessibleName(text)
+        lay.addWidget(hint)
+
+        form = QFormLayout()
+        self.bought = make_date_edit("Дата покупки абонемента", sub.bought)
+        form.addRow("Дата покупки", self.bought)
+
+        self.start = make_date_edit("С какого числа действует абонемент",
+                                    sub.begins)
+        form.addRow("Абонемент с числа", self.start)
+
+        self.direction = QComboBox()
+        self.direction.addItems(DIRECTIONS)
+        self.direction.setCurrentText(sub.direction)
+        self.direction.setAccessibleName("Направление")
+        form.addRow("Направление", self.direction)
+
+        self.count = QSpinBox()
+        self.count.setRange(0, 500)
+        self.count.setSpecialValueText("без ограничения")
+        self.count.setValue(max(0, sub.total))
+        self.count.setAccessibleName(
+            "Сколько уроков в абонементе; ноль — без ограничения")
+        form.addRow("Уроков", self.count)
+
+        self.price = QSpinBox()
+        self.price.setRange(0, 500_000)
+        self.price.setSingleStep(500)
+        self.price.setSuffix(" ₽")
+        self.price.setValue(sub.price)
+        self.price.setAccessibleName("Стоимость абонемента")
+        form.addRow("Стоимость", self.price)
+        lay.addLayout(form)
+
+        self.finished_box = QCheckBox("Абонемент закончен")
+        self.finished_box.setChecked(sub.finished)
+        self.finished_box.setAccessibleName("Абонемент закончен")
+        lay.addWidget(self.finished_box)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.count.setFocus()
+        self.count.selectAll()
+
+    def _save(self) -> None:
+        count = self.count.value()
+        if count and count < self.sub.used:
+            announce(
+                self,
+                f"В абонементе уже проведено {self.sub.used} "
+                f"{plural(self.sub.used, 'урок', 'урока', 'уроков')}. "
+                f"Поставь уроков не меньше, или ноль — без ограничения.",
+                assertive=True)
+            self.count.setFocus()
+            return
+        sub = self.sub
+        old = (sub.bought, sub.started, sub.direction, sub.total,
+               sub.price, sub.finished)
+        sub.bought = picked_date(self.bought)
+        sub.started = picked_date(self.start)
+        sub.direction = self.direction.currentText()
+        sub.total = count
+        sub.price = self.price.value()
+        sub.finished = self.finished_box.isChecked()
+        try:
+            self.closed_itself = self.store.update_subscription(sub)
+        except ValueError as error:
+            # Сохранение не прошло — возвращаем прежние значения, чтобы
+            # память программы не разошлась с файлом.
+            (sub.bought, sub.started, sub.direction, sub.total,
+             sub.price, sub.finished) = old
+            announce(self, str(error), assertive=True)
+            return
+        self.accept()
+
+
 class DoneLessonDialog(QDialog):
     """Дата уже проведённого урока и сколько уроков в этот день прошло."""
 
@@ -1940,6 +2048,7 @@ class MainWindow(QMainWindow):
         """Вкладка со списком абонементов: подсказка сверху, список ниже.
 
         Двойной щелчок открывает карточку ученика, чей это абонемент.
+        Правый щелчок или клавиша «Меню» открывает меню абонемента.
         """
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -1949,6 +2058,9 @@ class MainWindow(QMainWindow):
         lst = QListWidget()
         lst.setAccessibleName(name)
         lst.itemDoubleClicked.connect(self.open_sub_card)
+        lst.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        lst.customContextMenuRequested.connect(
+            lambda pos, box=lst: self.subs_menu(box, pos))
         lay.addWidget(lst, 1)
         self.tabs.addTab(page, title)
         return page, hint, lst
@@ -2020,9 +2132,105 @@ class MainWindow(QMainWindow):
         return self.store.subscription_by_uid(
             item.data(Qt.ItemDataRole.UserRole))
 
-    def export_subscription(self) -> None:
-        """F6 — выгрузить выбранный абонемент читаемым текстом в папку Data."""
-        sub = self.selected_subscription()
+    def subs_menu(self, lst: QListWidget, pos) -> None:
+        """Меню абонемента: правый щелчок или клавиша «Меню».
+
+        Клавиатура присылает точку в центре списка, а не на строке, —
+        тогда меню открывается у выбранного абонемента. Меню родное,
+        диктор читает пункты сам.
+        """
+        item = lst.itemAt(pos)
+        if item is None:
+            item = lst.currentItem()
+            if item is not None:
+                pos = lst.visualItemRect(item).center()
+        if item is None:
+            announce(self, "Выбери абонемент в списке, потом открой меню.",
+                     assertive=True)
+            return
+        sub = self.store.subscription_by_uid(
+            item.data(Qt.ItemDataRole.UserRole))
+        if sub is None:
+            return
+        lst.setCurrentItem(item)
+        menu = QMenu(lst)
+        menu.setAccessibleName(f"Абонемент {sub.student}")
+        edit = menu.addAction("Редактировать")
+        remove = menu.addAction("Удалить")
+        export = menu.addAction("Экспортировать")
+        chosen = menu.exec(lst.mapToGlobal(pos))
+        if chosen is edit:
+            self.edit_subscription(sub)
+        elif chosen is remove:
+            self.delete_subscription(sub)
+        elif chosen is export:
+            self.export_subscription(sub)
+
+    def edit_subscription(
+            self, sub: data.Subscription | None = None) -> None:
+        """Правка абонемента: из меню или для выбранного в списке."""
+        if sub is None:
+            sub = self.selected_subscription()
+        if sub is None:
+            announce(self, "Сначала выбери абонемент в списке на вкладке "
+                           "действующих или законченных.", assertive=True)
+            return
+        dialog = SubscriptionEditDialog(self.store, sub, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Правка отменена.")
+            return
+        self.refresh_subscriptions()
+        text = f"Абонемент {sub.student} сохранён: {self.sub_line(sub)}."
+        if dialog.closed_itself:
+            text += " Уроки кончились, поэтому он перешёл в законченные."
+        announce(self, text, assertive=True)
+
+    def delete_subscription(
+            self, sub: data.Subscription | None = None) -> None:
+        """Удалить абонемент совсем — только когда из него убраны уроки."""
+        if sub is None:
+            sub = self.selected_subscription()
+        if sub is None:
+            announce(self, "Сначала выбери абонемент в списке на вкладке "
+                           "действующих или законченных.", assertive=True)
+            return
+        count = len(self.store.subscription_lessons(sub))
+        if count:
+            word = plural(count, "урок", "урока", "уроков")
+            announce(self,
+                     f"Абонемент {sub.student} удалить нельзя: в нём "
+                     f"записано {count} {word}. Сначала убери уроки в "
+                     f"карточке ученика.", assertive=True)
+            return
+        text = (f"Удалить абонемент {sub.student} от "
+                f"{dates.fmt_date(sub.bought)}? Уроков в нём нет, оплаты "
+                f"в журнале останутся.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Удалить абонемент")
+        box.setText(text)
+        yes = box.addButton("Удалить", QMessageBox.ButtonRole.DestructiveRole)
+        no = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        announce(self, text, assertive=True)
+        box.exec()
+        if box.clickedButton() is not yes:
+            announce(self, "Удаление отменено.")
+            return
+        try:
+            self.store.delete_subscription(sub)
+        except ValueError as error:
+            announce(self, str(error), assertive=True)
+            return
+        self.refresh_subscriptions()
+        announce(self, f"Абонемент {sub.student} от "
+                       f"{dates.fmt_date(sub.bought)} удалён.",
+                 assertive=True)
+
+    def export_subscription(
+            self, sub: data.Subscription | None = None) -> None:
+        """F6 или меню — абонемент текстом в папку Данные, в «Абонементы»."""
+        if sub is None:
+            sub = self.selected_subscription()
         if sub is None:
             announce(self,
                      "Чтобы выгрузить абонемент, открой вкладку действующих "
@@ -2036,7 +2244,8 @@ class MainWindow(QMainWindow):
                      assertive=True)
             return
         announce(self, f"Абонемент {sub.student} выгружен в файл "
-                       f"{path.name}, он лежит в папке Дата.", assertive=True)
+                       f"{path.name}. Он лежит в папке Данные, внутри "
+                       f"папки Абонементы.", assertive=True)
 
     def refresh_all(self) -> None:
         self.refresh_students()
@@ -2081,10 +2290,15 @@ class MainWindow(QMainWindow):
         sub_tip = (f"{sub_keys} — выгрузить выбранный абонемент "
                    f"в текстовый файл." if sub_keys
                    else "Выгрузка абонемента в текстовый файл без клавиши.")
+        sub_menu = ("Правый щелчок или клавиша «Меню» на клавиатуре "
+                    "открывает меню абонемента: редактировать, удалить, "
+                    "экспортировать.")
         self.active_subs_hint.setText(
-            "Все действующие абонементы, новые сверху. " + sub_tip)
+            "Все действующие абонементы, новые сверху. " + sub_tip + " "
+            + sub_menu)
         self.finished_subs_hint.setText(
-            "Все законченные абонементы, новые сверху. " + sub_tip)
+            "Все законченные абонементы, новые сверху. " + sub_tip + " "
+            + sub_menu)
         card_keys = norm_keys(self.bindings.get("card", ""))
         self.card_button.setText(
             f"Карточка ученика ({card_keys})" if card_keys

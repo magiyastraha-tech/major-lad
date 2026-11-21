@@ -33,6 +33,8 @@ from . import dates, mirror, paths
 DB_FILE = "Мажорный лад Расписание.db"
 BACKUP_DIR = "Резерв"
 ARCHIVE_DIR = "Архив старой версии"
+# Выгруженные абонементы лежат отдельной папкой внутри `Data`.
+SUBS_DIR = "Абонементы"
 BACKUP_KEEP = 14
 SCHEMA_VERSION = 3
 
@@ -579,6 +581,7 @@ class Store:
         lines.append(f"Заработано за {month} {today.year}: "
                      f"{money(self.earned_in_month(today.year, today.month))} "
                      f"рублей.")
+        target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.parent / (target.name + ".tmp")
         tmp.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
         os.replace(tmp, target)
@@ -603,7 +606,7 @@ class Store:
             for bad in '<>:"/\\|?*':
                 name = name.replace(bad, "-")
             name = name.strip().strip(".") or "Без имени"
-            target = self.folder / (
+            target = self.folder / SUBS_DIR / (
                 f"Абонемент {name} {dates.fmt_date(sub.bought)}.txt")
         lines = ["Мажорный лад Расписание. Абонемент.", ""]
         lines.append(f"Ученик: {sub.student}.")
@@ -633,6 +636,7 @@ class Store:
                 lines.append(f"{when}, {lesson.status}.")
         else:
             lines.append("Уроков в этом абонементе пока нет.")
+        target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.parent / (target.name + ".tmp")
         tmp.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
         os.replace(tmp, target)
@@ -744,6 +748,51 @@ class Store:
         self.subscriptions.append(item)
         self.save_subscriptions()
         return item
+
+    def update_subscription(self, sub: Subscription) -> bool:
+        """Сохранить правки абонемента. Проверяет то, что можно сломать.
+
+        Уроков не может быть меньше, чем уже проведено, и действующий
+        абонемент у ученика бывает только один — иначе уроки непонятно из
+        чего списывать. Ошибку отдаём ValueError с готовой фразой для
+        человека. Возвращаем True, если абонемент сам закрылся: уроки
+        досчитались до конца.
+        """
+        if sub.total > 0 and sub.total < sub.used:
+            raise ValueError(
+                f"В абонементе уже проведено {sub.used} "
+                f"{lessons_word(sub.used)}. Поставь уроков не меньше, "
+                f"или ноль — тогда без ограничения.")
+        if not sub.finished:
+            for other in self.subscriptions:
+                if (other.uid != sub.uid and other.student == sub.student
+                        and not other.finished):
+                    raise ValueError(
+                        f"У ученика уже есть действующий абонемент от "
+                        f"{dates.fmt_date(other.bought)}. Сначала отметь "
+                        f"его законченным в карточке ученика.")
+        closed = (not sub.finished and sub.total > 0
+                  and sub.used >= sub.total)
+        if closed:
+            sub.finished = True
+        self.save_subscriptions()
+        return closed
+
+    def delete_subscription(self, sub: Subscription) -> None:
+        """Удалить абонемент совсем.
+
+        Сначала из него надо убрать уроки: иначе они остались бы ни при
+        чём, а счётчики разъехались. Оплаты в журнале остаются — деньги
+        были настоящими.
+        """
+        count = len(self.subscription_lessons(sub))
+        if count:
+            raise ValueError(
+                f"В абонементе записано {count} {lessons_word(count)}. "
+                f"Сначала убери уроки в карточке ученика, потом удаляй.")
+        self.subscriptions = [s for s in self.subscriptions
+                              if s.uid != sub.uid]
+        self.save_subscriptions()
 
     def current_subscription(self, student: str) -> Subscription | None:
         """Действующий абонемент: последний незаконченный."""
