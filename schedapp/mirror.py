@@ -72,10 +72,10 @@ def _student_lines(store, student) -> list[str]:
         lines.append(f"Заметка: {student.note}.")
     lines.append("")
     if sub is None:
-        lines.append("Абонемент: нет.")
+        lines.append("Действующий абонемент: нет.")
     else:
         start = sub.started or sub.bought
-        lines.append("Абонемент.")
+        lines.append("Действующий абонемент.")
         lines.append(f"Куплен: {dates.fmt_date(sub.bought)}.")
         lines.append(f"Действует с: {dates.fmt_date(start)}.")
         lines.append(f"Уроков в абонементе: {sub.total}.")
@@ -83,6 +83,19 @@ def _student_lines(store, student) -> list[str]:
         lines.append(f"Осталось: {sub.left}.")
         if sub.price:
             lines.append(f"Стоимость: {_money(sub.price)} рублей.")
+    lines.append("")
+    history = store.finished_subscriptions(student.name)
+    if not history:
+        lines.append("Законченных абонементов: нет.")
+    else:
+        lines.append(f"Законченных абонементов: {len(history)}.")
+        for item in history:
+            tail = f"Стоимость: {_money(item.price)} рублей." if item.price else ""
+            lines.append(
+                f"Законченный абонемент с {dates.fmt_date(item.begins)}: "
+                f"уроки {item.used} из {item.total}, куплен "
+                f"{dates.fmt_date(item.bought)}."
+                + (f" {tail}" if tail else ""))
     lines.append("")
     if near is not None:
         lines.append(f"Ближайший урок: {dates.human_date(near.day)}, "
@@ -140,14 +153,35 @@ def _total_at(subscriptions, day: date) -> int:
 
 
 def _counters(store) -> dict[int, tuple[int, int]]:
-    """Номер урока и размер абонемента для каждого проведённого урока."""
+    """Номер урока и размер абонемента для каждого проведённого урока.
+
+    Урок, записанный в абонемент, считается внутри своего абонемента:
+    у законченного счётчик идёт от 1 до его размера, и в действующем
+    номера не продолжают номера старого. Уроки до версии 0.3.0 привязки
+    не имеют — для них номер по-прежнему считается по датам.
+    """
     result: dict[int, tuple[int, int]] = {}
-    names = {lesson.student for lesson in store.lessons}
+    subs_by_uid = {s.uid: s for s in store.subscriptions}
+    linked = sorted(
+        [l for l in store.lessons
+         if l.status == DONE_STATUS and l.subscription],
+        key=lambda l: l.stamp)
+    per_sub: dict[int, int] = {}
+    for lesson in linked:
+        sub = subs_by_uid.get(lesson.subscription)
+        if sub is None:
+            continue
+        per_sub[sub.uid] = per_sub.get(sub.uid, 0) + 1
+        result[lesson.uid] = (per_sub[sub.uid], int(sub.total))
+
+    names = {lesson.student for lesson in store.lessons
+             if lesson.status == DONE_STATUS and not lesson.subscription}
     for name in names:
         subs = [s for s in store.subscriptions if s.student == name]
         done = sorted(
             [l for l in store.lessons
-             if l.student == name and l.status == DONE_STATUS],
+             if l.student == name and l.status == DONE_STATUS
+             and not l.subscription],
             key=lambda l: l.stamp)
         count = 0
         for lesson in done:
@@ -189,7 +223,10 @@ def _schedule_lines(store, today: date) -> list[str]:
         lines.append("Уроков не записано.")
         return lines
     for lesson in lessons:
-        lines.append(f"{dates.fmt_date(lesson.day)}, {lesson.time}, "
+        when = dates.fmt_date(lesson.day)
+        if lesson.time:
+            when += f", {lesson.time}"
+        lines.append(f"{when}, "
                      f"{lesson.student}, {lesson.direction.casefold()}, "
                      f"{lesson.lesson_format.casefold()}, {lesson.status}.")
     return lines

@@ -1,15 +1,20 @@
 """Звуки программы.
 
 Три звука: напоминание, начало урока, конец урока. При первом запуске
-программа сама кладёт в папку `Sound` простые WAV-файлы, чтобы было что
-услышать сразу. Свой звук — это замена файла с тем же именем: программа
-читает файл заново на каждое событие, перезапускать её не нужно.
+программа сама кладёт в папку `Data/Sound` простые WAV-файлы, чтобы было
+что услышать сразу. Свой звук — это замена файла с тем же именем:
+программа читает файл заново на каждое событие, перезапускать её не нужно.
+
+Звуки раньше лежали в папке `Sound` рядом с exe. При запуске версии 0.3.0
+файлы оттуда один раз переносятся в `Data/Sound`; уже существующие в новой
+папке не перезаписываются, а старая папка удаляется, только если опустела.
 
 Если файла нет или он не читается, вызывающий включает системный писк.
 """
 from __future__ import annotations
 
 import math
+import shutil
 import wave
 from array import array
 from pathlib import Path
@@ -89,12 +94,43 @@ def _wav_bytes(melody) -> bytes:
     return buffer.getvalue()
 
 
+def _move_old_sounds(target: Path) -> None:
+    """Перенести звуки из старого `Sound` рядом с exe в `Data/Sound`.
+
+    Свой звук пользователя важнее: если файл с таким именем в новой папке
+    уже есть, старый остаётся на месте. Старую папку убираем, только когда
+    она опустела, — чужие файлы там не трогаем.
+    """
+    old = paths.legacy_sound_dir()
+    if old == target or not old.is_dir():
+        return
+    for item in old.iterdir():
+        destination = target / item.name
+        if destination.exists() or not item.is_file():
+            continue
+        try:
+            shutil.move(str(item), str(destination))
+        except OSError:
+            continue
+    try:
+        if not any(old.iterdir()):
+            old.rmdir()
+    except OSError:
+        pass
+
+
 def ensure(folder: Path | None = None) -> None:
     """Создать папку звуков и недостающие файлы по умолчанию.
 
     Существующие файлы не трогаются: там может быть уже свой звук.
     """
     target = Path(folder) if folder is not None else paths.sound_dir()
+    if folder is None:
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            _move_old_sounds(target)
+        except OSError:
+            pass
     try:
         target.mkdir(parents=True, exist_ok=True)
         for kind, name in FILES.items():
