@@ -11,19 +11,20 @@ from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QDate, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon,
-                           QKeySequence, QPainter, QPixmap)
+                           QKeyCombination, QKeySequence, QPainter, QPixmap,
+                           QShortcut)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
-    QFormLayout, QGridLayout, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
+    QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget, QSystemTrayIcon,
+    QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget, QSystemTrayIcon,
 )
 
 from . import __version__, dates, settings, sounds, store as data, updater
 from .reminders import ReminderService, soon_text
 from .store import (DIRECTIONS, FORMATS, LESSON_CANCELLED, LESSON_DONE,
                     LESSON_WAIT, SERVICES, Store, money, plural)
-from .uikit import Announcer, ShortcutFilter, announce, key_text
+from .uikit import Announcer, announce, key_text
 
 WEEK_LABELS = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница",
                "Суббота", "Воскресенье")
@@ -684,6 +685,125 @@ class DoneLessonDialog(QDialog):
         self.accept()
 
 
+class LessonPickDialog(QDialog):
+    """Выбрать проведённый урок абонемента — для правки или удаления."""
+
+    def __init__(self, store: Store, sub: data.Subscription, title: str,
+                 ok_text: str, parent=None):
+        super().__init__(parent)
+        self.lessons = store.done_lessons(sub)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        if sub.total:
+            tail = f"уроки {sub.used} из {sub.total}"
+        else:
+            tail = f"всего уроков {sub.used}"
+        text = (f"{sub.student}, абонемент с {dates.fmt_date(sub.begins)}, "
+                f"{tail}. Выбери урок в списке.")
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setAccessibleName(text)
+        lay.addWidget(label)
+
+        self.pick = QComboBox()
+        self.pick.setAccessibleName("Урок")
+        for lesson in self.lessons:
+            when = dates.fmt_date(lesson.day)
+            if lesson.time:
+                when += f" в {lesson.time}"
+            self.pick.addItem(when, lesson)
+        lay.addWidget(self.pick)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(ok_text)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def chosen(self) -> data.Lesson | None:
+        return self.pick.currentData()
+
+
+class LessonEditDialog(QDialog):
+    """Правка проведённого урока: дата и, если нужно, время."""
+
+    def __init__(self, lesson: data.Lesson, parent=None):
+        super().__init__(parent)
+        self.lesson = lesson
+        self.new_day: date | None = None
+        self.new_time = ""
+        self.setWindowTitle("Редактировать урок")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        text = f"Урок {dates.fmt_date(lesson.day)}"
+        if lesson.time:
+            text += f" в {lesson.time}"
+        text += f". Ученик {lesson.student}."
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setAccessibleName(text)
+        lay.addWidget(label)
+
+        form = QFormLayout()
+        self.day = make_date_edit("Дата урока", lesson.day)
+        form.addRow("Дата урока", self.day)
+
+        hour, minute = 18, 0
+        if lesson.time:
+            try:
+                hour, minute = (int(part) for part in lesson.time.split(":", 1))
+            except ValueError:
+                hour, minute = 18, 0
+        self.has_time = QCheckBox("Указать время урока")
+        self.has_time.setAccessibleName("Указать время урока")
+        self.has_time.setChecked(bool(lesson.time))
+        form.addRow(self.has_time)
+
+        row = QHBoxLayout()
+        self.hour = QSpinBox()
+        self.hour.setRange(0, 23)
+        self.hour.setValue(hour)
+        self.hour.setAccessibleName("Час урока")
+        self.minute = QSpinBox()
+        self.minute.setRange(0, 59)
+        self.minute.setValue(minute)
+        self.minute.setAccessibleName("Минуты урока")
+        row.addWidget(self.hour)
+        row.addWidget(QLabel("часов"))
+        row.addWidget(self.minute)
+        row.addWidget(QLabel("минут"))
+        row.addStretch(1)
+        form.addRow("Время", row)
+        lay.addLayout(form)
+
+        self.has_time.toggled.connect(self.hour.setEnabled)
+        self.has_time.toggled.connect(self.minute.setEnabled)
+        self.hour.setEnabled(self.has_time.isChecked())
+        self.minute.setEnabled(self.has_time.isChecked())
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _save(self) -> None:
+        day = picked_date(self.day)
+        if day > date.today():
+            announce(self, "Дата урока не может быть в будущем: урок уже прошёл.",
+                     assertive=True)
+            return
+        self.new_day = day
+        self.new_time = (dates.fmt_time(self.hour.value(), self.minute.value())
+                         if self.has_time.isChecked() else "")
+        self.accept()
+
+
 class StudentCard(QDialog):
     """Карточка ученика: действующий абонемент и законченные в двух вкладках."""
 
@@ -714,6 +834,14 @@ class StudentCard(QDialog):
         self.active_done_button = QPushButton("Добавить проведённый урок")
         self.active_done_button.clicked.connect(self.add_done_lesson)
         active_lay.addWidget(self.active_done_button)
+        self.active_edit_button = QPushButton("Редактировать урок")
+        self.active_edit_button.setAccessibleName("Редактировать урок")
+        self.active_edit_button.clicked.connect(self.edit_active_lesson)
+        active_lay.addWidget(self.active_edit_button)
+        self.active_delete_button = QPushButton("Удалить урок")
+        self.active_delete_button.setAccessibleName("Удалить урок")
+        self.active_delete_button.clicked.connect(self.delete_active_lesson)
+        active_lay.addWidget(self.active_delete_button)
         self.new_sub_button = QPushButton("Добавить новый абонемент")
         self.new_sub_button.clicked.connect(self.add_new_subscription)
         active_lay.addWidget(self.new_sub_button)
@@ -734,6 +862,14 @@ class StudentCard(QDialog):
         self.old_done_button = QPushButton("Добавить проведённый урок")
         self.old_done_button.clicked.connect(self.add_old_done_lesson)
         history_lay.addWidget(self.old_done_button)
+        self.old_edit_button = QPushButton("Редактировать урок")
+        self.old_edit_button.setAccessibleName("Редактировать урок")
+        self.old_edit_button.clicked.connect(self.edit_old_lesson)
+        history_lay.addWidget(self.old_edit_button)
+        self.old_delete_button = QPushButton("Удалить урок")
+        self.old_delete_button.setAccessibleName("Удалить урок")
+        self.old_delete_button.clicked.connect(self.delete_old_lesson)
+        history_lay.addWidget(self.old_delete_button)
         self.old_sub_button = QPushButton("Добавить законченный абонемент")
         self.old_sub_button.clicked.connect(self.add_old_subscription)
         history_lay.addWidget(self.old_sub_button)
@@ -806,6 +942,9 @@ class StudentCard(QDialog):
         self.active_info.setAccessibleName(active)
         self.active_done_button.setEnabled(
             sub is not None and (not sub.total or sub.left > 0))
+        has_done = sub is not None and bool(self.store.done_lessons(sub))
+        self.active_edit_button.setEnabled(has_done)
+        self.active_delete_button.setEnabled(has_done)
 
         history = self.store.finished_subscriptions(self.student.name)
         if not history:
@@ -841,6 +980,9 @@ class StudentCard(QDialog):
         sub = self.history_pick.currentData()
         self.old_done_button.setEnabled(
             sub is not None and (not sub.total or sub.left > 0))
+        has_done = sub is not None and bool(self.store.done_lessons(sub))
+        self.old_edit_button.setEnabled(has_done)
+        self.old_delete_button.setEnabled(has_done)
 
     def _done(self, message: str) -> None:
         self.changed = True
@@ -903,6 +1045,92 @@ class StudentCard(QDialog):
             text = (f"Урок {dates.fmt_date(dialog.day_value)} записан. "
                     f"Всего уроков {sub.used}.")
         self._done(text)
+
+    @staticmethod
+    def _sub_tail(sub: data.Subscription) -> str:
+        if sub.total:
+            return f" В абонементе уроки {sub.used} из {sub.total}."
+        return f" Всего уроков {sub.used}."
+
+    def edit_active_lesson(self) -> None:
+        sub = self.store.current_subscription(self.student.name)
+        if sub is None:
+            announce(self, "Действующего абонемента нет.")
+            return
+        self._edit_lesson(sub)
+
+    def edit_old_lesson(self) -> None:
+        sub = self.history_pick.currentData()
+        if sub is None:
+            announce(self, "Сначала выбери законченный абонемент в списке.")
+            return
+        self._edit_lesson(sub)
+
+    def delete_active_lesson(self) -> None:
+        sub = self.store.current_subscription(self.student.name)
+        if sub is None:
+            announce(self, "Действующего абонемента нет.")
+            return
+        self._delete_lesson(sub)
+
+    def delete_old_lesson(self) -> None:
+        sub = self.history_pick.currentData()
+        if sub is None:
+            announce(self, "Сначала выбери законченный абонемент в списке.")
+            return
+        self._delete_lesson(sub)
+
+    def _pick_done_lesson(self, sub: data.Subscription, title: str,
+                          ok_text: str) -> data.Lesson | None:
+        if not self.store.done_lessons(sub):
+            announce(self, "В этом абонементе нет проведённых уроков.")
+            return None
+        dialog = LessonPickDialog(self.store, sub, title, ok_text, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.chosen()
+
+    def _edit_lesson(self, sub: data.Subscription) -> None:
+        lesson = self._pick_done_lesson(sub, "Редактировать урок",
+                                        "Редактировать")
+        if lesson is None:
+            announce(self, "Урок не изменён.")
+            return
+        dialog = LessonEditDialog(lesson, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Урок не изменён.")
+            return
+        new_day = dialog.new_day or lesson.day
+        new_time = dialog.new_time
+        if new_day == lesson.day and new_time == lesson.time:
+            announce(self, "Урок не изменён.")
+            return
+        for other in self.store.done_lessons(sub):
+            if other is not lesson and other.day == new_day:
+                announce(self, f"На {dates.fmt_date(new_day)} в этом абонементе "
+                               f"уже есть урок. Выбери другую дату.",
+                         assertive=True)
+                return
+        old_text = dates.fmt_date(lesson.day)
+        lesson.day = new_day
+        lesson.time = new_time
+        self.store.update_lesson(lesson)
+        when = dates.fmt_date(new_day)
+        if new_time:
+            when += f" в {new_time}"
+        self._done(f"Урок {old_text} изменён: теперь {when}."
+                   f"{self._sub_tail(sub)}")
+
+    def _delete_lesson(self, sub: data.Subscription) -> None:
+        lesson = self._pick_done_lesson(sub, "Удалить урок", "Удалить")
+        if lesson is None:
+            announce(self, "Урок не удалён.")
+            return
+        when = dates.fmt_date(lesson.day)
+        if lesson.time:
+            when += f" в {lesson.time}"
+        self.store.delete_lesson(lesson)
+        self._done(f"Урок {when} удалён.{self._sub_tail(sub)}")
 
     def confirm_lesson(self) -> None:
         name = self.student.name
@@ -1048,8 +1276,70 @@ class UpdateWorker(QThread):
             self.failed.emit(f"Обновление не удалось: {error}")
 
 
+def norm_keys(text: str) -> str:
+    """Клавиши единой записью: «ctrl+p», «Ctrl+P» и «CTRL+P» — одно и то же."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    sequence = QKeySequence(text)
+    return key_text(sequence) if not sequence.isEmpty() else ""
+
+
+def section_label(text: str) -> QLabel:
+    """Заголовок раздела настроек — жирный и крупнее обычного текста."""
+    label = QLabel(text)
+    font = label.font()
+    font.setBold(True)
+    font.setPointSize(font.pointSize() + 2)
+    label.setFont(font)
+    label.setAccessibleName(f"Раздел {text}")
+    return label
+
+
+class KeyCaptureDialog(QDialog):
+    """Ждёт одно сочетание клавиш: нажал — назначено.
+
+    Окно открывается уже в режиме записи, поэтому не нужно попадать
+    курсором в поле: диктор говорит, что делать, а первое нажатие с
+    модификаторами становится новыми клавишами действия.
+    """
+
+    def __init__(self, title: str, current: str = "", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.keys = current
+        self.setWindowTitle("Назначить клавиши")
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        text = (f"Нажми сочетание клавиш для действия «{title}». "
+                "Escape — отмена, Backspace — оставить без клавиши.")
+        hint = QLabel(text)
+        hint.setWordWrap(True)
+        hint.setAccessibleName(text)
+        lay.addWidget(hint)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt)
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.reject()
+            return
+        if key in (0, Qt.Key.Key_Backspace):
+            self.keys = ""
+            self.accept()
+            return
+        if key in (Qt.Key.Key_Unknown, Qt.Key.Key_Shift, Qt.Key.Key_Control,
+                   Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_AltGr):
+            return
+        mods = event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                    | Qt.KeyboardModifier.ShiftModifier
+                                    | Qt.KeyboardModifier.AltModifier
+                                    | Qt.KeyboardModifier.MetaModifier)
+        self.keys = key_text(QKeySequence(QKeyCombination(mods, Qt.Key(key))))
+        self.accept()
+
+
 class SettingsDialog(QDialog):
-    """Настройки: обновление программы и сочетания клавиш."""
+    """Настройки: «Общее» и «Сочетания клавиш» одним столбцом, без вкладок."""
 
     bindings_changed = Signal(dict)
 
@@ -1059,15 +1349,20 @@ class SettingsDialog(QDialog):
         self.bindings = dict(bindings)
         self._worker: UpdateWorker | None = None
         self.setWindowTitle("Настройки")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
+        self.resize(600, 700)
 
-        lay = QVBoxLayout(self)
-        tabs = QTabWidget(self)
-        lay.addWidget(tabs, 1)
-
-        # --- общее
+        outer = QVBoxLayout(self)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setAccessibleName("Настройки программы")
         page = QWidget()
         column = QVBoxLayout(page)
+        area.setWidget(page)
+        outer.addWidget(area, 1)
+
+        # --- общее
+        column.addWidget(section_label("Общее"))
         version = QLabel(f"Версия программы {__version__}.")
         version.setAccessibleName(f"Версия программы {__version__}")
         column.addWidget(version)
@@ -1089,27 +1384,23 @@ class SettingsDialog(QDialog):
         folder = QPushButton("Открыть папку Данные")
         folder.clicked.connect(self.open_data_folder)
         column.addWidget(folder)
-        column.addStretch(1)
-        tabs.addTab(page, "Общее")
 
         # --- сочетания клавиш
-        page = QWidget()
-        column = QVBoxLayout(page)
-        hint = QLabel("Поставь курсор в поле действия и нажми нужные клавиши. "
-                      "Пустое поле — действие без клавиши.")
+        column.addSpacing(12)
+        column.addWidget(section_label("Сочетания клавиш"))
+        hint = QLabel("Нажми на действие, затем нажми нужное сочетание "
+                      "клавиш. Backspace оставляет действие без клавиши.")
         hint.setWordWrap(True)
         column.addWidget(hint)
 
-        form = QFormLayout()
-        self.edits: dict[str, QKeySequenceEdit] = {}
+        self.key_buttons: dict[str, QPushButton] = {}
         for code, title, _keys in settings.ACTIONS:
-            edit = QKeySequenceEdit()
-            edit.setMaximumSequenceLength(1)
-            edit.setAccessibleName(title)
-            edit.setKeySequence(QKeySequence(self.bindings.get(code, "")))
-            self.edits[code] = edit
-            form.addRow(title, edit)
-        column.addLayout(form)
+            button = QPushButton()
+            button.clicked.connect(
+                lambda _checked=False, c=code: self.assign_key(c))
+            self.key_buttons[code] = button
+            column.addWidget(button)
+        self._show_keys()
         column.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -1122,8 +1413,7 @@ class SettingsDialog(QDialog):
         reset = buttons.addButton(
             "Сбросить по умолчанию", QDialogButtonBox.ButtonRole.ResetRole)
         reset.clicked.connect(self.reset_bindings)
-        column.addWidget(buttons)
-        tabs.addTab(page, "Сочетания клавиш")
+        outer.addWidget(buttons)
 
     # --- подписка на обновления ------------------------------------------
 
@@ -1183,9 +1473,42 @@ class SettingsDialog(QDialog):
 
     # --- клавиши ----------------------------------------------------------
 
+    def _show_keys(self) -> None:
+        """Каждая кнопка называет действие и его клавиши — как в дикторе."""
+        for code, title, _keys in settings.ACTIONS:
+            keys = norm_keys(self.bindings.get(code, ""))
+            text = f"{title}: {keys}" if keys else f"{title}: без клавиши"
+            button = self.key_buttons[code]
+            button.setText(text)
+            button.setAccessibleName(f"{text}. Нажми, чтобы назначить клавиши")
+
+    def assign_key(self, code: str) -> None:
+        """Поймать новое сочетание: нажал — оно и назначено."""
+        title = settings.TITLES[code]
+        dialog = KeyCaptureDialog(title, self.bindings.get(code, ""), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Клавиши не изменены.")
+            return
+        keys = norm_keys(dialog.keys)
+        if keys:
+            other = next((c for c, k in self.bindings.items()
+                          if c != code and norm_keys(k) == keys), None)
+            if other is not None:
+                announce(self, f"Клавиша {keys} уже занята действием "
+                               f"«{settings.TITLES[other]}». Сначала освободи её.",
+                         assertive=True)
+                return
+            announce(self, f"{title}: {keys}. Нажми «Сохранить», чтобы применить.",
+                     assertive=True)
+        else:
+            announce(self, f"{title}: без клавиши. Нажми «Сохранить», "
+                           f"чтобы применить.", assertive=True)
+        self.bindings[code] = keys
+        self._show_keys()
+
     def reset_bindings(self) -> None:
-        for code, keys in settings.defaults().items():
-            self.edits[code].setKeySequence(QKeySequence(keys))
+        self.bindings = settings.defaults()
+        self._show_keys()
         announce(self, "Расставлены клавиши по умолчанию. "
                        "Нажми «Сохранить», чтобы применить.")
 
@@ -1193,14 +1516,13 @@ class SettingsDialog(QDialog):
         result: dict[str, str] = {}
         seen: dict[str, str] = {}
         for code, title, _keys in settings.ACTIONS:
-            text = key_text(self.edits[code].keySequence())
+            text = norm_keys(self.bindings.get(code, ""))
             if text:
                 other = seen.get(text)
                 if other is not None:
                     announce(self, f"Клавиша {text} назначена дважды: "
                                    f"{other} и {title}. Поменяй одну.",
                              assertive=True)
-                    self.edits[code].setFocus()
                     return
                 seen[text] = title
             result[code] = text
@@ -1270,8 +1592,9 @@ class MainWindow(QMainWindow):
         self.update_hints()
 
         # --- горячие клавиши на всё приложение
-        self._filter = ShortcutFilter(self.hotkey, self.bindings, self)
-        QApplication.instance().installEventFilter(self._filter)
+        self._settings_open = False
+        self._shortcuts: list[QShortcut] = []
+        self.install_shortcuts()
 
         # --- напоминания
         self.reminders = ReminderService(self.store, self)
@@ -1349,7 +1672,7 @@ class MainWindow(QMainWindow):
         """Подсказки и кнопки называют те клавиши, что стоят сейчас."""
         pieces = []
         for code, title, _keys in settings.ACTIONS:
-            keys = self.bindings.get(code, "")
+            keys = norm_keys(self.bindings.get(code, ""))
             if keys:
                 pieces.append(f"{keys} — {title.casefold()}")
         tail = " ".join(pieces)
@@ -1357,32 +1680,61 @@ class MainWindow(QMainWindow):
             "Стрелки вверх и вниз — переход по ученикам. " + tail)
         self.schedule_hint.setText(
             "Стрелки вверх и вниз — уроки по порядку. " + tail)
-        card_keys = self.bindings.get("card", "")
+        card_keys = norm_keys(self.bindings.get("card", ""))
         self.card_button.setText(
             f"Карточка ученика ({card_keys})" if card_keys
             else "Карточка ученика")
-        settings_keys = self.bindings.get("settings", "")
+        settings_keys = norm_keys(self.bindings.get("settings", ""))
         self.settings_button.setText(
             f"Настройки ({settings_keys})" if settings_keys else "Настройки")
 
+    def install_shortcuts(self) -> None:
+        """Собрать горячие клавиши заново по текущим настройкам.
+
+        Родные ярлыки Qt (QShortcut) понимают раскладку клавиатуры,
+        цифровую клавиатуру и всплывающие окна. Пока открыты настройки,
+        они выключены: иначе назначение клавиши запускало бы команду.
+        """
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(False)
+            shortcut.deleteLater()
+        self._shortcuts = []
+        enabled = not self._settings_open
+        for code, _title, _keys in settings.ACTIONS:
+            text = norm_keys(self.bindings.get(code, ""))
+            if not text:
+                continue
+            sequence = QKeySequence(text)
+            if sequence.isEmpty():
+                continue
+            shortcut = QShortcut(sequence, self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(lambda c=code: self.hotkey(c))
+            shortcut.setEnabled(enabled)
+            self._shortcuts.append(shortcut)
+
     def apply_bindings(self, bindings: dict[str, str]) -> None:
         self.bindings = dict(bindings)
-        self._filter.set_bindings(self.bindings)
+        self.install_shortcuts()
         self.update_hints()
 
     def open_settings(self) -> None:
-        # Окно настроек модальное, но перехват клавиш работает и внутри
-        # него: без этого флага F10 открыл бы второе такое же окно.
+        # Окно настроек модальное, но ярлыки живут на всё приложение:
+        # пока оно открыто, они выключены, чтобы новая клавиша не
+        # сработала командой в момент назначения.
         if getattr(self, "_settings_open", False):
             return
-        dialog = SettingsDialog(self.store, self.bindings, self)
-        dialog.bindings_changed.connect(self.apply_bindings)
-        announce(dialog, f"Настройки. Версия программы {__version__}.")
         self._settings_open = True
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(False)
         try:
+            dialog = SettingsDialog(self.store, self.bindings, self)
+            dialog.bindings_changed.connect(self.apply_bindings)
+            announce(dialog, f"Настройки. Версия программы {__version__}.")
             dialog.exec()
         finally:
             self._settings_open = False
+            self.install_shortcuts()
         self.students_list.setFocus()
 
     # --- действия ---------------------------------------------------------

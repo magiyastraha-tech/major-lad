@@ -24,8 +24,13 @@ ACTIONS = (
     ("tomorrow", "Уроки на завтра", "F4"),
     ("earnings", "Заработок за месяц", "F5"),
     ("export", "Выгрузить данные в текст", "F9"),
-    ("settings", "Настройки", "F10"),
+    ("settings", "Настройки", "Ctrl+P"),
 )
+
+# Раньше настройки открывались по F10. Если в файле так и осталось —
+# подставляем новую клавишу, иначе Ctrl+P не заработает у тех, кто уже
+# запускал программу. Если человек выбрал что-то своё — не трогаем.
+OLD_SETTINGS_KEY = "F10"
 
 CODES = tuple(code for code, _, _ in ACTIONS)
 TITLES = {code: title for code, title, _ in ACTIONS}
@@ -55,6 +60,8 @@ def load(folder: Path) -> dict[str, str]:
         code = code.strip()
         if code in CODES:
             result[code] = keys.split("#", 1)[0].strip()
+    if result["settings"] == OLD_SETTINGS_KEY:
+        result["settings"] = defaults()["settings"]
     return result
 
 

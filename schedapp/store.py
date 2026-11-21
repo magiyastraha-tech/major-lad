@@ -772,6 +772,44 @@ class Store:
     def update_lesson(self, lesson: Lesson) -> None:
         self.save_lessons()
 
+    def subscription_by_uid(self, uid: int) -> Subscription | None:
+        for sub in self.subscriptions:
+            if sub.uid == uid:
+                return sub
+        return None
+
+    def done_lessons(self, sub: Subscription) -> list[Lesson]:
+        """Проведённые уроки абонемента по датам — для правки и удаления."""
+        return sorted((l for l in self.lessons
+                       if l.subscription == sub.uid and l.status == LESSON_DONE),
+                      key=lambda l: (l.day, l.time))
+
+    def delete_lesson(self, lesson: Lesson) -> None:
+        """Убрать урок из журнала.
+
+        Если урок был проведён и привязан к абонементу — счётчик
+        возвращается на один назад. Абонемент, который закрылся только
+        потому, что уроки кончились, снова становится действующим: урок
+        удалили, значит, он снова не до конца пройден.
+        """
+        if lesson not in self.lessons:
+            return
+        self.lessons.remove(lesson)
+        if lesson.status != LESSON_DONE or not lesson.subscription:
+            self.save_lessons()
+            return
+        sub = self.subscription_by_uid(lesson.subscription)
+        if sub is not None:
+            was_full = sub.total > 0 and sub.used >= sub.total
+            sub.used = max(0, sub.used - 1)
+            if was_full:
+                mine = [s for s in self.subscriptions if s.student == sub.student]
+                latest = max(mine, key=lambda s: (s.bought, s.uid), default=None)
+                if latest is not None and latest.uid == sub.uid:
+                    sub.finished = False
+            self.save_subscriptions()
+        self.save_lessons()
+
     def lessons_between(self, start: date, end: date) -> list[Lesson]:
         return sorted(
             [l for l in self.lessons if start <= l.day <= end],
