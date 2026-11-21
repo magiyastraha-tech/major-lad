@@ -1506,7 +1506,9 @@ class UpdateWorker(QThread):
                     last = percent
                     self.percent.emit(percent)
 
-            path = updater.download(update["url"], on_progress, update["size"])
+            path = updater.download(
+                update["url"], on_progress, update["size"],
+                update.get("digest", ""))
             self.status.emit("Скачано. Устанавливаю новую версию.")
             ok, message = updater.install_and_restart(path)
             if ok:
@@ -1516,6 +1518,9 @@ class UpdateWorker(QThread):
         except updater.UpdateError as error:
             self.failed.emit(str(error))
         except Exception as error:  # noqa: BLE001 — поток не должен падать молча
+            # Непонятную ошибку пишем в журнал: по одной фразе в окне
+            # её потом не разобрать.
+            updater.log(f"Обновление не удалось: {error!r}")
             self.failed.emit(f"Обновление не удалось: {error}")
 
 

@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -133,6 +134,9 @@ def find_update(current: str) -> dict | None:
             "version": version,
             "url": asset.get("browser_download_url") or "",
             "size": int(asset.get("size") or 0),
+            # GitHub отдаёт sha256 файла — по нему видно, что скачалось
+            # ровно то, что выложено, а не огрызок или подмена.
+            "digest": str(asset.get("digest") or ""),
             "notes": str(release.get("body") or "").strip(),
         }
         if not candidate["url"]:
@@ -145,15 +149,55 @@ def find_update(current: str) -> dict | None:
 # --- скачивание -----------------------------------------------------------
 
 
-def download(url: str, on_progress=None, size_hint: int = 0) -> Path:
-    """Скачать exe с докачкой. on_progress(получено, всего)."""
+def check_file(path: Path, size_hint: int = 0, digest: str = "") -> str | None:
+    """Что не так со скачанным файлом; None — файл целый.
+
+    Три проверки, от простой к строгой: размер, начало exe-файла («MZ») и
+    sha256 из выпуска. Без них битая закачка доходила до запуска и падала
+    с непонятной ошибкой вроде «incorrect header check».
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        return f"файл не читается: {error}"
+    if size_hint and size != size_hint:
+        return f"размер {size} вместо {size_hint} байт"
+    try:
+        with path.open("rb") as file:
+            head = file.read(2)
+    except OSError as error:
+        return f"файл не читается: {error}"
+    if head != b"MZ":
+        return "это не программа Windows"
+    want = digest[len("sha256:"):].lower() if digest.startswith("sha256:") else ""
+    if want:
+        hasher = hashlib.sha256()
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        if hasher.hexdigest() != want:
+            return "контрольная сумма не совпала"
+    return None
+
+
+def download(url: str, on_progress=None, size_hint: int = 0,
+             digest: str = "") -> Path:
+    """Скачать exe с докачкой и проверить его. on_progress(получено, всего).
+
+    Битый файл не отдаём дальше: удаляем и качаем заново. Если после
+    восьми попыток файл так и не сошёлся с выпуском, обновление
+    отменяется — старая версия остаётся целой, а человек получает
+    понятную причину вместо ошибки распаковки.
+    """
     folder = Path(tempfile.gettempdir()) / TEMP_DIR
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / ASSET_NAME
     part = folder / (ASSET_NAME + ".part")
 
     last_error: Exception | None = None
+    corrupt = False
     for attempt in range(1, 9):
+        corrupt = False
         try:
             have = part.stat().st_size if part.exists() else 0
             if size_hint and have > size_hint:
@@ -185,13 +229,25 @@ def download(url: str, on_progress=None, size_hint: int = 0) -> Path:
                             on_progress(have, total)
             if total and have < total:
                 raise OSError("скачалось не всё")
+            problem = check_file(part, size_hint, digest)
+            if problem is not None:
+                # Докачка с битым началом уже не поможет: начинаем с нуля.
+                part.unlink(missing_ok=True)
+                corrupt = True
+                raise OSError(problem)
             os.replace(part, target)
             return target
         except (HTTPError, URLError, OSError) as error:
             last_error = error
+            log(f"Попытка {attempt}: {error}")
             if attempt == 8:
                 break
             time.sleep(min(15, 3 * attempt))
+    if corrupt:
+        raise UpdateError(
+            "Скачанный файл пришёл битым, поэтому обновление отменено — "
+            "старая версия работает. Скачай новую версию вручную со "
+            "страницы выпусков на GitHub.")
     raise UpdateError(f"Скачать обновление не удалось: {last_error}.")
 
 
