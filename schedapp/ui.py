@@ -2433,67 +2433,34 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def shift_lesson(self, lesson: data.Lesson) -> None:
-        """Сдвинуть урок и весь его график на ту же величину.
+        """Увести урок в конец графика по расписанию ученика.
 
-        Так переносят пропущенный вторник: урок со вторника уезжает,
-        например, на среду, и все следующие уроки этого графика тоже
-        сдвигаются на день вперёд — ритм занятий сохраняется.
+        Урок не сдвигается на день-два: он уезжает на ближайший день, в
+        который ученик и так занимается (вторник, пятница — как записано
+        в его графике), после последнего урока. Количество уроков остаётся
+        прежним, меняется только дата.
         """
-        dialog = LessonEditDialog(lesson, self, allow_future=True,
-                                  title="Перенести урок")
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            announce(self, "Урок не перенесён.")
+        target = data.plan_move_to_end(self.store.lessons, lesson)
+        if target is None:
+            announce(self, f"Не нашёл свободного дня по расписанию "
+                           f"{lesson.student}: ближайшие дни заняты. "
+                           f"Перенеси урок вручную — «Редактировать урок».",
+                     assertive=True)
             return
-        new_day = dialog.new_day or lesson.day
-        new_time = dialog.new_time
-        if new_day == lesson.day and new_time == lesson.time:
-            announce(self, "Урок не изменён.")
-            return
-        # Тот же график — уроки того же ученика с тем же абонементом
-        # после выбранного дня. Куда именно они уедут, считает хранилище.
-        moved = data.plan_shift(self.store.lessons, lesson, new_day, new_time)
-
-        # После сдвига уроки не должны лечь на чужое время того же ученика.
-        shifted = {id(lesson)} | {id(row) for row, _day, _time in moved}
-        for row, day, time in [(lesson, new_day, new_time)] + moved:
-            for other in self.store.lessons:
-                if (id(other) in shifted or other.student != row.student
-                        or other.day != day or other.time != time):
-                    continue
-                when = dates.fmt_date(day)
-                if time:
-                    when += f" в {time}"
-                announce(self, f"Не переношу: у {row.student} на {when} уже "
-                               f"есть другой урок. Выбери другое время.",
-                         assertive=True)
-                return
-
+        new_day, new_time = target
         old_when = dates.fmt_date(lesson.day)
         if lesson.time:
             old_when += f" в {lesson.time}"
         new_when = dates.fmt_date(new_day)
         if new_time:
             new_when += f" в {new_time}"
-        if moved:
-            last_day, last_time = max(
-                ((day, time) for _row, day, time in moved),
-                key=lambda item: (item[0], item[1]))
-            last_when = dates.fmt_date(last_day)
-            if last_time:
-                last_when += f" в {last_time}"
-            word = plural(len(moved), "урок", "урока", "уроков")
-            text = (f"Урок {lesson.student} перенесётся с {old_when} на "
-                    f"{new_when}. Вместе с ним сдвинутся ещё {len(moved)} "
-                    f"{word} этого графика, последний — на {last_when}. "
-                    f"Перенести?")
-        else:
-            text = (f"Урок {lesson.student} перенесётся с {old_when} на "
-                    f"{new_when}. Следующих уроков в этом графике нет — "
-                    f"сдвинется только он. Перенести?")
         box = QMessageBox(self)
         box.setWindowTitle("Перенести урок")
         box.setIcon(QMessageBox.Icon.Question)
-        box.setText(text)
+        box.setText(f"Урок {lesson.student} перенесётся с {old_when} на "
+                    f"{new_when} — в конец расписания, на привычный день "
+                    f"занятий ученика. Количество уроков не изменится. "
+                    f"Перенести?")
         box.setStandardButtons(QMessageBox.StandardButton.Yes
                                | QMessageBox.StandardButton.No)
         box.setDefaultButton(QMessageBox.StandardButton.No)
@@ -2503,17 +2470,9 @@ class MainWindow(QMainWindow):
 
         lesson.day = new_day
         lesson.time = new_time
-        for row, day, time in moved:
-            row.day = day
-            row.time = time
-        self.store.save_lessons()
-        result = (f"Урок {lesson.student} перенесён с {old_when} на "
-                  f"{new_when}.")
-        if moved:
-            word = plural(len(moved), "урок", "урока", "уроков")
-            result += (f" Вместе с ним сдвинулись ещё {len(moved)} {word}, "
-                       f"последний теперь {last_when}.")
-        announce(self, result)
+        self.store.update_lesson(lesson)
+        announce(self, f"Урок {lesson.student} перенесён с {old_when} на "
+                       f"{new_when}.")
         self.refresh_all()
 
     def toggle_lesson_done(self, lesson: data.Lesson) -> None:
@@ -3068,8 +3027,9 @@ class MainWindow(QMainWindow):
         self.schedule_hint.setText(
             "Стрелки вверх и вниз — уроки по порядку. Правый щелчок или "
             "клавиша «Меню» открывают меню урока: редактировать — "
-            "перенести один урок, перенести — сдвинуть урок вместе со "
-            "всем следующим графиком ученика, отметить урок проведённым, "
+            "перенести один урок на любую дату, перенести — увести урок "
+            "в конец графика на привычный день занятий ученика, отметить "
+            "урок проведённым, "
             "открыть карточку ученика, удалить. Двойной щелчок открывает "
             "карточку ученика. " + tail)
         sub_keys = norm_keys(self.bindings.get("subexport", ""))
