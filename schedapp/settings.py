@@ -29,6 +29,9 @@ DEFAULT_VOLUME = 80
 CUE_VOLUME_KEY = "cue_volume"
 DEFAULT_CUE_VOLUME = 70
 CUES_KEY = "cues"
+# Папка для копии базы в облаке (например, Диск O):
+#     cloud = O:\Мажорный лад
+CLOUD_KEY = "cloud"
 # Значения «включено» во всех написаниях, какие можно набрать в блокноте.
 CUES_ON = ("on", "вкл", "включено", "включены", "1", "да", "yes", "true")
 
@@ -129,9 +132,25 @@ def load_cues(folder: Path) -> bool:
     return _values(folder).get(CUES_KEY, "").casefold() in CUES_ON
 
 
+def load_cloud(folder: Path) -> Path | None:
+    """Папка для копий в облаке; пусто — копирование выключено."""
+    raw = _values(folder).get(CLOUD_KEY, "").strip()
+    return Path(raw) if raw else None
+
+
+def save_cloud(folder: Path, cloud: Path | str | None) -> Path:
+    """Записать только папку для копий, не трогая остальные настройки."""
+    values = _values(folder)
+    bindings = {code: values.get(code, keys)
+                for code, _title, keys in ACTIONS}
+    return save(folder, bindings, load_volume(folder),
+                load_cue_volume(folder), load_cues(folder),
+                cloud="" if not cloud else str(cloud))
+
+
 def save(folder: Path, bindings: dict[str, str],
          volume: int | None = None, cue_volume: int | None = None,
-         cues: bool | None = None) -> Path:
+         cues: bool | None = None, cloud: Path | str | None = None) -> Path:
     path = Path(folder) / FILE
     if volume is None:
         volume = load_volume(folder)
@@ -139,6 +158,8 @@ def save(folder: Path, bindings: dict[str, str],
         cue_volume = load_cue_volume(folder)
     if cues is None:
         cues = load_cues(folder)
+    if cloud is None:
+        cloud = load_cloud(folder) or ""
     lines = [HEADER]
     for code, title, _ in ACTIONS:
         lines.append(f"# {title}")
@@ -149,6 +170,8 @@ def save(folder: Path, bindings: dict[str, str],
     lines.append(f"{CUE_VOLUME_KEY} = {cue_volume_value(cue_volume)}")
     lines.append("# Подсказки времени урока: on — включены, off — выключены")
     lines.append(f"{CUES_KEY} = {'on' if cues else 'off'}")
+    lines.append("# Папка для копии в облаке (пусто — копирование выключено)")
+    lines.append(f"{CLOUD_KEY} = {cloud}")
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     tmp.replace(path)

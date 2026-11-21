@@ -247,6 +247,12 @@ class Store:
             self._conn.executescript(_SCHEMA)
         self._migrate()
         self.load()
+        # Номер сохранения — «часы» для синхронизации: по нему видно,
+        # чья копия в облаке свежее, не сверяя время на устройствах.
+        self.save_no = self._read_save_no()
+        # Сюда окно кладёт действие «положить копию в облако»; пусто —
+        # копирование выключено.
+        self.sync = None
         if migrated:
             self._import_legacy()
         # Счётчик уроков — это число уроков, записанных в абонемент, а не
@@ -333,12 +339,29 @@ class Store:
         except sqlite3.DatabaseError:
             return False
 
+    def _read_save_no(self) -> int:
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'save_no'").fetchone()
+            return int(row[0]) if row else 0
+        except (sqlite3.Error, TypeError, ValueError):
+            return 0
+
+    def set_save_no(self, value: int) -> None:
+        """Поставить номер сохранения (после взятия копии из облака)."""
+        self.save_no = max(0, int(value))
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES "
+                "('save_no', ?)", (str(self.save_no),))
+
     def _write(self, table: str, columns: tuple[str, ...],
                rows: list[tuple]) -> None:
         """Таблица переписывается целиком в одной транзакции.
 
         Данных немного (сотни строк), зато не бывает полузаписанного
-        состояния: либо вся таблица новая, либо вся старая.
+        состояния: либо вся таблица новая, либо вся старая. Номер
+        сохранения растёт здесь же — вместе с данными, одной транзакцией.
         """
         marks = ", ".join("?" for _ in columns)
         with self._conn:
@@ -346,6 +369,15 @@ class Store:
             self._conn.executemany(
                 f"INSERT INTO {table}({', '.join(columns)}) VALUES ({marks})",
                 rows)
+            self.save_no += 1
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES "
+                "('save_no', ?)", (str(self.save_no),))
+        if self.sync is not None:
+            try:
+                self.sync(self)
+            except Exception:  # noqa: BLE001 — копия не ломает сохранение
+                pass
 
     def load(self) -> None:
         self.students = [

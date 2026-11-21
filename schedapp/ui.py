@@ -16,13 +16,13 @@ from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon,
                            QKeySequence, QPainter, QPixmap, QShortcut)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
-    QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
     QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget, QSystemTrayIcon,
 )
 
 from . import (__version__, autostart, dates, services, settings, sounds,
-               store as data, updater)
+               store as data, sync, updater)
 from .reminders import ReminderService, service_text, soon_text
 from .store import (DIRECTIONS, FORMATS, LESSON_CANCELLED, LESSON_DONE,
                     LESSON_WAIT, SERVICES, Store, money, plural)
@@ -1617,6 +1617,8 @@ class SettingsDialog(QDialog):
     bindings_changed = Signal(dict)
     volume_changed = Signal(int)
     cue_volume_changed = Signal(int)
+    restored = Signal()
+    cloud_changed = Signal()
 
     def __init__(self, store: Store, bindings: dict[str, str],
                  volume: int = settings.DEFAULT_VOLUME,
@@ -1626,6 +1628,7 @@ class SettingsDialog(QDialog):
         self.bindings = dict(bindings)
         self.volume = settings.volume_value(volume)
         self.cue_volume = settings.cue_volume_value(cue_volume)
+        self.cloud = settings.load_cloud(store.folder)
         self._worker: UpdateWorker | None = None
         self._update_ready = False
         self.setWindowTitle("Настройки")
@@ -1664,6 +1667,41 @@ class SettingsDialog(QDialog):
         folder = QPushButton("Открыть папку Данные")
         folder.clicked.connect(self.open_data_folder)
         column.addWidget(folder)
+
+        # --- копия в облако
+        column.addSpacing(12)
+        column.addWidget(section_label("Копия в облако"))
+        cloud_hint = QLabel(
+            "Программа кладёт копию данных и настроек в облачную папку — "
+            "например, на Диск O. На другом устройстве с тем же облаком "
+            "открой настройки и нажми «Взять данные из копии».")
+        cloud_hint.setWordWrap(True)
+        column.addWidget(cloud_hint)
+
+        self.cloud_label = QLabel()
+        self.cloud_label.setWordWrap(True)
+        column.addWidget(self.cloud_label)
+
+        self.cloud_choose = QPushButton("Выбрать папку для копий")
+        self.cloud_choose.setAccessibleName("Выбрать папку для копий")
+        self.cloud_choose.clicked.connect(self.choose_cloud_folder)
+        column.addWidget(self.cloud_choose)
+
+        self.cloud_save = QPushButton("Сохранить копию сейчас")
+        self.cloud_save.setAccessibleName("Сохранить копию в облако сейчас")
+        self.cloud_save.clicked.connect(self.save_cloud_now)
+        column.addWidget(self.cloud_save)
+
+        self.cloud_check = QPushButton("Проверить копию")
+        self.cloud_check.setAccessibleName("Проверить облачную копию")
+        self.cloud_check.clicked.connect(self.check_cloud)
+        column.addWidget(self.cloud_check)
+
+        self.cloud_take = QPushButton("Взять данные из копии")
+        self.cloud_take.setAccessibleName("Взять данные из облачной копии")
+        self.cloud_take.clicked.connect(self.take_cloud)
+        column.addWidget(self.cloud_take)
+        self.show_cloud()
 
         # --- автозапуск вместе с Windows (только на Windows)
         self.autostart_box: QCheckBox | None = None
@@ -1815,6 +1853,105 @@ class SettingsDialog(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.folder)))
         announce(self, "Открыта папка Дата.")
 
+    # --- копия в облако ---------------------------------------------------
+
+    def show_cloud(self) -> None:
+        if self.cloud is None:
+            text = ("Копия в облако выключена: папка не выбрана. Нажми "
+                    "«Выбрать папку для копий».")
+        else:
+            text = f"Папка для копий: {self.cloud}."
+        self.cloud_label.setText(text)
+        self.cloud_label.setAccessibleName(text)
+
+    def choose_cloud_folder(self) -> None:
+        start = self.store.folder
+        default = sync.default_folder()
+        if default is not None and default.parent.exists():
+            start = default
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Выбери папку для копий", str(start))
+        if not chosen:
+            announce(self, "Папка не изменена.")
+            return
+        try:
+            settings.save_cloud(self.store.folder, chosen)
+        except OSError:
+            announce(self, "Не получилось запомнить папку для копий.",
+                     assertive=True)
+            return
+        self.cloud = Path(chosen)
+        self.show_cloud()
+        self.cloud_changed.emit()
+        try:
+            sync.write(self.store, self.cloud)
+        except sync.SyncError as error:
+            announce(self, f"Папка выбрана, но копия не записалась: {error}",
+                     assertive=True)
+            return
+        announce(self, f"Копия будет лежать в папке {self.cloud}. "
+                       "Сейчас в ней сохранена первая копия.",
+                 assertive=True)
+
+    def save_cloud_now(self) -> None:
+        if self.cloud is None:
+            announce(self, "Сначала выбери папку для копий.", assertive=True)
+            return
+        if self.store.save_no == 0:
+            announce(self, "В базе пока нет данных для копии.",
+                     assertive=True)
+            return
+        try:
+            sync.write(self.store, self.cloud)
+        except sync.SyncError as error:
+            announce(self, str(error), assertive=True)
+            return
+        announce(self, f"Копия сохранена в папке {self.cloud}, "
+                       f"сохранение номер {self.store.save_no}.",
+                 assertive=True)
+
+    def check_cloud(self) -> None:
+        if self.cloud is None:
+            announce(self, "Сначала выбери папку для копий.", assertive=True)
+            return
+        try:
+            text = sync.check(self.store, self.cloud)
+        except sync.SyncError as error:
+            announce(self, str(error), assertive=True)
+            return
+        announce(self, text, assertive=True)
+
+    def take_cloud(self) -> None:
+        if self.cloud is None:
+            announce(self, "Сначала выбери папку для копий.", assertive=True)
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Взять данные из копии")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Текущие данные будут заменены копией из облака. "
+                    "Прежняя база останется в папке Резерв. Взять?")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes
+                               | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            announce(self, "Данные не изменены.")
+            return
+        try:
+            text = sync.restore(self.store, self.cloud)
+        except sync.SyncError as error:
+            announce(self, str(error), assertive=True)
+            return
+        # Клавиши и громкость могли приехать из копии — перечитываем их,
+        # а окна списков пересоберутся после сигнала.
+        self.bindings = settings.load(self.store.folder)
+        self.volume = settings.load_volume(self.store.folder)
+        self.cue_volume = settings.load_cue_volume(self.store.folder)
+        self._show_keys()
+        self.volume_box.setValue(self.volume)
+        self.cue_volume_box.setValue(self.cue_volume)
+        self.restored.emit()
+        announce(self, text, assertive=True)
+
     # --- звук -------------------------------------------------------------
 
     def test_sound(self) -> None:
@@ -1960,6 +2097,34 @@ class MainWindow(QMainWindow):
         self.volume = settings.load_volume(store.folder)
         self.cue_volume = settings.load_cue_volume(store.folder)
         self.cues = settings.load_cues(store.folder)
+
+        # --- копия в облако
+        # Папку помним в настройках. Если её ещё нет, а Диск O на месте —
+        # включаем копии сами: человек уже сказал, что пользуется им.
+        self.cloud = settings.load_cloud(store.folder)
+        if self.cloud is None:
+            default = sync.default_folder()
+            if default is not None:
+                self.cloud = default
+        if self.cloud is not None:
+            try:
+                self.cloud.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.cloud = None
+            else:
+                try:
+                    settings.save_cloud(store.folder, self.cloud)
+                except OSError:
+                    pass
+        self._sync_problem = ""
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setSingleShot(True)
+        self._sync_timer.setInterval(1500)
+        self._sync_timer.timeout.connect(self.write_cloud_copy)
+        # После каждого сохранения данных — копия в облако (с небольшой
+        # задержкой: за одну правку таблица может записаться дважды).
+        store.sync = self.schedule_cloud_copy
+
         self.setWindowTitle(f"Мажорный лад Расписание {__version__}")
         self.resize(820, 620)
         self.announcer = Announcer(self)
@@ -2072,8 +2237,49 @@ class MainWindow(QMainWindow):
         if self.store.notice:
             text += " " + self.store.notice
             self.store.notice = ""
+        if self.cloud is not None:
+            newer = sync.newer_message(self.store, self.cloud)
+            if newer:
+                text += " " + newer
         announce(self, text)
         self.students_list.setFocus()
+
+    # --- копия в облако ---------------------------------------------------
+
+    def schedule_cloud_copy(self, *_args) -> None:
+        if self.cloud is None:
+            return
+        self._sync_timer.start()
+
+    def write_cloud_copy(self) -> None:
+        if self.cloud is None:
+            return
+        try:
+            sync.write(self.store, self.cloud)
+        except sync.SyncError as error:
+            # Про сбой говорим один раз за запуск: повторять на каждое
+            # сохранение — только мешать работе.
+            if not self._sync_problem:
+                self._sync_problem = str(error)
+                announce(self, f"Копия в облако не записалась: {error}",
+                         assertive=True)
+            return
+        self._sync_problem = ""
+
+    def reload_cloud(self) -> None:
+        self.cloud = settings.load_cloud(self.store.folder)
+        self._sync_problem = ""
+
+    def after_restore(self) -> None:
+        """После взятия копии: перечитать настройки и пересобрать окна."""
+        self.bindings = settings.load(self.store.folder)
+        self.volume = settings.load_volume(self.store.folder)
+        self.cue_volume = settings.load_cue_volume(self.store.folder)
+        self.cues = settings.load_cues(self.store.folder)
+        self.install_shortcuts()
+        self.update_hints()
+        self.update_cues_button()
+        self.refresh_all()
 
     def student_line(self, student: data.Student) -> str:
         used, total = self.store.balance(student.name)
@@ -2764,6 +2970,8 @@ class MainWindow(QMainWindow):
             dialog.bindings_changed.connect(self.apply_bindings)
             dialog.volume_changed.connect(self.apply_volume)
             dialog.cue_volume_changed.connect(self.apply_cue_volume)
+            dialog.restored.connect(self.after_restore)
+            dialog.cloud_changed.connect(self.reload_cloud)
             announce(dialog, f"Настройки. Версия программы {__version__}.")
             dialog.exec()
         finally:
