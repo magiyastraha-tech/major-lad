@@ -2611,17 +2611,22 @@ class MainWindow(QMainWindow):
         box.setWindowTitle("Начало урока")
         box.setText(text)
         yes = box.addButton("Да, урок идёт", QMessageBox.ButtonRole.YesRole)
-        later = box.addButton("Напомнить через час",
-                              QMessageBox.ButtonRole.NoRole)
+        in_five = box.addButton("Напомнить через 5 минут",
+                                QMessageBox.ButtonRole.NoRole)
+        box.addButton("Напомнить через час", QMessageBox.ButtonRole.NoRole)
         box.setDefaultButton(yes)
 
         def ask() -> None:
             announce(self, text, assertive=True)
             box.exec()
-            if box.clickedButton() is yes:
+            chosen = box.clickedButton()
+            if chosen is yes:
                 self.reminders.mark_started(lesson)
                 announce(
                     self, "Хорошо. Через сорок минут спрошу, прошёл ли урок.")
+            elif chosen is in_five:
+                self.reminders.snooze(lesson, timedelta(minutes=5))
+                announce(self, "Напомню через пять минут.")
             else:
                 self.reminders.snooze(lesson)
                 announce(self, "Напомню через час.")
