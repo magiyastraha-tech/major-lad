@@ -30,6 +30,16 @@ WEEK_LABELS = ("Понедельник", "Вторник", "Среда", "Чет
                "Суббота", "Воскресенье")
 MINUTES = [f"{m:02d}" for m in range(0, 60, 5)]
 
+# Фраза для последнего урока в абонементе: звучит после весёлого сигнала,
+# до вопроса «урок прошёл?». Это подсказка преподавателю, что сказать
+# ученику, поэтому обращение на «вы».
+LAST_LESSON_TEXT = (
+    "Минуточку внимания! У вас сегодня последнее занятие в абонементе. "
+    "Если новый абонемент приобретёте сегодня, одно занятие — в подарок.")
+
+# Подсказки времени от начала урока: (минута, звук).
+CUE_MARKS = ((10, "cue10"), (20, "cue20"), (30, "cue30"), (40, "cue40"))
+
 
 def make_date_edit(name: str, initial: date | None = None) -> QDateEdit:
     """Поле даты: набирается с клавиатуры и открывается календарём."""
@@ -691,14 +701,15 @@ class SubscriptionDialog(QDialog):
 
 
 class DoneLessonDialog(QDialog):
-    """Дата уже проведённого урока: один урок за одно открытие окна."""
+    """Дата уже проведённого урока и сколько уроков в этот день прошло."""
 
     def __init__(self, store: Store, sub: data.Subscription, parent=None):
         super().__init__(parent)
         self.store = store
         self.sub = sub
-        self.lesson: data.Lesson | None = None
+        self.lessons: list[data.Lesson] = []
         self.day_value: date | None = None
+        self.count_value = 1
         self.setWindowTitle("Добавить проведённый урок")
         self.setMinimumWidth(440)
         lay = QVBoxLayout(self)
@@ -720,9 +731,17 @@ class DoneLessonDialog(QDialog):
         default = last + timedelta(days=1) if last else sub.begins
         self.day = make_date_edit("Дата проведённого урока", default)
         form.addRow("Дата урока", self.day)
+        # Сколько уроков прошло в этот день: иногда идут два или три подряд.
+        # Больше остатка не предложим — программа всё равно откажет.
+        top = max(1, sub.left) if sub.total else 99
+        self.count = QSpinBox()
+        self.count.setRange(1, top)
+        self.count.setValue(1)
+        self.count.setAccessibleName("Количество уроков за этот день")
+        form.addRow("Количество уроков", self.count)
         lay.addLayout(form)
 
-        hint = QLabel("Программа сама поставит урок на нужное место в списке "
+        hint = QLabel("Программа сама поставит уроки на нужное место в списке "
                       "и прибавит счётчик.")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -737,12 +756,14 @@ class DoneLessonDialog(QDialog):
 
     def _add(self) -> None:
         day = picked_date(self.day)
+        count = int(self.count.value())
         try:
-            self.lesson = self.store.add_done_lesson(self.sub, day)
+            self.lessons = self.store.add_done_lesson(self.sub, day, count)
         except ValueError as error:
             announce(self, str(error))
             return
         self.day_value = day
+        self.count_value = count
         self.accept()
 
 
@@ -1099,12 +1120,16 @@ class StudentCard(QDialog):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             announce(self, "Урок не добавлен.")
             return
-        if sub.total:
-            text = (f"Урок {dates.fmt_date(dialog.day_value)} записан. "
-                    f"В абонементе уроки {sub.used} из {sub.total}.")
+        day = dates.fmt_date(dialog.day_value)
+        if dialog.count_value > 1:
+            word = plural(dialog.count_value, "урок", "урока", "уроков")
+            head = f"Записано {word}: {dialog.count_value}, {day}."
         else:
-            text = (f"Урок {dates.fmt_date(dialog.day_value)} записан. "
-                    f"Всего уроков {sub.used}.")
+            head = f"Урок {day} записан."
+        if sub.total:
+            text = f"{head} В абонементе уроки {sub.used} из {sub.total}."
+        else:
+            text = f"{head} Всего уроков {sub.used}."
         self._done(text)
 
     @staticmethod
@@ -1429,13 +1454,16 @@ class SettingsDialog(QDialog):
 
     bindings_changed = Signal(dict)
     volume_changed = Signal(int)
+    cue_volume_changed = Signal(int)
 
     def __init__(self, store: Store, bindings: dict[str, str],
-                 volume: int = settings.DEFAULT_VOLUME, parent=None):
+                 volume: int = settings.DEFAULT_VOLUME,
+                 cue_volume: int = settings.DEFAULT_CUE_VOLUME, parent=None):
         super().__init__(parent)
         self.store = store
         self.bindings = dict(bindings)
         self.volume = settings.volume_value(volume)
+        self.cue_volume = settings.cue_volume_value(cue_volume)
         self._worker: UpdateWorker | None = None
         self.setWindowTitle("Настройки")
         self.setMinimumWidth(560)
@@ -1493,6 +1521,27 @@ class SettingsDialog(QDialog):
         test.setAccessibleName("Проверить звук напоминания")
         test.clicked.connect(self.test_sound)
         column.addWidget(test)
+
+        column.addSpacing(8)
+        cue_hint = QLabel("Громкость подсказок времени урока: короткие "
+                          "сигналы через десять, двадцать, тридцать и "
+                          "сорок минут от начала занятия. Ноль — подсказки "
+                          "без звука.")
+        cue_hint.setWordWrap(True)
+        column.addWidget(cue_hint)
+
+        self.cue_volume_box = QSpinBox()
+        self.cue_volume_box.setRange(0, 100)
+        self.cue_volume_box.setSingleStep(5)
+        self.cue_volume_box.setValue(self.cue_volume)
+        self.cue_volume_box.setAccessibleName(
+            "Громкость подсказок времени в процентах")
+        column.addWidget(self.cue_volume_box)
+
+        cue_test = QPushButton("Проверить подсказку времени")
+        cue_test.setAccessibleName("Проверить звук подсказки времени")
+        cue_test.clicked.connect(self.test_cue_sound)
+        column.addWidget(cue_test)
 
         # --- сочетания клавиш
         column.addSpacing(12)
@@ -1597,6 +1646,22 @@ class SettingsDialog(QDialog):
             lambda: announce(
                 self, f"Сигнал напоминания, громкость {level} процентов."))
 
+    def test_cue_sound(self) -> None:
+        """Проиграть подсказку «двадцать минут» с её громкостью."""
+        level = settings.cue_volume_value(self.cue_volume_box.value())
+        if level == 0:
+            announce(self, "Громкость подсказок ноль, они выключены.",
+                     assertive=True)
+            return
+        folder = self.store.folder / "Sound"
+        if not sounds.play("cue20", folder, level):
+            QApplication.beep()
+        wait = sounds.length("cue20", folder) + 0.15
+        QTimer.singleShot(
+            int(wait * 1000),
+            lambda: announce(
+                self, f"Подсказка времени, громкость {level} процентов."))
+
     # --- клавиши ----------------------------------------------------------
 
     def _show_keys(self) -> None:
@@ -1635,9 +1700,10 @@ class SettingsDialog(QDialog):
     def reset_bindings(self) -> None:
         self.bindings = settings.defaults()
         self.volume_box.setValue(settings.DEFAULT_VOLUME)
+        self.cue_volume_box.setValue(settings.DEFAULT_CUE_VOLUME)
         self._show_keys()
-        announce(self, "Расставлены клавиши по умолчанию и средняя громкость. "
-                       "Нажми «Сохранить», чтобы применить.")
+        announce(self, "Расставлены клавиши по умолчанию и средние "
+                       "громкости. Нажми «Сохранить», чтобы применить.")
 
     def save_bindings(self) -> None:
         result: dict[str, str] = {}
@@ -1654,20 +1720,27 @@ class SettingsDialog(QDialog):
                 seen[text] = title
             result[code] = text
         level = settings.volume_value(self.volume_box.value())
+        cue_level = settings.cue_volume_value(self.cue_volume_box.value())
         try:
-            settings.save(self.store.folder, result, level)
+            settings.save(self.store.folder, result, level, cue_level)
         except OSError:
             announce(self, "Не получилось сохранить настройки.", assertive=True)
             return
         self.bindings = result
         self.volume = level
+        self.cue_volume = cue_level
         self.bindings_changed.emit(result)
         self.volume_changed.emit(level)
+        self.cue_volume_changed.emit(cue_level)
         if level:
-            tail = f"Громкость сигналов {level} процентов."
+            first = f"Громкость сигналов {level} процентов."
         else:
-            tail = "Сигналы выключены."
-        announce(self, f"Настройки сохранены. {tail}", assertive=True)
+            first = "Сигналы напоминаний выключены."
+        if cue_level:
+            second = f"Громкость подсказок времени {cue_level} процентов."
+        else:
+            second = "Подсказки времени без звука."
+        announce(self, f"Настройки сохранены. {first} {second}", assertive=True)
         self.accept()
 
 
@@ -1680,6 +1753,8 @@ class MainWindow(QMainWindow):
         self.store = store
         self.bindings = settings.load(store.folder)
         self.volume = settings.load_volume(store.folder)
+        self.cue_volume = settings.load_cue_volume(store.folder)
+        self.cues = settings.load_cues(store.folder)
         self.setWindowTitle(f"Мажорный лад Расписание {__version__}")
         self.resize(820, 620)
         self.announcer = Announcer(self)
@@ -1720,6 +1795,9 @@ class MainWindow(QMainWindow):
         self.settings_button = QPushButton()
         self.settings_button.clicked.connect(self.open_settings)
         row.addWidget(self.settings_button)
+        self.cues_button = QPushButton()
+        self.cues_button.clicked.connect(self.toggle_cues)
+        row.addWidget(self.cues_button)
         row.addStretch(1)
         lay.addLayout(row)
         self.tabs.addTab(page, "Ученики")
@@ -1746,6 +1824,14 @@ class MainWindow(QMainWindow):
         self.reminders.soon.connect(self.on_soon)
         self.reminders.ask_start.connect(self.on_ask_start)
         self.reminders.ask_finish.connect(self.on_ask_finish)
+
+        # --- подсказки времени урока
+        self._cue_anchor: datetime | None = None
+        self._cue_done: set[int] = set()
+        self._cue_timer = QTimer(self)
+        self._cue_timer.setInterval(1000)
+        self._cue_timer.timeout.connect(self.check_cues)
+        self._cue_timer.start()
 
         self.refresh_all()
         self.setup_tray()
@@ -1841,6 +1927,20 @@ class MainWindow(QMainWindow):
         settings_keys = norm_keys(self.bindings.get("settings", ""))
         self.settings_button.setText(
             f"Настройки ({settings_keys})" if settings_keys else "Настройки")
+        self.update_cues_button()
+
+    def update_cues_button(self) -> None:
+        """Кнопка называет своё состояние словами — диктор прочитает его."""
+        if self.cues:
+            text = "Подсказки времени: включены"
+            name = ("Звуковые подсказки времени урока включены. Нажми, "
+                    "чтобы выключить")
+        else:
+            text = "Подсказки времени: выключены"
+            name = ("Звуковые подсказки времени урока выключены. Нажми, "
+                    "чтобы включить")
+        self.cues_button.setText(text)
+        self.cues_button.setAccessibleName(name)
 
     def install_shortcuts(self) -> None:
         """Собрать горячие клавиши заново по текущим настройкам.
@@ -1875,6 +1975,69 @@ class MainWindow(QMainWindow):
     def apply_volume(self, volume: int) -> None:
         self.volume = settings.volume_value(volume)
 
+    def apply_cue_volume(self, volume: int) -> None:
+        self.cue_volume = settings.cue_volume_value(volume)
+
+    # --- подсказки времени урока ------------------------------------------
+
+    def toggle_cues(self) -> None:
+        """Включить или выключить подсказки времени и запомнить выбор."""
+        self.cues = not self.cues
+        try:
+            settings.save(self.store.folder, self.bindings, self.volume,
+                          self.cue_volume, self.cues)
+        except OSError:
+            announce(self, "Не получилось сохранить настройку.",
+                     assertive=True)
+            return
+        self.update_cues_button()
+        # Отсчёт всегда от начала текущего урока, а не от момента щелчка:
+        # включил посреди урока — прошлые минуты не догоняем пачкой.
+        self._cue_anchor = None
+        self._cue_done.clear()
+        if not self.cues:
+            announce(self, "Звуковые подсказки времени выключены.")
+            return
+        if self.cue_volume == 0:
+            announce(self, "Подсказки времени включены, но их громкость "
+                           "ноль. Поставь громкость в настройках.",
+                     assertive=True)
+            return
+        announce(self, "Звуковые подсказки времени включены. Сигналы "
+                       "прозвучат через десять, двадцать, тридцать и "
+                       "сорок минут от начала урока.", assertive=True)
+
+    def check_cues(self) -> None:
+        """Раз в секунду: не пора ли подать подсказку времени."""
+        if not self.cues:
+            self._cue_anchor = None
+            self._cue_done.clear()
+            return
+        anchor = self.reminders.first_start()
+        if anchor is None:
+            self._cue_anchor = None
+            self._cue_done.clear()
+            return
+        elapsed = (datetime.now() - anchor).total_seconds()
+        if self._cue_anchor != anchor:
+            # Урок только начался или подсказки включили на ходу: то, что
+            # уже прошло, считаем пройденным — сигнал нужен заранее,
+            # а не пачкой задним числом.
+            self._cue_anchor = anchor
+            self._cue_done = {mark for mark, _kind in CUE_MARKS
+                              if elapsed >= mark * 60}
+            return
+        for mark, kind in CUE_MARKS:
+            if mark in self._cue_done or elapsed < mark * 60:
+                continue
+            self._cue_done.add(mark)
+            self.play_cue(kind)
+
+    def play_cue(self, kind: str) -> None:
+        folder = self.store.folder / "Sound"
+        if not sounds.play(kind, folder, self.cue_volume):
+            QApplication.beep()
+
     def open_settings(self) -> None:
         # Окно настроек модальное, но ярлыки живут на всё приложение:
         # пока оно открыто, они выключены, чтобы новая клавиша не
@@ -1886,9 +2049,10 @@ class MainWindow(QMainWindow):
             shortcut.setEnabled(False)
         try:
             dialog = SettingsDialog(self.store, self.bindings, self.volume,
-                                    self)
+                                    self.cue_volume, self)
             dialog.bindings_changed.connect(self.apply_bindings)
             dialog.volume_changed.connect(self.apply_volume)
+            dialog.cue_volume_changed.connect(self.apply_cue_volume)
             announce(dialog, f"Настройки. Версия программы {__version__}.")
             dialog.exec()
         finally:
@@ -2086,6 +2250,10 @@ class MainWindow(QMainWindow):
     def on_ask_finish(self, lesson: data.Lesson) -> None:
         text = (f"Вы подтверждаете, что урок прошёл? "
                 f"{lesson.student}, в {lesson.time}.")
+        # Если это последний урок абонемента — сначала весёлый сигнал и
+        # подсказка про подарок, и только потом обычный вопрос.
+        sub = self.store.current_subscription(lesson.student)
+        last = sub is not None and sub.total > 0 and sub.left == 1
 
         def ask() -> None:
             announce(self, text, assertive=True)
@@ -2119,7 +2287,16 @@ class MainWindow(QMainWindow):
             announce(self, f"{lesson.student}, урок проведён.{tail}",
                      assertive=True)
 
-        self._play_then("finish", ask)
+        if not last:
+            self._play_then("finish", ask)
+            return
+
+        def promo() -> None:
+            announce(self, LAST_LESSON_TEXT, assertive=True)
+            # Даём диктору проговорить фразу целиком, потом обычный вопрос.
+            QTimer.singleShot(3000, lambda: self._play_then("finish", ask))
+
+        self._play_then("last", promo)
 
     # --- трей -------------------------------------------------------------
 

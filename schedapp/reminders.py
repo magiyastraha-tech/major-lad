@@ -78,6 +78,16 @@ class ReminderService(QObject):
     def started_at(self, lesson: Lesson) -> datetime | None:
         return self._started.get(lesson.uid)
 
+    def first_start(self) -> datetime | None:
+        """Когда начался самый ранний из идущих уроков.
+
+        По этой отметке подсказки времени считают, сколько прошло от
+        начала занятия. Нет идущих уроков — None.
+        """
+        if not self._started:
+            return None
+        return min(self._started.values())
+
     # --- проверка ---------------------------------------------------------
 
     def tick(self, now: datetime | None = None) -> None:

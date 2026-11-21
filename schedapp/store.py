@@ -855,37 +855,62 @@ class Store:
             sub.finished = True
         self.save_subscriptions()
 
-    def add_done_lesson(self, sub: Subscription, day: date) -> Lesson:
-        """Проведённый урок в абонемент, без времени — он уже прошёл.
+    def add_done_lesson(self, sub: Subscription, day: date,
+                        count: int = 1) -> list[Lesson]:
+        """Проведённые уроки в абонемент, без времени — они уже прошли.
 
         Так вводятся старые уроки и дописываются пропущенные в действующем
-        абонементе. Счётчик прибавляется сам, порядок в файле «Проведённые
-        уроки» программа расставляет по датам.
+        абонементе. За один день уроков бывает несколько: `count` задаёт,
+        сколько записать сразу. Счётчик прибавляется сам, порядок в файле
+        «Проведённые уроки» программа расставляет по датам.
         """
+        try:
+            count = max(1, int(count))
+        except (TypeError, ValueError):
+            count = 1
         if sub.total > 0 and sub.left <= 0:
             raise ValueError("В абонементе не осталось уроков.")
-        for lesson in self.lessons:
-            if (lesson.subscription == sub.uid and lesson.day == day
-                    and lesson.status == LESSON_DONE):
-                raise ValueError(
-                    "У этого абонемента уже есть проведённый урок "
-                    f"{dates.fmt_date(day)}.")
+        if sub.total > 0 and count > sub.left:
+            left = sub.left
+            word = plural(left, "урок", "урока", "уроков")
+            raise ValueError(
+                f"В абонементе осталось {left} {word}, а записать просят "
+                f"{count}. Уменьши количество.")
+        # Проверка «урок на эту дату уже есть» нужна против случайного
+        # двойного ввода одного урока. Когда количество задано явно,
+        # это уже намерение: несколько уроков в один день — обычное дело.
+        if count == 1:
+            for lesson in self.lessons:
+                if (lesson.subscription == sub.uid and lesson.day == day
+                        and lesson.status == LESSON_DONE):
+                    raise ValueError(
+                        "У этого абонемента уже есть проведённый урок "
+                        f"{dates.fmt_date(day)}.")
         owner = self.find_student(sub.student)
-        lesson = Lesson(
-            uid=self._next_uid(self.lessons),
-            day=day,
-            time="",
-            student=sub.student,
-            lesson_format=owner.lesson_format if owner else FORMATS[0],
-            direction=sub.direction
-            or (owner.direction if owner else DIRECTIONS[2]),
-            status=LESSON_DONE,
-            subscription=sub.uid,
-        )
-        self.lessons.append(lesson)
+        added: list[Lesson] = []
+        for _ in range(count):
+            lesson = Lesson(
+                uid=self._next_uid(self.lessons),
+                day=day,
+                time="",
+                student=sub.student,
+                lesson_format=owner.lesson_format if owner else FORMATS[0],
+                direction=sub.direction
+                or (owner.direction if owner else DIRECTIONS[2]),
+                status=LESSON_DONE,
+                subscription=sub.uid,
+            )
+            self.lessons.append(lesson)
+            added.append(lesson)
         self.save_lessons()
-        self.bump_used(sub)
-        return lesson
+        if sub.total > 0:
+            sub.used = min(sub.total, sub.used + count)
+        else:
+            sub.used += count
+        if sub.total > 0 and sub.used >= sub.total:
+            sub.finished = True
+        self.save_subscriptions()
+        return added
 
     def update_lesson(self, lesson: Lesson) -> None:
         self.save_lessons()
