@@ -429,6 +429,9 @@ class Source:
         # Задержка входного потока, как её отдаёт драйвер. Меряем один раз
         # при открытии: в звуковом потоке спрашивать её каждый блок незачем.
         self.latency: float | None = None
+        # Задержка входа по отметкам самого драйвера. У WASAPI паспортная
+        # нередко равна нулю, а отметки точные; сглаживается в callback.
+        self.measured_latency: float | None = None
         # Уровень входа за последний промежуток: максимальный отсчёт и
         # сколько блоков упёрлось в предел. Перегруз на входе звучит как
         # хрип ещё до передачи, и никакая сеть тут не виновата.
@@ -489,6 +492,16 @@ class Source:
 
     def _callback(self, indata, frames, time_info, status) -> None:
         self.frames_in += frames
+        # Задержку входа берём из отметок драйвера: паспортная у WASAPI
+        # бывает нулём, и тогда голос у собеседника обгоняет клик ровно на
+        # незамеренную задержку устройства. Сглаживаем — отметки дрожат на
+        # размер блока.
+        value = _stamp_latency(time_info, "in")
+        if value is not None:
+            if self.measured_latency is None:
+                self.measured_latency = value
+            else:
+                self.measured_latency += (value - self.measured_latency) * 0.1
         try:
             peak = float(np.max(np.abs(indata)))
             if peak > self.peak:
@@ -530,6 +543,19 @@ class Source:
         if self.ring_r is not None:
             return left, self._read_ring(self.ring_r, frames)
         return left, left
+
+    def latency_now(self) -> float:
+        """Задержка входа для компенсации, в секундах.
+
+        Порядок доверия: паспортная и замеренная по отметкам — что больше,
+        затем оценка по драйверу. Ноль здесь означал бы «мгновенно» и
+        разъехался бы с настоящим трактом на всю задержку устройства.
+        """
+        values = [value for value in (self.latency, self.measured_latency)
+                  if value is not None and value > 0]
+        if values:
+            return max(values)
+        return _hostapi_latency(self.device_index) or 0.0
 
     def fill(self) -> int:
         """Сколько звука ждёт в буферах прямо перед чтением.
@@ -807,6 +833,66 @@ def _stream_latency(stream) -> float | None:
         return None
 
 
+def _stamp_latency(time_info, direction: str) -> float | None:
+    """Задержка тракта по отметкам драйвера.
+
+    Для входа: сколько прошло от момента, когда драйвер снял первый отсчёт
+    блока, до вызова callback. Для выхода: сколько пройдёт от вызова
+    callback до момента, когда первый отсчёт блока зазвучит в устройстве.
+    WASAPI отдаёт эти отметки точно, а stream.latency там нередко приходит
+    нулём — без отметок компенсация считалась бы без задержки устройства,
+    и клик у собеседника уезжал бы от голоса.
+
+    Отметки бывают нулевыми или несогласованными, если драйвер их не
+    поддерживает: такие значения отбрасываем и остаёмся при паспортной
+    задержке.
+    """
+    try:
+        now = float(time_info.currentTime)
+        if direction == "in":
+            value = now - float(time_info.inputBufferAdcTime)
+        else:
+            value = float(time_info.outputBufferDacTime) - now
+    except Exception:
+        return None
+    # Ограничение отсекает мусор: первый вызов после открытия потока иногда
+    # приходит с несогласованными отметками, и подставлять такую задержку
+    # в компенсацию нельзя. Полсекунды заведомо больше любой живой задержки
+    # входа и выхода. NaN сюда не пройдёт: сравнение с ним всегда ложно.
+    if not 0.0 <= value <= 0.5:
+        return None
+    return value
+
+
+# Типичная задержка драйвера, когда ни паспорт потока, ни отметки её не
+# назвали. Ноль в таком случае — не «мгновенно», а «неизвестно», и брать его
+# за правду значит заведомо разъехаться на десятки миллисекунд.
+HOSTAPI_LATENCY = (
+    ("mme", 0.120),
+    ("directsound", 0.040),
+    ("wasapi", 0.020),
+    ("wdm-ks", 0.010),
+    ("asio", 0.010),
+)
+
+
+def _hostapi_latency(index: int | None) -> float | None:
+    """Оценка задержки по драйверу устройства. Последний довод, когда
+    точных чисел нет: MME медленнее всех, WASAPI в общей очереди — заметно
+    быстрее."""
+    if sd is None or index is None or int(index) < 0:
+        return None
+    try:
+        api = sd.query_hostapis(sd.query_devices(int(index))["hostapi"])
+        name = str(api["name"]).lower()
+    except Exception:
+        return None
+    for part, value in HOSTAPI_LATENCY:
+        if part in name:
+            return value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Движок
 # ---------------------------------------------------------------------------
@@ -843,6 +929,11 @@ class AudioEngine:
         self.player = Player(SAMPLE_RATE)
         self._out = None
         self._out_channels = 1
+        # Индекс устройства вывода и его задержка по отметкам драйвера.
+        # Паспортная у WASAPI бывает нулём, а без неё компенсация не знает,
+        # на сколько музыкант слышит клик позже, чем тот родился.
+        self._out_index = -1
+        self._out_measured: float | None = None
         self._sock: socket.socket | None = None
         self._peer = None
         self._server_addr = None
@@ -993,6 +1084,8 @@ class AudioEngine:
                             self._out = stream
                             self._out_channels = channels
                             opened_index = index
+                            self._out_index = index
+                            self._out_measured = None
                             # Отсчёт для сторожа начинается с открытия:
                             # первые вызовы приходят не сразу.
                             self._last_cb = time.monotonic()
@@ -1101,7 +1194,11 @@ class AudioEngine:
         if self.sources:
             how = ("авто, дальше по фактическому буферу"
                    if self.tx_delay_ms <= 0 else "вручную")
-            self.log(f"Компенсация задержки: {delay} мс ({how}).")
+            out_ms, in_ms, fill_ms, _ = self._tx_parts
+            note = "" if self._out_measured is not None else ", выход оценочный"
+            self.log(f"Компенсация задержки: {delay} мс ({how}). "
+                     f"Выход {out_ms:.0f} мс, вход {in_ms:.0f} мс, "
+                     f"буфер {fill_ms:.0f} мс{note}.")
 
         if midi_enabled:
             self.set_midi(True, midi_port, midi_fixed_velocity)
@@ -1209,6 +1306,8 @@ class AudioEngine:
             except Exception:
                 pass
             self._out = None
+        self._out_index = -1
+        self._out_measured = None
         for source in self.sources.values():
             source.close()
         self.sources.clear()
@@ -1284,14 +1383,20 @@ class AudioEngine:
         тоже: иначе у собеседника клик опережает голос.
         """
         value = _stream_latency(self._out) if self._out is not None else None
-        return value if value is not None and value > 0 else 0.0
+        values = [item for item in (value, self._out_measured)
+                  if item is not None and item > 0]
+        if values:
+            return max(values)
+        return _hostapi_latency(self._out_index) or 0.0
 
     def _in_latency(self) -> float:
         """Задержка самого медленного входа в секундах."""
         in_lat = 0.0
-        for source in self.sources.values():
-            value = _stream_latency(source.stream)
-            if value is not None and value > in_lat:
+        # Список входов снимаем копией: его меняет интерфейс, а считаем мы
+        # в звуковом потоке.
+        for source in list(self.sources.values()):
+            value = source.latency_now()
+            if value > in_lat:
                 in_lat = value
         return in_lat
 
@@ -1314,8 +1419,13 @@ class AudioEngine:
         else:
             keep, maximum = input_bounds()
             ring_frames = 0.5 * (keep + maximum)
-        total = (self._out_latency() * 1000.0 + self._in_latency() * 1000.0
+        out_lat = self._out_latency()
+        in_lat = self._in_latency()
+        total = (out_lat * 1000.0 + in_lat * 1000.0
                  + ring_frames * 1000.0 / SAMPLE_RATE)
+        self._tx_parts = (out_lat * 1000.0, in_lat * 1000.0,
+                          ring_frames * 1000.0 / SAMPLE_RATE,
+                          int(round(total)))
         return int(round(total))
 
     def _apply_tx_delay(self) -> int:
@@ -1337,11 +1447,9 @@ class AudioEngine:
         средний уровень, а не колебание на размер блока.
         """
         out_lat = self._out_latency()
-        in_lat = 0.0
-        for source in self.sources.values():
-            value = source.latency
-            if value is not None and value > in_lat:
-                in_lat = value
+        # Ту же задержку входа, что и при старте, но уже по отметкам
+        # драйвера, если они успели набраться.
+        in_lat = self._in_latency()
         if self.tx_delay_ms > 0:
             self._tx_parts = (out_lat * 1000.0, in_lat * 1000.0,
                               fill * 1000.0 / SAMPLE_RATE, self.tx_delay_ms)
@@ -1373,10 +1481,13 @@ class AudioEngine:
         how = "вручную" if self.tx_delay_ms > 0 else "авто"
         if not self.sources:
             return
+        # Отметок вывода нет — цифра выхода оценочная. По этой пометке в
+        # журнале видно, почему компенсация может не сойтись.
+        note = "" if self._out_measured is not None else ", выход оценочный"
         try:
             self.log(f"Компенсация ({how}): выход {out_ms:.0f} мс, "
                      f"вход {in_ms:.0f} мс, буфер {fill_ms:.0f} мс, "
-                     f"итого {total_ms} мс.")
+                     f"итого {total_ms} мс{note}.")
         except Exception:
             pass
 
@@ -1390,6 +1501,16 @@ class AudioEngine:
         тишину и считаем сбои — они видны в журнале.
         """
         try:
+            # Задержку вывода меряем по отметкам драйвера: от вызова callback
+            # до момента, когда блок зазвучит. Паспортная у WASAPI бывает
+            # нулём, и клик у собеседника тогда опережает голос на всю
+            # задержку наушников.
+            value = _stamp_latency(time_info, "out")
+            if value is not None:
+                if self._out_measured is None:
+                    self._out_measured = value
+                else:
+                    self._out_measured += (value - self._out_measured) * 0.1
             self._out_callback_inner(outdata, frames)
         except Exception as exc:
             self._cb_errors += 1

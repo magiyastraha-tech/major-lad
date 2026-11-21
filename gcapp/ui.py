@@ -273,6 +273,35 @@ def link_color() -> QColor:
     return QColor("#1a5fb4")
 
 
+# Правое Control: обе клавиши Control приходят в Qt одним Key_Control,
+# поэтому сторону спрашиваем у самой Windows. Это единственный надёжный
+# способ — в Qt 6 скан-код правой клавиши совпадает с левой.
+VK_RCONTROL = 0xA3
+
+
+def _user32():
+    """Windows-функции для опроса клавиш, иначе None."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        return ctypes.windll.user32
+    except Exception:
+        return None
+
+
+def _right_ctrl_down() -> bool:
+    """Зажат ли правый Control прямо сейчас."""
+    api = _user32()
+    if api is None:
+        return False
+    try:
+        return bool(api.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+    except Exception:
+        return False
+
+
 class _ShortcutFilter(QObject):
     """Пользовательские сочетания клавиш на главном окне.
 
@@ -1415,6 +1444,9 @@ class MainWindow(QMainWindow):
         self._mic_muted = bool(getattr(self.engine, "mic_muted", False))
         # Зажат ли сейчас правый Control ради короткой фразы.
         self._ptt_held = False
+        # Сторож удержания и одноразовая запись кодов клавиши в журнал.
+        self._ptt_timer: QTimer | None = None
+        self._ptt_logged = False
         self._cam_on = False
         # Отдельное окно с видео на весь экран, пока оно открыто.
         self.video_window: VideoWindow | None = None
@@ -2383,6 +2415,7 @@ class MainWindow(QMainWindow):
     def _toggle_mic(self) -> None:
         self._mic_muted = not self._mic_muted
         self._ptt_held = False
+        self._ptt_watch_stop()
         self.engine.set_mic_muted(self._mic_muted)
         self._update_mic_button()
         text = "Микрофон выключен" if self._mic_muted else "Микрофон включён"
@@ -2394,21 +2427,59 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _is_right_ctrl(event) -> bool:
         """Правое Control. В Qt обе клавиши приходят одним Key_Control,
-        сторону различаем по системному коду: у правой он 0x11D, а
-        виртуальная клавиша — VK_RCONTROL."""
+        сторону различаем по системе: спрашиваем у Windows, зажат ли именно
+        правый Control. Коды из самого события — запасной путь, если
+        система не ответила."""
         if event.key() != Qt.Key.Key_Control:
             return False
+        if _right_ctrl_down():
+            return True
         try:
-            return (int(event.nativeScanCode()) == 0x11D
-                    or int(event.nativeVirtualKey()) == 0xA3)
+            if int(event.nativeVirtualKey()) == VK_RCONTROL:
+                return True
+            return int(event.nativeScanCode()) == 0x11D
         except Exception:
             return False
+
+    def _ptt_watch_start(self) -> None:
+        """Сторож на время удержания: если отпускание перехватило другое
+        окно, микрофон всё равно выключится."""
+        if _user32() is None:
+            return
+        if self._ptt_timer is None:
+            self._ptt_timer = QTimer(self)
+            self._ptt_timer.setInterval(120)
+            self._ptt_timer.timeout.connect(self._ptt_watch)
+        self._ptt_timer.start()
+
+    def _ptt_watch_stop(self) -> None:
+        if self._ptt_timer is not None:
+            self._ptt_timer.stop()
+
+    def _ptt_watch(self) -> None:
+        if not self._ptt_held:
+            self._ptt_watch_stop()
+            return
+        if not _right_ctrl_down():
+            self._ptt_off()
 
     def _ptt_press(self, event) -> bool:
         """Правый Control зажат: если микрофон выключен, включаем, пока
         держат. Если он и так включён — ничего не делаем."""
         if event.isAutoRepeat() or not self.isActiveWindow():
             return False
+        if not self._ptt_logged and event.key() == Qt.Key.Key_Control:
+            # Одна строка в журнал: по ней видно, что именно приходит от
+            # клавиатуры, если у человека снова не сработает.
+            self._ptt_logged = True
+            try:
+                self.engine.log(
+                    "Правый Control: скан-код "
+                    f"{int(event.nativeScanCode())}, виртуальная клавиша "
+                    f"{int(event.nativeVirtualKey())}, зажата правой: "
+                    f"{'да' if _right_ctrl_down() else 'нет'}.")
+            except Exception:
+                pass
         if not self._is_right_ctrl(event):
             return False
         if not self._mic_muted or self._ptt_held:
@@ -2422,15 +2493,23 @@ class MainWindow(QMainWindow):
         self._set_status("Микрофон включён. Отпустите правый Control, "
                          "чтобы выключить.")
         announce(self.mic_button, "Микрофон включён")
+        self._ptt_watch_start()
         return True
 
     def _ptt_release(self, event) -> None:
-        if not self._ptt_held or event.key() != Qt.Key.Key_Control:
+        if not self._ptt_held:
+            return
+        if event.key() not in (Qt.Key.Key_Control, Qt.Key.Key_unknown):
+            return
+        # Пока правый Control зажат физически, не выключаем: отпустили
+        # другую клавишу или левый Control.
+        if _right_ctrl_down():
             return
         self._ptt_off()
 
     def _ptt_off(self) -> None:
         """Control отпустили или окно потеряло фокус: снова выключаем."""
+        self._ptt_watch_stop()
         if not self._ptt_held:
             return
         self._ptt_held = False
