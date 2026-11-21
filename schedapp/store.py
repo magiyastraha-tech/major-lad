@@ -247,6 +247,10 @@ class Store:
         self.load()
         if migrated:
             self._import_legacy()
+        # Счётчик уроков — это число уроков, записанных в абонемент, а не
+        # цифра, которую кто-то вписал руками. Сверяем её при каждом
+        # запуске: иначе «вписал 4 из 8, а дат не внёс» так и висело бы.
+        self.recount_used()
         self._refresh_files()
 
     # --- база ------------------------------------------------------------
@@ -612,9 +616,48 @@ class Store:
     def update_student(self, student: Student) -> None:
         self.save_students()
 
-    def remove_student(self, student: Student) -> None:
-        self.students = [s for s in self.students if s.uid != student.uid]
+    def rename_student(self, old: str, new: str) -> None:
+        """Переименовать ученика везде: абонементы, уроки и оплаты.
+
+        Абонементы, уроки и оплаты держат имя ученика, а не его номер.
+        Без этой замены переименование оставило бы их висеть на старом
+        имени, и половина карточки оказалась бы чужой.
+        """
+        old = (old or "").strip()
+        new = (new or "").strip()
+        if not old or not new or old == new:
+            return
+        for item in self.subscriptions:
+            if item.student == old:
+                item.student = new
+        for lesson in self.lessons:
+            if lesson.student == old:
+                lesson.student = new
+        for payment in self.payments:
+            if payment.student == old:
+                payment.student = new
+        for student in self.students:
+            if student.name == old:
+                student.name = new
+        self.save_subscriptions()
+        self.save_lessons()
+        self.save_payments()
         self.save_students()
+
+    def remove_student(self, student: Student) -> None:
+        """Убрать ученика вместе с его абонементами и уроками.
+
+        Оплаты остаются в журнале: деньги были настоящими, и заработок
+        за прошлые месяцы не должен меняться из-за удаления карточки.
+        """
+        name = student.name
+        self.students = [s for s in self.students if s.uid != student.uid]
+        self.subscriptions = [s for s in self.subscriptions
+                              if s.student != name]
+        self.lessons = [l for l in self.lessons if l.student != name]
+        self.save_students()
+        self.save_subscriptions()
+        self.save_lessons()
 
     def add_subscription(self, student: str, total: int, price: int = 0,
                          direction: str = DIRECTIONS[2],
@@ -673,6 +716,81 @@ class Store:
         for sub in self.subscriptions:
             if not sub.finished and sub.total > 0 and sub.used >= sub.total:
                 sub.finished = True
+                changed = True
+        if changed:
+            self.save_subscriptions()
+        return changed
+
+    def _link_lessons(self) -> bool:
+        """Привязать старые проведённые уроки к их абонементу по дате.
+
+        Уроки, внесённые до появления этой связи, лежали без абонемента.
+        Берём тот, что действовал в день урока (последний начавшийся не
+        позже этого дня); если урок раньше всех — самый ранний абонемент
+        ученика. Так счётчик видит все его уроки, а не только новые.
+        """
+        by_student: dict[str, list[Subscription]] = {}
+        for sub in self.subscriptions:
+            by_student.setdefault(sub.student, []).append(sub)
+        changed = False
+        for lesson in self.lessons:
+            if lesson.subscription or lesson.status != LESSON_DONE:
+                continue
+            subs = by_student.get(lesson.student)
+            if not subs:
+                continue
+            before = [s for s in subs if s.begins <= lesson.day]
+            if before:
+                sub = max(before, key=lambda s: (s.begins, s.uid))
+            else:
+                sub = min(subs, key=lambda s: (s.begins, s.uid))
+            lesson.subscription = sub.uid
+            changed = True
+        if changed:
+            self.save_lessons()
+        return changed
+
+    def recount_used(self) -> bool:
+        """Пересчитать счётчики уроков по самим урокам.
+
+        В абонементе хранится только число проведённых уроков, и раньше
+        его можно было вписать руками, не заведя ни одного урока: «4 из 8»
+        при пустом списке дат. Теперь цифра считается заново — сколько
+        уроков с отметкой «проведён» записано в абонемент, столько и
+        показывается.
+
+        Абонемент, где уроки кончились, закрывается сам. Открывается
+        обратно только тот, что закрылся именно из-за нехватки уроков и
+        теперь имеет свободные места, — старый, законченный вручную,
+        остаётся в истории.
+        """
+        self._link_lessons()
+        counts: dict[int, int] = {}
+        for lesson in self.lessons:
+            if lesson.status == LESSON_DONE and lesson.subscription:
+                counts[lesson.subscription] = (
+                    counts.get(lesson.subscription, 0) + 1)
+        latest: dict[str, Subscription] = {}
+        for sub in self.subscriptions:
+            old = latest.get(sub.student)
+            if old is None or (sub.bought, sub.uid) > (old.bought, old.uid):
+                latest[sub.student] = sub
+        changed = False
+        for sub in self.subscriptions:
+            used = counts.get(sub.uid, 0)
+            if sub.total > 0:
+                used = min(used, sub.total)
+            was_full = sub.total > 0 and sub.used >= sub.total
+            if sub.used != used:
+                sub.used = used
+                changed = True
+            full = sub.total > 0 and sub.used >= sub.total
+            if full and not sub.finished:
+                sub.finished = True
+                changed = True
+            elif (was_full and not full and sub.finished
+                  and latest.get(sub.student) is sub):
+                sub.finished = False
                 changed = True
         if changed:
             self.save_subscriptions()

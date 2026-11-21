@@ -165,7 +165,7 @@ class StudentDialog(QDialog):
             self.name.setFocus()
             return
         other = self.store.find_student(name)
-        if self.student is None and other is not None:
+        if other is not None and other is not self.student:
             announce(self, f"Ученик {name} уже есть в списке.")
             self.name.setFocus()
             return
@@ -189,14 +189,75 @@ class StudentDialog(QDialog):
             self.accept()
             return
         student = self.student
+        old_name = student.name
         student.name = name
         student.phone = self.phone.text().strip()
         student.email = self.email.text().strip()
         student.lesson_format = self.format.currentText()
         student.direction = self.direction.currentText()
+        # Абонементы, уроки и оплаты хранят имя ученика. Переименование
+        # должно пройти по ним тоже, иначе карточка останется на старом
+        # имени и покажет пустоту.
+        if old_name != student.name:
+            self.store.rename_student(old_name, student.name)
         self.store.update_student(student)
         self.created = student
         self.accept()
+
+
+class StudentPickDialog(QDialog):
+    """Выбор ученика из списка: стрелками, Enter — дальше.
+
+    Нужен кнопкам «Редактировать ученика» и «Удалить ученика»: сначала
+    человек выбирает, кого именно, потом открывается действие.
+    """
+
+    def __init__(self, store: Store, title: str, hint: str, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.picked: data.Student | None = None
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+
+        label = QLabel(hint)
+        label.setWordWrap(True)
+        lay.addWidget(label)
+
+        self.list = QListWidget()
+        self.list.setAccessibleName("Список учеников")
+        for student in sorted(store.students,
+                              key=lambda s: s.name.casefold()):
+            item = QListWidgetItem(student.name)
+            item.setData(Qt.ItemDataRole.UserRole, student.uid)
+            self.list.addItem(item)
+        self.list.itemDoubleClicked.connect(lambda _item: self._accept())
+        lay.addWidget(self.list, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Дальше")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        self.list.setFocus()
+
+    def _accept(self) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            announce(self, "Сначала выбери ученика в списке.")
+            self.list.setFocus()
+            return
+        uid = item.data(Qt.ItemDataRole.UserRole)
+        for student in self.store.students:
+            if student.uid == uid:
+                self.picked = student
+                self.accept()
+                return
 
 
 class LessonPayDialog(QDialog):
@@ -1618,6 +1679,16 @@ class MainWindow(QMainWindow):
         self.add_button.setDefault(True)
         self.add_button.clicked.connect(self.add_student)
         row.addWidget(self.add_button)
+        self.edit_button = QPushButton("Редактировать ученика")
+        self.edit_button.clicked.connect(self.edit_student)
+        row.addWidget(self.edit_button)
+        self.remove_button = QPushButton("Удалить ученика")
+        self.remove_button.clicked.connect(self.remove_student)
+        row.addWidget(self.remove_button)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        row = QHBoxLayout()
         self.card_button = QPushButton()
         self.card_button.clicked.connect(self.open_card)
         row.addWidget(self.card_button)
@@ -1715,6 +1786,15 @@ class MainWindow(QMainWindow):
                 return student
         return None
 
+    def select_uid(self, uid: int | None) -> None:
+        """Поставить выбор на ученика с этим номером, если он в списке."""
+        for row in range(self.students_list.count()):
+            item = self.students_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == uid:
+                self.students_list.setCurrentRow(row)
+                item.setSelected(True)
+                return
+
     # --- клавиши и настройки ---------------------------------------------
 
     def update_hints(self) -> None:
@@ -1811,6 +1891,57 @@ class MainWindow(QMainWindow):
         if total:
             text += f" Уроки {used} из {total}."
         announce(self, text, assertive=True)
+
+    def pick_student(self, title: str, hint: str) -> data.Student | None:
+        """Спросить, кого именно имел в виду: список и кнопка «Дальше»."""
+        if not self.store.students:
+            announce(self, "В списке пока нет учеников.")
+            return None
+        dialog = StudentPickDialog(self.store, title, hint, self)
+        announce(dialog, hint, assertive=True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.picked
+
+    def edit_student(self) -> None:
+        student = self.pick_student(
+            "Редактировать ученика",
+            "Выбери ученика, которого надо изменить, и нажми «Дальше».")
+        if student is None:
+            return
+        dialog = StudentDialog(self.store, self, student)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.refresh_all()
+        self.select_uid(student.uid)
+        self.students_list.setFocus()
+        announce(self, f"{student.name} сохранён.", assertive=True)
+
+    def remove_student(self) -> None:
+        student = self.pick_student(
+            "Удалить ученика",
+            "Выбери ученика, которого надо удалить, и нажми «Дальше».")
+        if student is None:
+            return
+        text = (f"Удалить ученика {student.name}? Вместе с ним пропадут "
+                f"его абонементы и уроки, в том числе в расписании. "
+                f"Оплаты в журнале останутся.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Удалить ученика")
+        box.setText(text)
+        yes = box.addButton("Удалить", QMessageBox.ButtonRole.DestructiveRole)
+        no = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        announce(self, text, assertive=True)
+        box.exec()
+        if box.clickedButton() is not yes:
+            announce(self, "Удаление отменено.")
+            return
+        self.store.remove_student(student)
+        self.refresh_all()
+        self.students_list.setFocus()
+        announce(self, f"{student.name} удалён вместе с абонементами, "
+                       f"уроками и записью в расписании.", assertive=True)
 
     def open_card(self) -> None:
         student = self.selected_student()
