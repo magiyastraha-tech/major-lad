@@ -12,8 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QDate, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon,
-                           QKeyCombination, QKeySequence, QPainter, QPixmap,
-                           QShortcut)
+                           QKeySequence, QPainter, QPixmap, QShortcut)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
     QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -1347,6 +1346,31 @@ def norm_keys(text: str) -> str:
     return key_text(sequence) if not sequence.isEmpty() else ""
 
 
+def combo_text(mods, key: int) -> str:
+    """Сочетание из нажатых клавиш, записанное как «Ctrl+P».
+
+    Собираем строку сами, без QKeyCombination: в новых сборках PySide6
+    (6.12) этого класса в QtGui больше нет, и программа падала при
+    запуске — ещё до первого окна. Имя самой клавиши знает QKeySequence,
+    модификаторы дописываем в том же порядке, в каком их печатает Qt:
+    Ctrl, Alt, Shift, Meta.
+    """
+    name = QKeySequence(key).toString(QKeySequence.SequenceFormat.PortableText)
+    if not name:
+        return ""
+    parts = []
+    if mods & Qt.KeyboardModifier.ControlModifier:
+        parts.append("Ctrl")
+    if mods & Qt.KeyboardModifier.AltModifier:
+        parts.append("Alt")
+    if mods & Qt.KeyboardModifier.ShiftModifier:
+        parts.append("Shift")
+    if mods & Qt.KeyboardModifier.MetaModifier:
+        parts.append("Meta")
+    parts.append(name)
+    return "+".join(parts)
+
+
 def section_label(text: str) -> QLabel:
     """Заголовок раздела настроек — жирный и крупнее обычного текста."""
     label = QLabel(text)
@@ -1396,7 +1420,7 @@ class KeyCaptureDialog(QDialog):
                                     | Qt.KeyboardModifier.ShiftModifier
                                     | Qt.KeyboardModifier.AltModifier
                                     | Qt.KeyboardModifier.MetaModifier)
-        self.keys = key_text(QKeySequence(QKeyCombination(mods, Qt.Key(key))))
+        self.keys = combo_text(mods, key)
         self.accept()
 
 
