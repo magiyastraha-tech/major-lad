@@ -366,23 +366,17 @@ class AddDateDialog(QDialog):
         self.accept()
 
 
-class ScheduleDialog(QDialog):
-    """Постоянное расписание: галочки по дням недели и время каждого дня."""
+class WeekGrid(QWidget):
+    """Дни недели галочками и время для каждого дня.
 
-    def __init__(self, store: Store, student: data.Student, parent=None):
+    Один и тот же набор нужен и в отдельном окне расписания, и в форме
+    нового абонемента — поэтому он живёт отдельным полем.
+    """
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.store = store
-        self.student = student
-        self.added = 0
-        self.setWindowTitle("Добавить расписание")
-        self.setMinimumWidth(520)
-        lay = QVBoxLayout(self)
-        hint = QLabel("Отметь галочками дни, в которые бывают уроки, "
-                      "и поставь время для каждого дня.")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
-
-        grid = QGridLayout()
+        lay = QGridLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
         self.checks: list[QCheckBox] = []
         self.hours: list[QSpinBox] = []
         self.minutes: list[QComboBox] = []
@@ -400,14 +394,70 @@ class ScheduleDialog(QDialog):
             check.toggled.connect(minute.setEnabled)
             hour.setEnabled(False)
             minute.setEnabled(False)
-            grid.addWidget(check, index, 0)
-            grid.addWidget(hour, index, 1)
-            grid.addWidget(QLabel("часов"), index, 2)
-            grid.addWidget(minute, index, 3)
+            lay.addWidget(check, index, 0)
+            lay.addWidget(hour, index, 1)
+            lay.addWidget(QLabel("часов"), index, 2)
+            lay.addWidget(minute, index, 3)
             self.checks.append(check)
             self.hours.append(hour)
             self.minutes.append(minute)
-        lay.addLayout(grid)
+
+    def picked(self) -> list[tuple[int, int, int]]:
+        """Отмеченные дни: номер дня недели, час и минуты."""
+        return [(i, self.hours[i].value(), int(self.minutes[i].currentText()))
+                for i, check in enumerate(self.checks) if check.isChecked()]
+
+
+def add_weekly_lessons(store: Store, student: data.Student,
+                       picked: list[tuple[int, int, int]],
+                       first: date | None = None) -> int:
+    """Записать уроки по отмеченным дням недели на четыре недели вперёд.
+
+    Начало — сегодня или первый день абонемента, если он позже. Уже
+    прошедшее время и уроки, которые в это же время уже стоят, пропускаются.
+    """
+    now = datetime.now()
+    start = first or date.today()
+    added = 0
+    for offset in range(0, 28):
+        day = start + timedelta(days=offset)
+        for weekday, hour, minute in picked:
+            if day.weekday() != weekday:
+                continue
+            time = dates.fmt_time(hour, minute)
+            if datetime(day.year, day.month, day.day, hour, minute) <= now:
+                continue
+            same = any(l.student == student.name and l.day == day
+                       and l.time == time and l.status == LESSON_WAIT
+                       for l in store.lessons)
+            if same:
+                continue
+            store.add_lesson(
+                student.name, day, time,
+                lesson_format=student.lesson_format,
+                direction=student.direction)
+            added += 1
+    return added
+
+
+class ScheduleDialog(QDialog):
+    """Постоянное расписание: галочки по дням недели и время каждого дня."""
+
+    def __init__(self, store: Store, student: data.Student, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.student = student
+        self.added = 0
+        self.setWindowTitle("Добавить расписание")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        hint = QLabel("Отметь галочками дни, в которые бывают уроки, "
+                      "и поставь время для каждого дня.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.grid = WeekGrid()
+        lay.addWidget(self.grid)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -418,31 +468,11 @@ class ScheduleDialog(QDialog):
         lay.addWidget(buttons)
 
     def _add(self) -> None:
-        now = datetime.now()
-        picked = [(i, self.hours[i].value(), int(self.minutes[i].currentText()))
-                  for i, check in enumerate(self.checks) if check.isChecked()]
+        picked = self.grid.picked()
         if not picked:
             announce(self, "Ни один день не отмечен. Поставь галочки на нужных днях.")
             return
-        today = date.today()
-        for offset in range(0, 28):
-            day = today + timedelta(days=offset)
-            for weekday, hour, minute in picked:
-                if day.weekday() != weekday:
-                    continue
-                time = dates.fmt_time(hour, minute)
-                if datetime(day.year, day.month, day.day, hour, minute) <= now:
-                    continue
-                same = any(l.student == self.student.name and l.day == day
-                           and l.time == time and l.status == LESSON_WAIT
-                           for l in self.store.lessons)
-                if same:
-                    continue
-                self.store.add_lesson(
-                    self.student.name, day, time,
-                    lesson_format=self.student.lesson_format,
-                    direction=self.student.direction)
-                self.added += 1
+        self.added = add_weekly_lessons(self.store, self.student, picked)
         self.accept()
 
 
@@ -543,6 +573,25 @@ class SubscriptionDialog(QDialog):
         form.addRow("Стоимость", self.price)
         lay.addLayout(form)
 
+        self.schedule_added = 0
+        self.schedule_empty = False
+        # Расписание нужно только новому абонементу: у законченного уроки
+        # уже прошли, записывать их вперёд некуда.
+        self.schedule_box: QCheckBox | None = None
+        self.grid: WeekGrid | None = None
+        if not historical:
+            self.schedule_box = QCheckBox("Заодно записать уроки по расписанию")
+            self.schedule_box.setAccessibleName(
+                "Заодно записать уроки по расписанию")
+            self.schedule_box.setChecked(True)
+            lay.addWidget(self.schedule_box)
+
+            self.grid = WeekGrid()
+            self.grid.setAccessibleName("Расписание уроков")
+            lay.addWidget(self.grid)
+            self.schedule_box.toggled.connect(self.grid.setEnabled)
+            self.grid.setEnabled(True)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Добавить")
@@ -566,6 +615,16 @@ class SubscriptionDialog(QDialog):
             word = plural(count, "урок", "урока", "уроков")
             self.store.add_payment(
                 self.student.name, f"Абонемент, {count} {word}", price)
+        if self.schedule_box is not None and self.schedule_box.isChecked():
+            picked = self.grid.picked()
+            if picked:
+                # Расписание начинается не раньше сегодняшнего дня: то, что
+                # уже прошло, вперёд не записывается.
+                first = max(date.today(), self.subscription.begins)
+                self.schedule_added = add_weekly_lessons(
+                    self.store, self.student, picked, first=first)
+            else:
+                self.schedule_empty = True
         self.accept()
 
 
@@ -687,7 +746,7 @@ class StudentCard(QDialog):
         for text, slot in (
                 ("Подтвердить урок", self.confirm_lesson),
                 ("Добавить дату", self.add_date),
-                ("Добавить расписание", self.add_schedule),
+                ("Добавить уроки по расписанию", self.add_schedule),
                 ("Докупить уроки", self.top_up),
                 ("Добавить услугу", self.add_service)):
             button = QPushButton(text)
@@ -799,6 +858,11 @@ class StudentCard(QDialog):
                 f"{dates.fmt_date(sub.begins)} добавлен.")
         if sub.total:
             text += f" Уроки 0 из {sub.total}."
+        if dialog.schedule_added:
+            word = plural(dialog.schedule_added, "урок", "урока", "уроков")
+            text += f" Расписание записано, {dialog.schedule_added} {word}."
+        elif dialog.schedule_empty:
+            text += (" Расписание не записано: ни один день не отмечен.")
         self._done(text)
 
     def add_old_subscription(self) -> None:
