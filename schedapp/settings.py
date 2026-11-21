@@ -32,6 +32,16 @@ CUES_KEY = "cues"
 # Папка для копии базы в облаке (например, Диск O):
 #     cloud = O:\Мажорный лад
 CLOUD_KEY = "cloud"
+# Порядок списков абонементов:
+#     subs_order = date   — по дате добавления, новые сверху (по умолчанию)
+#     subs_order = name   — по алфавиту
+#     subs_order = bought — по дате покупки, новые сверху
+#     subs_order = first  — по дню первого урока, новые сверху
+SUBS_ORDER_KEY = "subs_order"
+SUBS_ORDER_DATE = "date"
+SUBS_ORDER_NAME = "name"
+SUBS_ORDER_BOUGHT = "bought"
+SUBS_ORDER_FIRST = "first"
 # Значения «включено» во всех написаниях, какие можно набрать в блокноте.
 CUES_ON = ("on", "вкл", "включено", "включены", "1", "да", "yes", "true")
 
@@ -138,6 +148,31 @@ def load_cloud(folder: Path) -> Path | None:
     return Path(raw) if raw else None
 
 
+def subs_order_value(text: str | None) -> str:
+    """Порядок списков абонементов: дата добавления, алфавит, покупка, урок."""
+    raw = (text or "").strip().casefold()
+    if raw == SUBS_ORDER_NAME:
+        return SUBS_ORDER_NAME
+    if raw == SUBS_ORDER_BOUGHT:
+        return SUBS_ORDER_BOUGHT
+    if raw == SUBS_ORDER_FIRST:
+        return SUBS_ORDER_FIRST
+    return SUBS_ORDER_DATE
+
+
+def load_subs_order(folder: Path) -> str:
+    """Как разложены абонементы. По умолчанию — по дате добавления."""
+    return subs_order_value(_values(folder).get(SUBS_ORDER_KEY))
+
+
+def save_subs_order(folder: Path, order: str) -> Path:
+    """Записать только порядок абонементов, не трогая остальные настройки."""
+    values = _values(folder)
+    bindings = {code: values.get(code, keys)
+                for code, _title, keys in ACTIONS}
+    return save(folder, bindings, subs_order=subs_order_value(order))
+
+
 def save_cloud(folder: Path, cloud: Path | str | None) -> Path:
     """Записать только папку для копий, не трогая остальные настройки."""
     values = _values(folder)
@@ -150,7 +185,8 @@ def save_cloud(folder: Path, cloud: Path | str | None) -> Path:
 
 def save(folder: Path, bindings: dict[str, str],
          volume: int | None = None, cue_volume: int | None = None,
-         cues: bool | None = None, cloud: Path | str | None = None) -> Path:
+         cues: bool | None = None, cloud: Path | str | None = None,
+         subs_order: str | None = None) -> Path:
     path = Path(folder) / FILE
     if volume is None:
         volume = load_volume(folder)
@@ -160,6 +196,8 @@ def save(folder: Path, bindings: dict[str, str],
         cues = load_cues(folder)
     if cloud is None:
         cloud = load_cloud(folder) or ""
+    if subs_order is None:
+        subs_order = load_subs_order(folder)
     lines = [HEADER]
     for code, title, _ in ACTIONS:
         lines.append(f"# {title}")
@@ -172,6 +210,10 @@ def save(folder: Path, bindings: dict[str, str],
     lines.append(f"{CUES_KEY} = {'on' if cues else 'off'}")
     lines.append("# Папка для копии в облаке (пусто — копирование выключено)")
     lines.append(f"{CLOUD_KEY} = {cloud}")
+    lines.append("# Порядок абонементов: date — по дате добавления, "
+                 "name — по алфавиту, bought — по дате покупки, "
+                 "first — по дню первого урока")
+    lines.append(f"{SUBS_ORDER_KEY} = {subs_order_value(subs_order)}")
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     tmp.replace(path)

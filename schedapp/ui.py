@@ -2206,6 +2206,9 @@ class MainWindow(QMainWindow):
         self.volume = settings.load_volume(store.folder)
         self.cue_volume = settings.load_cue_volume(store.folder)
         self.cues = settings.load_cues(store.folder)
+        # Порядок списков абонементов: по дате добавления или по алфавиту.
+        # Одна настройка на обе вкладки — переключатель в каждой.
+        self.subs_order = settings.load_subs_order(store.folder)
 
         # --- копия в облако
         # Папку помним в настройках. Если её ещё нет, а Диск O на месте —
@@ -2300,11 +2303,12 @@ class MainWindow(QMainWindow):
 
         # --- вкладки абонементов
         (self.active_subs_page, self.active_subs_hint,
-         self.active_subs_list) = self._subs_tab(
+         self.active_subs_list, self.active_order_button) = self._subs_tab(
             "Действующие абонементы", "Список действующих абонементов",
             historical=False)
         (self.finished_subs_page, self.finished_subs_hint,
-         self.finished_subs_list) = self._subs_tab(
+         self.finished_subs_list,
+         self.finished_order_button) = self._subs_tab(
             "Законченные абонементы", "Список законченных абонементов",
             historical=True)
 
@@ -2391,6 +2395,7 @@ class MainWindow(QMainWindow):
         self.volume = settings.load_volume(self.store.folder)
         self.cue_volume = settings.load_cue_volume(self.store.folder)
         self.cues = settings.load_cues(self.store.folder)
+        self.subs_order = settings.load_subs_order(self.store.folder)
         self.install_shortcuts()
         self.update_hints()
         self.update_cues_button()
@@ -2624,11 +2629,12 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _subs_tab(self, title: str, name: str, historical: bool
-                  ) -> tuple[QWidget, QLabel, QListWidget]:
+                  ) -> tuple[QWidget, QLabel, QListWidget, QPushButton]:
         """Вкладка со списком абонементов: подсказка, список, кнопки.
 
         Двойной щелчок открывает карточку ученика, чей это абонемент.
         Правый щелчок или клавиша «Меню» открывает меню абонемента.
+        Кнопка «Порядок» переключает раскладку списка.
         """
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -2665,11 +2671,15 @@ class MainWindow(QMainWindow):
         remove_button.clicked.connect(
             lambda _checked=False: self.delete_subscription())
         row.addWidget(remove_button)
+        order_button = QPushButton()
+        order_button.clicked.connect(
+            lambda _checked=False: self.toggle_subs_order())
+        row.addWidget(order_button)
         row.addStretch(1)
         lay.addLayout(row)
 
         self.tabs.addTab(page, title)
-        return page, hint, lst
+        return page, hint, lst, order_button
 
     def sub_line(self, sub: data.Subscription) -> str:
         """Абонемент одной фразой: как его прочитает диктор."""
@@ -2694,14 +2704,33 @@ class MainWindow(QMainWindow):
             parts.append(f"проведено {sub.used}")
         return ", ".join(parts)
 
+    def subs_in_order(self, subs):
+        """Абонементы в выбранном порядке: алфавит, два вида дат, урок.
+
+        По дате добавления — это по номеру записи: он растёт при
+        добавлении, поэтому новые оказываются сверху. По дате покупки —
+        по дню, когда абонемент купили. По дню первого урока — по дате
+        начала абонемента, а у пробного и разового урока это дата самого
+        занятия; новые сверху.
+        """
+        if self.subs_order == settings.SUBS_ORDER_NAME:
+            return sorted(subs, key=lambda s: (s.student.casefold(), s.uid))
+        if self.subs_order == settings.SUBS_ORDER_BOUGHT:
+            return sorted(subs, key=lambda s: (s.bought, s.uid),
+                          reverse=True)
+        if self.subs_order == settings.SUBS_ORDER_FIRST:
+            return sorted(subs, key=lambda s: (s.begins, s.uid),
+                          reverse=True)
+        return sorted(subs, key=lambda s: s.uid, reverse=True)
+
     def _fill_subs(self, lst: QListWidget, subs) -> None:
-        """Наполнить список абонементов; новые сверху."""
+        """Наполнить список абонементов в выбранном порядке."""
         current = None
         item = lst.currentItem()
         if item is not None:
             current = item.data(Qt.ItemDataRole.UserRole)
         lst.clear()
-        for sub in sorted(subs, key=lambda s: (s.begins, s.uid), reverse=True):
+        for sub in self.subs_in_order(subs):
             item = QListWidgetItem(self.sub_line(sub))
             item.setData(Qt.ItemDataRole.UserRole, sub.uid)
             lst.addItem(item)
@@ -2718,6 +2747,57 @@ class MainWindow(QMainWindow):
                          if not s.finished])
         self._fill_subs(self.finished_subs_list,
                         [s for s in self.store.subscriptions if s.finished])
+
+    # Порядок переключателя: каждое нажатие — следующий вид.
+    SUBS_ORDERS = (settings.SUBS_ORDER_DATE, settings.SUBS_ORDER_NAME,
+                   settings.SUBS_ORDER_BOUGHT, settings.SUBS_ORDER_FIRST)
+    ORDER_SHORT = {
+        settings.SUBS_ORDER_DATE: "по дате добавления",
+        settings.SUBS_ORDER_NAME: "по алфавиту",
+        settings.SUBS_ORDER_BOUGHT: "по дате покупки",
+        settings.SUBS_ORDER_FIRST: "по дню первого урока",
+    }
+
+    def order_words(self) -> str:
+        """Порядок списков словами — для подсказки и объявления."""
+        words = {
+            settings.SUBS_ORDER_DATE: "по дате добавления, новые сверху",
+            settings.SUBS_ORDER_NAME: "по алфавиту",
+            settings.SUBS_ORDER_BOUGHT: "по дате покупки, новые сверху",
+            settings.SUBS_ORDER_FIRST: "по дню первого урока, новые сверху",
+        }
+        return words.get(self.subs_order, words[settings.SUBS_ORDER_DATE])
+
+    def next_order(self) -> str:
+        """Какой порядок включится при следующем нажатии."""
+        try:
+            index = self.SUBS_ORDERS.index(self.subs_order)
+        except ValueError:
+            return self.SUBS_ORDERS[0]
+        return self.SUBS_ORDERS[(index + 1) % len(self.SUBS_ORDERS)]
+
+    def toggle_subs_order(self) -> None:
+        """Переключить порядок абонементов и переложить оба списка."""
+        self.subs_order = self.next_order()
+        try:
+            settings.save_subs_order(self.store.folder, self.subs_order)
+        except OSError:
+            # Порядок — мелочь: не записался на диск, но в этой сессии
+            # работает.
+            pass
+        self.update_hints()
+        self.refresh_subscriptions()
+        announce(self, f"Абонементы разложены {self.order_words()}.")
+
+    def _update_order_buttons(self) -> None:
+        """Кнопка называет текущий порядок; диктор скажет, что изменится."""
+        text = "Порядок: " + self.ORDER_SHORT.get(
+            self.subs_order, self.ORDER_SHORT[settings.SUBS_ORDER_DATE])
+        name = (f"Абонементы разложены {self.order_words()}. Нажми, чтобы "
+                f"разложить {self.ORDER_SHORT[self.next_order()]}")
+        for button in (self.active_order_button, self.finished_order_button):
+            button.setText(text)
+            button.setAccessibleName(name)
 
     def open_sub_card(self, item: QListWidgetItem) -> None:
         """Из списка абонементов — в карточку его ученика."""
@@ -3210,15 +3290,20 @@ class MainWindow(QMainWindow):
         sub_menu = ("Кнопки под списком и меню по правому щелчку или "
                     "клавише «Меню»: добавить, редактировать, удалить "
                     "абонемент. Выгрузить можно из меню.")
+        order = f"Сейчас — {self.order_words()}. "
         self.active_subs_hint.setText(
-            "Все действующие абонементы, новые сверху. " + sub_tip + " "
-            + sub_menu)
+            "Все действующие абонементы. " + order + sub_tip + " "
+            + sub_menu + " Кнопка «Порядок» переключает раскладку: по "
+            "дате добавления, по алфавиту, по дате покупки и по дню "
+            "первого урока.")
         self.finished_subs_hint.setText(
-            "Все законченные абонементы, пробные и разовые уроки, новые "
-            "сверху. Пробный или разовый урок добавляется кнопками "
+            "Все законченные абонементы, пробные и разовые уроки. " + order
+            + "Пробный или разовый урок добавляется кнопками "
             "«Добавить пробный урок» и «Добавить разовый урок»: ученик, "
             "дата, очно или онлайн, направление, у разового ещё цена. "
-            + sub_tip + " " + sub_menu)
+            + sub_tip + " " + sub_menu + " Кнопка «Порядок» переключает "
+            "раскладку: по дате добавления, по алфавиту, по дате покупки "
+            "и по дню первого урока.")
         self.services_hint.setText(
             "Оплаченные услуги, новые сверху. Кнопки под списком и меню по "
             "правому щелчку или клавише «Меню»: добавить, редактировать, "
@@ -3233,6 +3318,7 @@ class MainWindow(QMainWindow):
         self.settings_button.setText(
             f"Настройки ({settings_keys})" if settings_keys else "Настройки")
         self.update_cues_button()
+        self._update_order_buttons()
 
     def update_cues_button(self) -> None:
         """Кнопка называет своё состояние словами — диктор прочитает его."""
