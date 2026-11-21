@@ -2602,6 +2602,8 @@ class MainWindow(QMainWindow):
 
         Двойной щелчок открывает карточку ученика, чей это абонемент.
         Правый щелчок или клавиша «Меню» открывает меню абонемента.
+        Кнопка «Добавить проведённый урок» отмечает урок в выбранном
+        абонементе — так же, как в карточке ученика.
         Кнопка «Порядок» переключает раскладку списка.
         """
         page = QWidget()
@@ -2631,6 +2633,10 @@ class MainWindow(QMainWindow):
             single_button.clicked.connect(
                 lambda _checked=False: self.add_single_lesson())
             row.addWidget(single_button)
+        done_button = QPushButton("Добавить проведённый урок")
+        done_button.clicked.connect(
+            lambda _checked=False: self.add_done_lesson())
+        row.addWidget(done_button)
         edit_button = QPushButton("Редактировать абонемент")
         edit_button.clicked.connect(
             lambda _checked=False: self.edit_subscription())
@@ -2801,8 +2807,9 @@ class MainWindow(QMainWindow):
 
         Клавиатура присылает точку в центре списка, а не на строке, —
         тогда меню открывается у выбранного абонемента. «Добавить» есть
-        всегда, остальные пункты — когда абонемент выбран. Меню родное,
-        диктор читает пункты сам.
+        всегда, остальные пункты — когда абонемент выбран. Выбранный
+        абонемент можно отметить уроком, поправить, удалить или
+        выгрузить. Меню родное, диктор читает пункты сам.
         """
         item = lst.itemAt(pos)
         if item is None:
@@ -2822,9 +2829,10 @@ class MainWindow(QMainWindow):
         if lst is self.finished_subs_list:
             trial = menu.addAction("Добавить пробный урок")
             single = menu.addAction("Добавить разовый урок")
-        edit = remove = export = None
+        done = edit = remove = export = None
         if sub is not None:
             menu.addSeparator()
+            done = menu.addAction("Добавить проведённый урок")
             edit = menu.addAction("Редактировать")
             remove = menu.addAction("Удалить")
             export = menu.addAction("Экспортировать")
@@ -2837,6 +2845,8 @@ class MainWindow(QMainWindow):
             self.add_trial_lesson()
         elif chosen is single:
             self.add_single_lesson()
+        elif chosen is done:
+            self.add_done_lesson(sub)
         elif chosen is edit:
             self.edit_subscription(sub)
         elif chosen is remove:
@@ -2878,7 +2888,8 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentWidget(self.finished_subs_page)
             text = (f"Законченный абонемент {student.name} с "
                     f"{dates.fmt_date(sub.begins)} добавлен. Отметь в нём "
-                    f"проведённые уроки в карточке ученика.")
+                    f"проведённые уроки кнопкой «Добавить проведённый "
+                    f"урок».")
         else:
             self.tabs.setCurrentWidget(self.active_subs_page)
             text = (f"{student.name}, абонемент с "
@@ -2927,7 +2938,8 @@ class MainWindow(QMainWindow):
                 f"{dates.fmt_date(sub.bought)} добавлен.")
         if sub.price:
             text += f" Стоимость: {money(sub.price)} рублей."
-        text += " Отметь его проведённым в карточке ученика."
+        text += (" Отметь его проведённым кнопкой «Добавить проведённый "
+                 "урок».")
         announce(self, text, assertive=True)
 
     def add_trial_lesson(self) -> None:
@@ -2935,6 +2947,40 @@ class MainWindow(QMainWindow):
 
     def add_single_lesson(self) -> None:
         self.add_one_off_lesson("single")
+
+    def add_done_lesson(
+            self, sub: data.Subscription | None = None) -> None:
+        """Проведённый урок в выбранном абонементе — как в карточке.
+
+        Кнопка на вкладке действующих или законченных и пункт меню
+        работают с абонементом, выбранным в списке. Урок с пустым
+        временем: он уже прошёл, расписание его не касается.
+        """
+        if sub is None:
+            sub = self.selected_subscription()
+        if sub is None:
+            announce(self, "Сначала выбери абонемент в списке на вкладке "
+                           "действующих или законченных.", assertive=True)
+            return
+        was_finished = sub.finished
+        dialog = DoneLessonDialog(self.store, sub, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Урок не добавлен.")
+            return
+        self.refresh_all()
+        day = dates.fmt_date(dialog.day_value)
+        if dialog.count_value > 1:
+            word = plural(dialog.count_value, "урок", "урока", "уроков")
+            text = f"{sub.student}: записано {word} {dialog.count_value}, {day}."
+        else:
+            text = f"{sub.student}: урок {day} записан."
+        if sub.total:
+            text += f" В абонементе уроки {sub.used} из {sub.total}."
+        else:
+            text += f" Всего уроков {sub.used}."
+        if sub.finished and not was_finished:
+            text += " Уроки кончились, абонемент перешёл в законченные."
+        announce(self, text, assertive=True)
 
     def edit_subscription(
             self, sub: data.Subscription | None = None) -> None:
@@ -3256,8 +3302,9 @@ class MainWindow(QMainWindow):
                    f"в текстовый файл." if sub_keys
                    else "Выгрузка абонемента в текстовый файл без клавиши.")
         sub_menu = ("Кнопки под списком и меню по правому щелчку или "
-                    "клавише «Меню»: добавить, редактировать, удалить "
-                    "абонемент. Выгрузить можно из меню.")
+                    "клавише «Меню»: добавить абонемент, отметить "
+                    "проведённый урок в выбранном абонементе, "
+                    "редактировать, удалить. Выгрузить можно из меню.")
         order = f"Сейчас — {self.order_words()}. "
         self.active_subs_hint.setText(
             "Все действующие абонементы. " + order + sub_tip + " "
