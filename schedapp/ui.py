@@ -63,6 +63,14 @@ def rubles(amount: int) -> str:
     return f"{money(amount)} {plural(amount, 'рубль', 'рубля', 'рублей')}"
 
 
+def split_name(name: str) -> tuple[str, str]:
+    """Разложить «Имя Фамилия» на два поля: имя — первое слово."""
+    parts = (name or "").split()
+    if not parts:
+        return "", ""
+    return parts[0], " ".join(parts[1:])
+
+
 def lesson_line(lesson: data.Lesson, with_status: bool = True) -> str:
     """Урок одной фразой: как его прочитает диктор."""
     parts = [dates.human_date(lesson.day), f"в {lesson.time}",
@@ -93,7 +101,11 @@ def make_icon() -> QIcon:
 
 
 class StudentDialog(QDialog):
-    """Карточка нового ученика: имя, контакты, формат, направление, абонемент."""
+    """Карточка ученика: имя, фамилия, телефон, почта.
+
+    Больше ничего не спрашиваем: формат, направление и абонемент заводятся
+    потом — при добавлении пробного, разового урока или абонемента.
+    """
 
     def __init__(self, store: Store, parent=None, student: data.Student | None = None):
         super().__init__(parent)
@@ -107,10 +119,18 @@ class StudentDialog(QDialog):
         form = QFormLayout(self)
         form.setSpacing(10)
 
-        self.name = QLineEdit(student.name if student else "")
-        self.name.setAccessibleName("Имя и фамилия")
-        self.name.setPlaceholderText("Андрей Булкин")
-        form.addRow("Имя и фамилия", self.name)
+        # Имя обязательно, фамилия нет. В базе ученик по-прежнему хранится
+        # одной строкой «Имя Фамилия» — так его видят все остальные списки.
+        first, last = split_name(student.name if student else "")
+        self.first_name = QLineEdit(first)
+        self.first_name.setAccessibleName("Имя")
+        self.first_name.setPlaceholderText("Андрей")
+        form.addRow("Имя", self.first_name)
+
+        self.last_name = QLineEdit(last)
+        self.last_name.setAccessibleName("Фамилия")
+        self.last_name.setPlaceholderText("Булкин")
+        form.addRow("Фамилия", self.last_name)
 
         self.phone = QLineEdit(student.phone if student else "")
         self.phone.setAccessibleName("Телефон")
@@ -119,45 +139,6 @@ class StudentDialog(QDialog):
         self.email = QLineEdit(student.email if student else "")
         self.email.setAccessibleName("Почта")
         form.addRow("Почта", self.email)
-
-        self.format = QComboBox()
-        self.format.addItems(FORMATS)
-        self.format.setAccessibleName("Очно или онлайн")
-        if student:
-            self.format.setCurrentText(student.lesson_format)
-        form.addRow("Очно или онлайн", self.format)
-
-        self.direction = QComboBox()
-        self.direction.addItems(DIRECTIONS)
-        self.direction.setAccessibleName("Направление")
-        if student:
-            self.direction.setCurrentText(student.direction)
-        form.addRow("Направление", self.direction)
-
-        # Абонемент спрашивается только у нового ученика. У существующего
-        # абонемент заводится кнопкой «Добавить новый абонемент» в карточке —
-        # иначе правка контактов молча обнуляла бы счётчик.
-        self.lessons = None
-        self.price = None
-        self.start = None
-        if adding:
-            self.lessons = QSpinBox()
-            self.lessons.setRange(0, 500)
-            self.lessons.setAccessibleName("Сколько уроков куплено")
-            self.lessons.setValue(8)
-            form.addRow("Куплено уроков", self.lessons)
-
-            self.price = QSpinBox()
-            self.price.setRange(0, 500_000)
-            self.price.setSingleStep(500)
-            self.price.setSuffix(" ₽")
-            self.price.setAccessibleName("Цена абонемента")
-            form.addRow("Цена абонемента", self.price)
-
-            # Покупка и начало абонемента могут быть разными днями: человек
-            # оплатил сегодня, а уроки начинаются с понедельника.
-            self.start = make_date_edit("С какого числа действует абонемент")
-            form.addRow("Абонемент с числа", self.start)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -168,36 +149,25 @@ class StudentDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
-        self.name.setFocus()
+        self.first_name.setFocus()
 
     def _accept(self) -> None:
-        name = self.name.text().strip()
-        if not name:
-            announce(self, "Имя не заполнено. Напиши имя и фамилию ученика.")
-            self.name.setFocus()
+        first = self.first_name.text().strip()
+        if not first:
+            announce(self, "Имя не заполнено. Напиши имя ученика.")
+            self.first_name.setFocus()
             return
+        name = " ".join(part for part in (first, self.last_name.text().strip())
+                        if part)
         other = self.store.find_student(name)
         if other is not None and other is not self.student:
             announce(self, f"Ученик {name} уже есть в списке.")
-            self.name.setFocus()
+            self.first_name.setFocus()
             return
         if self.student is None:
             student = self.store.add_student(
-                name, phone=self.phone.text(), email=self.email.text(),
-                lesson_format=self.format.currentText(),
-                direction=self.direction.currentText())
+                name, phone=self.phone.text(), email=self.email.text())
             self.created = student
-            count = self.lessons.value()
-            if count > 0:
-                price = self.price.value()
-                self.store.add_subscription(
-                    student.name, count, price=price,
-                    direction=student.direction,
-                    started=picked_date(self.start))
-                if price > 0:
-                    word = plural(count, "урок", "урока", "уроков")
-                    self.store.add_payment(
-                        student.name, f"Абонемент, {count} {word}", price)
             self.accept()
             return
         student = self.student
@@ -205,8 +175,6 @@ class StudentDialog(QDialog):
         student.name = name
         student.phone = self.phone.text().strip()
         student.email = self.email.text().strip()
-        student.lesson_format = self.format.currentText()
-        student.direction = self.direction.currentText()
         # Абонементы, уроки и оплаты хранят имя ученика. Переименование
         # должно пройти по ним тоже, иначе карточка останется на старом
         # имени и покажет пустоту.
