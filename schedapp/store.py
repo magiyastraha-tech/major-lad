@@ -1,30 +1,48 @@
 """Данные программы: ученики, абонементы, уроки и оплаты.
 
-Всё лежит простыми текстовыми файлами в папке Data рядом с программой:
-их можно открыть блокнотом, прочитать и поправить руками. Строка файла —
-поля через вертикальную черту, строки с решётки в начале — пояснения,
-программа их не читает. При запуске программа читает файлы заново,
-поэтому правка из блокнота не теряется.
+Всё лежит в одном файле базы данных в папке Data рядом с программой:
+`Мажорный лад Расписание.db`. База — обычный файл SQLite, его не нужно
+открывать блокнотом: программе он нужен целиком, а руками данные правятся
+через саму программу. Зато одна база вместо четырёх текстовых файлов не
+рассыпается на половину записи и не путает поля при ручной правке.
 
-Записи хранятся не «как попало», а с номером в первом поле: по нему
-программа отличает один урок от другого, даже если у двух учеников
-одинаковое имя или урок перенесли на другой день.
+Что было раньше: четыре текстовых файла (`Ученики.txt`, `Абонементы.txt`,
+`Расписание.txt`, `Журнал оплат.txt`). При первом запуске новой версии
+программа сама переносит из них всё в базу, а сами файлы убирает в папку
+`Data/Архив старой версии` — на случай, если понадобится посмотреть, как
+было. Ничего не пропадает.
+
+Каждый запуск перед открытием базы делает резервную копию в `Data/Резерв`
+(последние 14 дней). Если что-то случится с файлом базы, копия под рукой.
+
+Записи хранятся с номером в первом поле: по нему программа отличает один
+урок от другого, даже если у двух учеников одинаковое имя или урок
+перенесли на другой день.
 """
 from __future__ import annotations
 
 import os
+import shutil
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
 from . import dates, paths
 
-SEP = " | "
+DB_FILE = "Мажорный лад Расписание.db"
+BACKUP_DIR = "Резерв"
+ARCHIVE_DIR = "Архив старой версии"
+BACKUP_KEEP = 14
+SCHEMA_VERSION = 1
 
+# Старые текстовые файлы: из них переносим данные при первом запуске.
 STUDENTS_FILE = "Ученики.txt"
 SUBSCRIPTIONS_FILE = "Абонементы.txt"
 LESSONS_FILE = "Расписание.txt"
 PAYMENTS_FILE = "Журнал оплат.txt"
+LEGACY_FILES = (STUDENTS_FILE, SUBSCRIPTIONS_FILE, LESSONS_FILE,
+                PAYMENTS_FILE)
 
 LESSON_WAIT = "ожидается"
 LESSON_DONE = "проведён"
@@ -36,27 +54,48 @@ DIRECTIONS = ("Вокал", "Аккомпанирующая гитара", "Ак
               "Электрогитара")
 SERVICES = ("Аренда гитары", "Настройка гитары", "Студийная работа")
 
-# Заголовки файлов. Пишутся при первом запуске и остаются в файле, чтобы
-# через месяц было видно, где какое поле.
-_STUDENTS_HEAD = (
-    "# Ученики программы «Мажорный лад Расписание».",
-    "# Поля через вертикальную черту:",
-    "# номер | имя | телефон | почта | очно или онлайн | направление | заметка",
-)
-_SUBSCRIPTIONS_HEAD = (
-    "# Абонементы: кто сколько уроков купил и сколько уже прошло.",
-    "# Поля: номер | дата покупки | ученик | направление | куплено | прошло | сумма",
-)
-_LESSONS_HEAD = (
-    "# Расписание уроков.",
-    "# Поля: номер | дата | время | ученик | очно или онлайн | направление |"
-    " состояние | сумма | заметка",
-    "# Состояние: ожидается, проведён, отменён.",
-)
-_PAYMENTS_HEAD = (
-    "# Журнал оплат: каждая строка — приход денег.",
-    "# Поля: номер | дата | ученик | за что | сумма",
-)
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS students (
+    uid INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    phone TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '',
+    lesson_format TEXT NOT NULL DEFAULT 'Очно',
+    direction TEXT NOT NULL DEFAULT 'Акустическая гитара',
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS subscriptions (
+    uid INTEGER PRIMARY KEY,
+    bought TEXT NOT NULL,
+    student TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT '',
+    total INTEGER NOT NULL DEFAULT 0,
+    used INTEGER NOT NULL DEFAULT 0,
+    price INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS lessons (
+    uid INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    time TEXT NOT NULL DEFAULT '',
+    student TEXT NOT NULL,
+    lesson_format TEXT NOT NULL DEFAULT 'Очно',
+    direction TEXT NOT NULL DEFAULT 'Акустическая гитара',
+    status TEXT NOT NULL DEFAULT 'ожидается',
+    price INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS payments (
+    uid INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    student TEXT NOT NULL,
+    what TEXT NOT NULL DEFAULT '',
+    amount INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+"""
 
 
 @dataclass
@@ -115,7 +154,10 @@ class Payment:
 
 
 def _read_rows(path: Path) -> list[list[str]]:
-    """Строки файла, уже разбитые на поля. Пояснения пропускаются."""
+    """Строки старого текстового файла, разбитые на поля.
+
+    Нужна только для переноса из версии с txt: пояснения пропускаются.
+    """
     if not path.exists():
         return []
     rows: list[list[str]] = []
@@ -132,21 +174,7 @@ def _read_rows(path: Path) -> list[list[str]]:
     return rows
 
 
-def _write_rows(path: Path, head: tuple[str, ...],
-                rows: list[list[str]]) -> None:
-    """Пишет файл целиком: сначала во временный, потом подменяет.
-
-    Подмена нужна, чтобы при сбое посреди записи старый файл остался
-    целым, а не превратился в половину строки.
-    """
-    lines = list(head) + [SEP.join(str(part) for part in row) for row in rows]
-    text = "\r\n".join(lines) + "\r\n"
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def _int(text: str, default: int = 0) -> int:
+def _int(text, default: int = 0) -> int:
     try:
         return int(str(text).strip())
     except (TypeError, ValueError):
@@ -172,29 +200,144 @@ def lessons_word(count: int) -> str:
 
 
 class Store:
-    """Все данные программы в памяти, с записью в файлы после изменения."""
+    """Все данные программы в памяти, с записью в базу после изменения."""
 
     def __init__(self, folder: Path | None = None):
         self.folder = Path(folder) if folder is not None else paths.data_dir()
         self.folder.mkdir(parents=True, exist_ok=True)
+        # Одна фраза для диктора о переносе старых данных — пусто, если
+        # переносить было нечего.
+        self.notice = ""
         self.students: list[Student] = []
         self.subscriptions: list[Subscription] = []
         self.lessons: list[Lesson] = []
         self.payments: list[Payment] = []
+
+        self._db_path = self.folder / DB_FILE
+        migrated = not self._db_path.exists()
+        if not migrated and self._db_empty():
+            # Базу стёрли или она осталась пустой — старые файлы ещё
+            # могут лежать рядом, тогда поднимаем данные из них.
+            migrated = any((self.folder / name).exists()
+                           for name in LEGACY_FILES)
+        self._backup()
+        self._conn = sqlite3.connect(self._db_path)
+        self._conn.row_factory = sqlite3.Row
+        with self._conn:
+            self._conn.executescript(_SCHEMA)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema', ?)",
+                (str(SCHEMA_VERSION),))
         self.load()
+        if migrated:
+            self._import_legacy()
 
-    # --- файлы -----------------------------------------------------------
+    # --- база ------------------------------------------------------------
 
-    def _path(self, name: str) -> Path:
-        return self.folder / name
+    def _backup(self) -> None:
+        """Копия базы перед запуском, по одной на день, последние 14."""
+        if not self._db_path.exists():
+            return
+        folder = self.folder / BACKUP_DIR
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"{date.today():%Y-%m-%d}{self._db_path.suffix}"
+            if not target.exists():
+                shutil.copy2(self._db_path, target)
+            copies = sorted(folder.glob("*.db"))
+            for old in copies[:-BACKUP_KEEP]:
+                old.unlink(missing_ok=True)
+        except OSError:
+            # Резервная копия — страховка, а не условие работы: не вышло,
+            # программа всё равно должна открыться.
+            pass
+
+    def _db_empty(self) -> bool:
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                for table in ("students", "subscriptions", "lessons",
+                              "payments"):
+                    row = conn.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()
+                    if row and row[0]:
+                        return False
+                return True
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return False
+
+    def _write(self, table: str, columns: tuple[str, ...],
+               rows: list[tuple]) -> None:
+        """Таблица переписывается целиком в одной транзакции.
+
+        Данных немного (сотни строк), зато не бывает полузаписанного
+        состояния: либо вся таблица новая, либо вся старая.
+        """
+        marks = ", ".join("?" for _ in columns)
+        with self._conn:
+            self._conn.execute(f"DELETE FROM {table}")
+            self._conn.executemany(
+                f"INSERT INTO {table}({', '.join(columns)}) VALUES ({marks})",
+                rows)
 
     def load(self) -> None:
-        self.students = []
-        for row in _read_rows(self._path(STUDENTS_FILE)):
+        self.students = [
+            Student(uid=row["uid"], name=row["name"], phone=row["phone"],
+                    email=row["email"],
+                    lesson_format=row["lesson_format"] or FORMATS[0],
+                    direction=row["direction"] or DIRECTIONS[2],
+                    note=row["note"])
+            for row in self._conn.execute(
+                "SELECT * FROM students ORDER BY uid")]
+
+        self.subscriptions = []
+        for row in self._conn.execute(
+                "SELECT * FROM subscriptions ORDER BY uid"):
+            day = dates.parse_date(row["bought"]) or date.today()
+            self.subscriptions.append(Subscription(
+                uid=row["uid"], bought=day, student=row["student"],
+                direction=row["direction"], total=_int(row["total"]),
+                used=_int(row["used"]), price=_int(row["price"])))
+
+        self.lessons = []
+        for row in self._conn.execute("SELECT * FROM lessons ORDER BY uid"):
+            day = dates.parse_date(row["day"])
+            if day is None:
+                continue
+            status = (row["status"] if row["status"] in LESSON_STATES
+                      else LESSON_WAIT)
+            self.lessons.append(Lesson(
+                uid=row["uid"], day=day, time=row["time"],
+                student=row["student"],
+                lesson_format=row["lesson_format"] or FORMATS[0],
+                direction=row["direction"] or DIRECTIONS[2],
+                status=status, price=_int(row["price"]), note=row["note"]))
+
+        self.payments = []
+        for row in self._conn.execute("SELECT * FROM payments ORDER BY uid"):
+            day = dates.parse_date(row["day"])
+            if day is None:
+                continue
+            self.payments.append(Payment(
+                uid=row["uid"], day=day, student=row["student"],
+                what=row["what"], amount=_int(row["amount"])))
+
+    # --- перенос старых txt ----------------------------------------------
+
+    def _import_legacy(self) -> None:
+        """Однократный перенос из четырёх txt в базу."""
+        folder = self.folder
+        if not any((folder / name).exists() for name in LEGACY_FILES):
+            return
+
+        students: list[Student] = []
+        for row in _read_rows(folder / STUDENTS_FILE):
             if len(row) < 2 or not row[1]:
                 continue
             row += [""] * (7 - len(row))
-            self.students.append(Student(
+            students.append(Student(
                 uid=_int(row[0]),
                 name=row[1],
                 phone=row[2],
@@ -204,24 +347,19 @@ class Store:
                 note=row[6],
             ))
 
-        self.subscriptions = []
-        for row in _read_rows(self._path(SUBSCRIPTIONS_FILE)):
+        subscriptions: list[Subscription] = []
+        for row in _read_rows(folder / SUBSCRIPTIONS_FILE):
             if len(row) < 5:
                 continue
             row += [""] * (7 - len(row))
             day = dates.parse_date(row[1]) or date.today()
-            self.subscriptions.append(Subscription(
-                uid=_int(row[0]),
-                bought=day,
-                student=row[2],
-                direction=row[3],
-                total=_int(row[4]),
-                used=_int(row[5]),
-                price=_int(row[6]),
-            ))
+            subscriptions.append(Subscription(
+                uid=_int(row[0]), bought=day, student=row[2],
+                direction=row[3], total=_int(row[4]), used=_int(row[5]),
+                price=_int(row[6])))
 
-        self.lessons = []
-        for row in _read_rows(self._path(LESSONS_FILE)):
+        lessons: list[Lesson] = []
+        for row in _read_rows(folder / LESSONS_FILE):
             if len(row) < 4:
                 continue
             row += [""] * (9 - len(row))
@@ -229,68 +367,135 @@ class Store:
             if day is None:
                 continue
             status = row[6] if row[6] in LESSON_STATES else LESSON_WAIT
-            self.lessons.append(Lesson(
-                uid=_int(row[0]),
-                day=day,
-                time=row[2],
-                student=row[3],
+            lessons.append(Lesson(
+                uid=_int(row[0]), day=day, time=row[2], student=row[3],
                 lesson_format=row[4] or FORMATS[0],
-                direction=row[5] or DIRECTIONS[2],
-                status=status,
-                price=_int(row[7]),
-                note=row[8],
-            ))
+                direction=row[5] or DIRECTIONS[2], status=status,
+                price=_int(row[7]), note=row[8]))
 
-        self.payments = []
-        for row in _read_rows(self._path(PAYMENTS_FILE)):
+        payments: list[Payment] = []
+        for row in _read_rows(folder / PAYMENTS_FILE):
             if len(row) < 4:
                 continue
             row += [""] * (5 - len(row))
             day = dates.parse_date(row[1])
             if day is None:
                 continue
-            self.payments.append(Payment(
-                uid=_int(row[0]),
-                day=day,
-                student=row[2],
-                what=row[3],
-                amount=_int(row[4]),
-            ))
+            payments.append(Payment(
+                uid=_int(row[0]), day=day, student=row[2], what=row[3],
+                amount=_int(row[4])))
 
-        # Файлов ещё нет — создаём их с пояснениями: так в папке Data
-        # сразу видно, что за что отвечает.
-        for name, head, items in (
-                (STUDENTS_FILE, _STUDENTS_HEAD, self.students),
-                (SUBSCRIPTIONS_FILE, _SUBSCRIPTIONS_HEAD, self.subscriptions),
-                (LESSONS_FILE, _LESSONS_HEAD, self.lessons),
-                (PAYMENTS_FILE, _PAYMENTS_HEAD, self.payments)):
-            if not self._path(name).exists():
-                _write_rows(self._path(name), head, [])
+        # Нумерация: если в txt номеров не было, проставляем по порядку.
+        for items in (students, subscriptions, lessons, payments):
+            seen: set[int] = set()
+            for item in items:
+                if item.uid <= 0 or item.uid in seen:
+                    item.uid = max(seen, default=0) + 1
+                seen.add(item.uid)
+
+        self.students, self.subscriptions = students, subscriptions
+        self.lessons, self.payments = lessons, payments
+        self.save_students()
+        self.save_subscriptions()
+        self.save_lessons()
+        self.save_payments()
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                ("legacy_migrated", datetime.now().strftime("%Y-%m-%d %H:%M")))
+
+        # Старые файлы не удаляем — убираем в архив.
+        archive = folder / ARCHIVE_DIR
+        try:
+            archive.mkdir(parents=True, exist_ok=True)
+            for name in LEGACY_FILES:
+                source = folder / name
+                if source.exists():
+                    os.replace(source, archive / name)
+        except OSError:
+            pass
+
+        if students or lessons or payments:
+            self.notice = (
+                f"Данные из старых файлов перенесены в базу: "
+                f"{len(students)} {plural(len(students), 'ученик', 'ученика', 'учеников')}, "
+                f"{len(lessons)} {lessons_word(len(lessons))}, "
+                f"{len(payments)} {plural(len(payments), 'оплата', 'оплаты', 'оплат')}. "
+                f"Старые файлы лежат в папке Архив старой версии.")
+
+    # --- сохранение ------------------------------------------------------
 
     def save_students(self) -> None:
-        _write_rows(
-            self._path(STUDENTS_FILE), _STUDENTS_HEAD,
-            [[s.uid, s.name, s.phone, s.email, s.lesson_format,
-              s.direction, s.note] for s in self.students])
+        self._write("students",
+                    ("uid", "name", "phone", "email", "lesson_format",
+                     "direction", "note"),
+                    [(s.uid, s.name, s.phone, s.email, s.lesson_format,
+                      s.direction, s.note) for s in self.students])
 
     def save_subscriptions(self) -> None:
-        _write_rows(
-            self._path(SUBSCRIPTIONS_FILE), _SUBSCRIPTIONS_HEAD,
-            [[s.uid, dates.fmt_date(s.bought), s.student, s.direction,
-              s.total, s.used, s.price] for s in self.subscriptions])
+        self._write("subscriptions",
+                    ("uid", "bought", "student", "direction", "total",
+                     "used", "price"),
+                    [(s.uid, dates.fmt_date(s.bought), s.student,
+                      s.direction, s.total, s.used, s.price)
+                     for s in self.subscriptions])
 
     def save_lessons(self) -> None:
-        _write_rows(
-            self._path(LESSONS_FILE), _LESSONS_HEAD,
-            [[l.uid, dates.fmt_date(l.day), l.time, l.student,
-              l.lesson_format, l.direction, l.status, l.price, l.note]
-             for l in self.lessons])
+        self._write("lessons",
+                    ("uid", "day", "time", "student", "lesson_format",
+                     "direction", "status", "price", "note"),
+                    [(l.uid, dates.fmt_date(l.day), l.time, l.student,
+                      l.lesson_format, l.direction, l.status, l.price,
+                      l.note) for l in self.lessons])
 
     def save_payments(self) -> None:
-        _write_rows(
-            self._path(PAYMENTS_FILE), _PAYMENTS_HEAD,
-            [[p.uid, dates.fmt_date(p.day), p.student, p.what, p.amount]
-             for p in self.payments])
+        self._write("payments", ("uid", "day", "student", "what", "amount"),
+                    [(p.uid, dates.fmt_date(p.day), p.student, p.what,
+                      p.amount) for p in self.payments])
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
+
+    # --- выгрузка в текст -------------------------------------------------
+
+    def export_text(self, path: Path | None = None) -> Path:
+        """Читаемый текстовый отчёт по всем данным — для диктора и глаз."""
+        target = Path(path) if path is not None else self.folder / "Выгрузка.txt"
+        lines = ["Мажорный лад Расписание. Выгрузка данных.",
+                 f"Сделана {date.today():%d.%m.%Y}.", ""]
+        lines.append(f"Ученики: {len(self.students)}.")
+        for student in sorted(self.students, key=lambda s: s.name.casefold()):
+            used, total = self.balance(student.name)
+            balance = (f"Уроки {used} из {total}" if total
+                       else "Абонемента нет")
+            lines.append(f"{student.name}. {balance}. "
+                         f"{student.lesson_format}, {student.direction}.")
+            if student.phone:
+                lines.append(f"Телефон: {student.phone}.")
+        lines.append("")
+        lines.append(f"Уроки: {len(self.lessons)}.")
+        for lesson in sorted(self.lessons, key=lambda l: l.stamp):
+            lines.append(f"{dates.fmt_date(lesson.day)} в {lesson.time}, "
+                         f"{lesson.student}, {lesson.direction}, "
+                         f"{lesson.status}.")
+        lines.append("")
+        lines.append(f"Оплаты: {len(self.payments)}.")
+        for payment in sorted(self.payments, key=lambda p: (p.day, p.uid)):
+            lines.append(f"{dates.fmt_date(payment.day)}, {payment.student}, "
+                         f"{payment.what}, {money(payment.amount)} рублей.")
+        lines.append("")
+        today = date.today()
+        month = dates.MONTHS_NOM[today.month - 1]
+        lines.append(f"Заработано за {month} {today.year}: "
+                     f"{money(self.earned_in_month(today.year, today.month))} "
+                     f"рублей.")
+        tmp = target.parent / (target.name + ".tmp")
+        tmp.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        os.replace(tmp, target)
+        return target
 
     # --- ученики ---------------------------------------------------------
 

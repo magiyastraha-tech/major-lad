@@ -118,8 +118,9 @@ def announce(widget: QWidget, text: str, assertive: bool = False) -> None:
 class ShortcutFilter(QObject):
     """Перехват горячих клавиш на всё приложение.
 
-    F2, F3, F4 и F5 должны работать из любого окна программы, даже если
-    фокус в поле ввода: иначе нажатие уйдёт в поле и ничего не случится.
+    F2, F3, F4, F5 и F9 должны работать из любого окна программы, даже
+    если фокус в поле ввода: иначе нажатие уйдёт в поле и ничего не
+    случится.
     """
 
     def __init__(self, handler, parent: QObject | None = None):
@@ -127,6 +128,7 @@ class ShortcutFilter(QObject):
         self._handler = handler
         self._keys = {
             Qt.Key.Key_F2, Qt.Key.Key_F3, Qt.Key.Key_F4, Qt.Key.Key_F5,
+            Qt.Key.Key_F9,
         }
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt)

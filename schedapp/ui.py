@@ -653,7 +653,8 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(page)
         hint = QLabel("Стрелки вверх и вниз — уроки по порядку. "
                       "F3 — уроки на сегодня, F4 — на завтра, "
-                      "F5 — заработок за месяц.")
+                      "F5 — заработок за месяц, F9 — выгрузить данные "
+                      "в текст.")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         self.schedule_list = QListWidget()
@@ -680,7 +681,11 @@ class MainWindow(QMainWindow):
     def hello(self) -> None:
         count = len(self.store.students)
         word = plural(count, "ученик", "ученика", "учеников")
-        announce(self, f"Мажорный лад Расписание. В списке {count} {word}.")
+        text = f"Мажорный лад Расписание. В списке {count} {word}."
+        if self.store.notice:
+            text += " " + self.store.notice
+            self.store.notice = ""
+        announce(self, text)
         self.students_list.setFocus()
 
     def student_line(self, student: data.Student) -> str:
@@ -773,6 +778,8 @@ class MainWindow(QMainWindow):
             self.speak_day(date.today() + timedelta(days=1), "на завтра")
         elif key == Qt.Key.Key_F5:
             self.speak_earnings()
+        elif key == Qt.Key.Key_F9:
+            self.export_text()
 
     def speak_day(self, day: date, what: str) -> None:
         lessons = [l for l in self.store.lessons
@@ -801,6 +808,17 @@ class MainWindow(QMainWindow):
             f"За {dates.MONTHS_NOM[today.month - 1]} заработано "
             f"{rubles(earned)}. Проведено {len(done)} {lessons_word}.",
             assertive=True)
+
+    def export_text(self) -> None:
+        """F9 — выгрузить все данные читаемым текстом в папку Data."""
+        try:
+            path = self.store.export_text()
+        except OSError:
+            announce(self, "Не получилось выгрузить данные в текст.",
+                     assertive=True)
+            return
+        announce(self, f"Данные выгружены в файл {path.name}, "
+                       f"он лежит в папке Дата.", assertive=True)
 
     # --- напоминания ------------------------------------------------------
 
