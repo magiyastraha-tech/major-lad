@@ -2,9 +2,12 @@
 
 Обновления лежат в релизах GitHub. Программа спрашивает последний релиз,
 сравнивает версии и, если вышла новая, скачивает свой exe во временную папку.
-Установка простая: запущенный exe нельзя перезаписать, но можно переименовать —
-поэтому старый файл уходит в .old.exe, на его место встаёт новый, программа
-запускается заново. Настройки лежат в json рядом и при обновлении не трогаются.
+Запущенный exe на Windows не отдаёт сам себя — ни перезаписать, ни даже
+переименовать. Поэтому установка идёт в два шага: скачанная версия ложится
+рядом с программой под именем «...new.exe» и запускается установщиком; она
+дожидается нашего выхода, убирает старый файл в «...old.exe» и встаёт на его
+место, когда файл уже никто не держит. Настройки лежат в json рядом и при
+обновлении не трогаются.
 """
 from __future__ import annotations
 
@@ -30,6 +33,10 @@ USER_AGENT = "MajorLad-Updater"
 
 # Сколько раз пробуем докачать файл после обрыва связи.
 _DOWNLOAD_TRIES = 8
+
+# Установка обновления: скачанная копия ждёт нас, потом встаёт на место.
+INSTALL_FLAG = "--install-update"
+STAGED_SUFFIX = ".new.exe"
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -156,11 +163,35 @@ def _fetch(url: str, part: Path, done: int, progress=None) -> int:
     return total
 
 
+def backup_path_for(exe: Path) -> Path:
+    """Куда уходит старая версия при установке: рядом, с меткой .old."""
+    return exe.with_name(f"{exe.stem}.old.exe")
+
+
+def staged_path_for(exe: Path) -> Path:
+    """Куда ложится новая версия до установки: рядом, с меткой .new."""
+    return exe.with_name(f"{exe.stem}{STAGED_SUFFIX}")
+
+
 def backup_path() -> Path | None:
     if not getattr(sys, "frozen", False):
         return None
-    exe = Path(sys.executable)
-    return exe.with_name(f"{exe.stem}.old.exe")
+    return backup_path_for(Path(sys.executable))
+
+
+def cleanup_staged() -> None:
+    """Убирает временную копию новой версии, если установка не довелась."""
+    if not getattr(sys, "frozen", False):
+        return
+    staged = staged_path_for(Path(sys.executable))
+    for _ in range(10):
+        try:
+            if not staged.exists():
+                return
+            staged.unlink(missing_ok=True)
+            return
+        except OSError:
+            time.sleep(0.3)
 
 
 def cleanup_backup() -> None:
@@ -236,30 +267,118 @@ def _start_later(exe: Path) -> bool:
 
 
 def install_and_restart(new_file: Path) -> tuple[bool, str]:
-    """Ставит новый exe на место старого и запускает программу заново."""
+    """Кладёт новую версию рядом с программой и запускает установщик.
+
+    Запущенный exe на Windows держит сам себя — подменить его на месте
+    нельзя. Поэтому здесь ничего не подменяется: скачанная версия ложится
+    в папку программы под именем «...new.exe», запускается установщиком и
+    ждёт, пока мы закроемся. Установщик уже после нашего выхода убирает
+    старый файл и встаёт на его место — когда файл никто не держит.
+    """
     if not getattr(sys, "frozen", False):
         return False, "Обновление работает только в собранной программе."
     exe = Path(sys.executable)
-    backup = exe.with_name(f"{exe.stem}.old.exe")
+    staged = staged_path_for(exe)
     try:
-        if backup.exists():
-            backup.unlink()
-        exe.rename(backup)
-        shutil.move(str(new_file), str(exe))
+        if staged.exists():
+            staged.unlink()
+        shutil.copy2(str(new_file), str(staged))
     except Exception as exc:
-        if not exe.exists() and backup.exists():
-            try:
-                backup.rename(exe)
-            except Exception:
-                pass
-        return False, f"Не удалось заменить файл программы: {exc}"
-    if not _start_later(exe):
+        return False, (
+            f"Не удалось положить новую версию в папку программы "
+            f"{exe.parent}: {exc}. Похоже, в эту папку нельзя писать — "
+            f"перенеси программу вместе с папкой Data в свою папку, "
+            f"например в Документы, и обновление пройдёт.")
+    try:
+        _start_installer(staged, exe)
+    except Exception as exc:
         try:
-            flags = 0
-            if os.name == "nt":
-                flags = getattr(subprocess, "DETACHED_PROCESS", 0)
-            subprocess.Popen([str(exe)], cwd=str(exe.parent), close_fds=True,
-                             creationflags=flags, env=_clean_env())
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, f"Не удалось запустить установщик обновления: {exc}"
+    return True, ""
+
+
+def _start_installer(staged: Path, target: Path) -> None:
+    """Запускает скачанную версию установщиком: она ждёт нас и меняет exe."""
+    args = [str(staged), INSTALL_FLAG, str(target),
+            "--wait-pid", str(os.getpid())]
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+    subprocess.Popen(args, cwd=str(target.parent), close_fds=True,
+                     creationflags=flags, env=_clean_env())
+
+
+def take_install_target() -> Path | None:
+    """Вынимает из аргументов `--install-update <путь>`: мы — установщик."""
+    argv = list(sys.argv)
+    for index, value in enumerate(argv):
+        if value == INSTALL_FLAG and index + 1 < len(argv):
+            target = Path(argv[index + 1])
+            del argv[index:index + 2]
+            sys.argv[:] = argv
+            return target
+        if value.startswith(INSTALL_FLAG + "="):
+            target = Path(value.split("=", 1)[1])
+            del argv[index]
+            sys.argv[:] = argv
+            return target
+    return None
+
+
+def finish_install(target: Path) -> tuple[bool, str]:
+    """Встаёт новой версией на место старой и запускает её.
+
+    Здесь уже нечему мешать: прошлая программа закрыта, exe свободен.
+    Копируем себя (мы запущены из «...new.exe») на место программы, а не
+    переименовываем: переименовывать запущенный файл Windows не даёт.
+    """
+    me = Path(sys.executable)
+    target = Path(target)
+    old = backup_path_for(target)
+    last_error: Exception | None = None
+
+    # Windows отпускает exe не мгновенно после выхода процесса: ещё
+    # работает загрузчик PyInstaller, иногда файл держит антивирус.
+    # Полминуты ждём и пробуем снова — обычно хватает одной-двух попыток.
+    moved = False
+    deadline = time.monotonic() + 30.0
+    while not moved and time.monotonic() < deadline:
+        try:
+            if old.exists():
+                old.unlink()
+            if target.exists():
+                target.rename(old)
+            moved = True
         except Exception as exc:
-            return False, f"Файл заменён, но запустить программу не удалось: {exc}"
+            last_error = exc
+            time.sleep(0.5)
+    if not moved:
+        return False, (f"Не удалось освободить файл программы "
+                       f"{target.name}: {last_error}")
+
+    copied = False
+    deadline = time.monotonic() + 30.0
+    while not copied and time.monotonic() < deadline:
+        try:
+            shutil.copy2(str(me), str(target))
+            copied = True
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.5)
+    if not copied:
+        try:
+            target.unlink(missing_ok=True)
+            if old.exists():
+                old.rename(target)
+        except Exception:
+            pass
+        return False, f"Не удалось поставить новую версию: {last_error}"
+
+    if not _start_later(target):
+        return False, "Новая версия на месте, но запустить её не удалось."
     return True, ""

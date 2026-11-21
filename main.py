@@ -194,10 +194,35 @@ def _wait_previous(pid: int, timeout: float = 60.0) -> None:
         time.sleep(0.25)
 
 
+def _run_installer(target: Path) -> int:
+    """Мы запущены как установщик обновления: поставить новую версию.
+
+    Окно не открываем — ждём выхода прошлой программы и подменяем файл.
+    Окно нужно только чтобы сказать об ошибке: молча закрыться, не
+    поставив обновление, — худшее из возможного.
+    """
+    if not getattr(sys, "frozen", False):
+        return 1
+    ok, message = updater.finish_install(target)
+    if ok:
+        return 0
+    app = QApplication(sys.argv)
+    box = QMessageBox()
+    box.setWindowTitle("Обновление не установилось")
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText(message)
+    box.setAccessibleName(message)
+    box.exec()
+    return 1
+
+
 def main(forced_role: str | None = None) -> int:
     wait_pid = _take_wait_pid()
     if wait_pid:
         _wait_previous(wait_pid)
+    install_target = updater.take_install_target()
+    if install_target is not None:
+        return _run_installer(install_target)
     # Прежние версии держали рабочие папки россыпью рядом с exe. Переносим
     # их в Data до первого чтения настроек: дальше весь код смотрит в Data.
     moved = config.migrate()
@@ -221,8 +246,9 @@ def main(forced_role: str | None = None) -> int:
         runlog.write("Перенесено в Data: " + ", ".join(moved) + ".")
     _install_error_handler()
 
-    # Файл прошлой версии после обновления больше не нужен.
+    # Файлы прошлой версии после обновления больше не нужны.
     updater.cleanup_backup()
+    updater.cleanup_staged()
 
     # До загрузки: есть ли файл настроек. По нему отличаем первый запуск
     # после установки от обычного, где настройки уже выбирал человек.
