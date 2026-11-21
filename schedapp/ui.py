@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget, QSystemTrayIcon,
 )
 
-from . import __version__, dates, settings, sounds, store as data, updater
+from . import (__version__, autostart, dates, settings, sounds,
+               store as data, updater)
 from .reminders import ReminderService, soon_text
 from .store import (DIRECTIONS, FORMATS, LESSON_CANCELLED, LESSON_DONE,
                     LESSON_WAIT, SERVICES, Store, money, plural)
@@ -1502,6 +1503,24 @@ class SettingsDialog(QDialog):
         folder.clicked.connect(self.open_data_folder)
         column.addWidget(folder)
 
+        # --- автозапуск вместе с Windows (только на Windows)
+        self.autostart_box: QCheckBox | None = None
+        if autostart.supported():
+            column.addSpacing(12)
+            column.addWidget(section_label("Запуск с Windows"))
+            self.autostart_box = QCheckBox(
+                "Запускать при входе в Windows, сразу в трее")
+            self.autostart_box.setChecked(autostart.is_enabled())
+            self.autostart_box.setAccessibleName(
+                "Запускать программу при входе в Windows, сразу в трее")
+            column.addWidget(self.autostart_box)
+            auto_hint = QLabel(
+                "Программа запустится в фоне, в трее: окно не откроется, "
+                "а расписание и напоминания начнут работать сами. Чтобы "
+                "открыть окно, щёлкни по значку в трее.")
+            auto_hint.setWordWrap(True)
+            column.addWidget(auto_hint)
+
         # --- звуки
         column.addSpacing(12)
         column.addWidget(section_label("Звуки"))
@@ -1721,6 +1740,14 @@ class SettingsDialog(QDialog):
             result[code] = text
         level = settings.volume_value(self.volume_box.value())
         cue_level = settings.cue_volume_value(self.cue_volume_box.value())
+        if self.autostart_box is not None:
+            try:
+                autostart.set_enabled(self.autostart_box.isChecked())
+            except OSError:
+                announce(self, "Не получилось изменить запуск с Windows. "
+                               "Проверь права пользователя и попробуй ещё "
+                               "раз.", assertive=True)
+                return
         try:
             settings.save(self.store.folder, result, level, cue_level)
         except OSError:
@@ -1740,7 +1767,16 @@ class SettingsDialog(QDialog):
             second = f"Громкость подсказок времени {cue_level} процентов."
         else:
             second = "Подсказки времени без звука."
-        announce(self, f"Настройки сохранены. {first} {second}", assertive=True)
+        if self.autostart_box is not None:
+            if self.autostart_box.isChecked():
+                third = ("При входе в Windows программа запускается "
+                         "в трее. ")
+            else:
+                third = "Запуск при входе в Windows выключен. "
+        else:
+            third = ""
+        announce(self, f"Настройки сохранены. {first} {second} {third}".strip(),
+                 assertive=True)
         self.accept()
 
 
@@ -1748,9 +1784,11 @@ class SettingsDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, background: bool = False):
         super().__init__()
         self.store = store
+        # Запуск при входе в Windows: окно не показываем, живём в трее.
+        self.background = background
         self.bindings = settings.load(store.folder)
         self.volume = settings.load_volume(store.folder)
         self.cue_volume = settings.load_cue_volume(store.folder)
@@ -1843,7 +1881,14 @@ class MainWindow(QMainWindow):
 
         self.refresh_all()
         self.setup_tray()
-        QTimer.singleShot(600, self.hello)
+        if self.background:
+            self.tray.showMessage(
+                "Мажорный лад Расписание",
+                "Программа запущена и работает в трее. Расписание и "
+                "напоминания включены.",
+                QSystemTrayIcon.MessageIcon.Information, 8000)
+        else:
+            QTimer.singleShot(600, self.hello)
 
     # --- общее ------------------------------------------------------------
 
@@ -2485,6 +2530,14 @@ def run_installer(pid: int, target: Path) -> int:
 
 
 def main() -> int:
+    # Запуск при входе в Windows: ключ `--tray` — окно не открываем,
+    # программа живёт в трее.
+    background = autostart.TRAY_FLAG in sys.argv
+    if background:
+        sys.argv.remove(autostart.TRAY_FLAG)
+    # Программу могли перенести или обновить — поправляем путь
+    # в записи автозапуска, если он включён.
+    autostart.refresh()
     # После обновления нас запускает новая версия с `--wait-pid N`:
     # ждём, пока прошлый процесс отпустит exe, и убираем его копию.
     pid = updater.take_wait_pid()
@@ -2500,9 +2553,10 @@ def main() -> int:
     app.setApplicationName("Мажорный лад Расписание")
     app.setApplicationDisplayName("Мажорный лад Расписание")
     app.setOrganizationName("Мажорный лад")
-    window = MainWindow(Store())
-    window.show()
-    announce(window, "Мажорный лад Расписание открыта.")
+    window = MainWindow(Store(), background=background)
+    if not background:
+        window.show()
+        announce(window, "Мажорный лад Расписание открыта.")
     return app.exec()
 
 
