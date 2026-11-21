@@ -1812,6 +1812,14 @@ class MainWindow(QMainWindow):
         self.schedule_list.setAccessibleName("Расписание уроков")
         lay.addWidget(self.schedule_list, 1)
         self.tabs.addTab(page, "Расписание")
+
+        # --- вкладки абонементов
+        (self.active_subs_page, self.active_subs_hint,
+         self.active_subs_list) = self._subs_tab(
+            "Действующие абонементы", "Список действующих абонементов")
+        (self.finished_subs_page, self.finished_subs_hint,
+         self.finished_subs_list) = self._subs_tab(
+            "Законченные абонементы", "Список законченных абонементов")
         self.update_hints()
 
         # --- горячие клавиши на всё приложение
@@ -1882,9 +1890,113 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, lesson.uid)
             self.schedule_list.addItem(item)
 
+    def _subs_tab(self, title: str,
+                  name: str) -> tuple[QWidget, QLabel, QListWidget]:
+        """Вкладка со списком абонементов: подсказка сверху, список ниже.
+
+        Двойной щелчок открывает карточку ученика, чей это абонемент.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        hint = QLabel()
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lst = QListWidget()
+        lst.setAccessibleName(name)
+        lst.itemDoubleClicked.connect(self.open_sub_card)
+        lay.addWidget(lst, 1)
+        self.tabs.addTab(page, title)
+        return page, hint, lst
+
+    def sub_line(self, sub: data.Subscription) -> str:
+        """Абонемент одной фразой: как его прочитает диктор."""
+        parts = [sub.student,
+                 f"куплен {dates.fmt_date(sub.bought)}",
+                 f"с {dates.fmt_date(sub.begins)}"]
+        if sub.total:
+            parts.append(f"уроки {sub.used} из {sub.total}")
+            if not sub.finished:
+                parts.append(f"осталось {sub.left}")
+        else:
+            parts.append(f"проведено {sub.used}")
+        return ", ".join(parts)
+
+    def _fill_subs(self, lst: QListWidget, subs) -> None:
+        """Наполнить список абонементов; новые сверху."""
+        current = None
+        item = lst.currentItem()
+        if item is not None:
+            current = item.data(Qt.ItemDataRole.UserRole)
+        lst.clear()
+        for sub in sorted(subs, key=lambda s: (s.begins, s.uid), reverse=True):
+            item = QListWidgetItem(self.sub_line(sub))
+            item.setData(Qt.ItemDataRole.UserRole, sub.uid)
+            lst.addItem(item)
+        if current is not None:
+            for row in range(lst.count()):
+                item = lst.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == current:
+                    lst.setCurrentRow(row)
+                    break
+
+    def refresh_subscriptions(self) -> None:
+        self._fill_subs(self.active_subs_list,
+                        [s for s in self.store.subscriptions
+                         if not s.finished])
+        self._fill_subs(self.finished_subs_list,
+                        [s for s in self.store.subscriptions if s.finished])
+
+    def open_sub_card(self, item: QListWidgetItem) -> None:
+        """Из списка абонементов — в карточку его ученика."""
+        sub = self.store.subscription_by_uid(
+            item.data(Qt.ItemDataRole.UserRole))
+        if sub is None:
+            return
+        student = self.store.find_student(sub.student)
+        if student is None:
+            announce(self, f"Ученик {sub.student} не найден в списке.",
+                     assertive=True)
+            return
+        self.select_uid(student.uid)
+        self.open_card()
+
+    def selected_subscription(self) -> data.Subscription | None:
+        """Абонемент, выбранный в одной из вкладок абонементов."""
+        page = self.tabs.currentWidget()
+        if page is self.active_subs_page:
+            lst = self.active_subs_list
+        elif page is self.finished_subs_page:
+            lst = self.finished_subs_list
+        else:
+            return None
+        item = lst.currentItem()
+        if item is None:
+            return None
+        return self.store.subscription_by_uid(
+            item.data(Qt.ItemDataRole.UserRole))
+
+    def export_subscription(self) -> None:
+        """F6 — выгрузить выбранный абонемент читаемым текстом в папку Data."""
+        sub = self.selected_subscription()
+        if sub is None:
+            announce(self,
+                     "Чтобы выгрузить абонемент, открой вкладку действующих "
+                     "или законченных абонементов, выбери его в списке и "
+                     "нажми ещё раз.", assertive=True)
+            return
+        try:
+            path = self.store.export_subscription(sub)
+        except OSError:
+            announce(self, "Не получилось выгрузить абонемент.",
+                     assertive=True)
+            return
+        announce(self, f"Абонемент {sub.student} выгружен в файл "
+                       f"{path.name}, он лежит в папке Дата.", assertive=True)
+
     def refresh_all(self) -> None:
         self.refresh_students()
         self.refresh_schedule()
+        self.refresh_subscriptions()
 
     def selected_uid(self) -> int | None:
         item = self.students_list.currentItem()
@@ -1920,6 +2032,14 @@ class MainWindow(QMainWindow):
             "Стрелки вверх и вниз — переход по ученикам. " + tail)
         self.schedule_hint.setText(
             "Стрелки вверх и вниз — уроки по порядку. " + tail)
+        sub_keys = norm_keys(self.bindings.get("subexport", ""))
+        sub_tip = (f"{sub_keys} — выгрузить выбранный абонемент "
+                   f"в текстовый файл." if sub_keys
+                   else "Выгрузка абонемента в текстовый файл без клавиши.")
+        self.active_subs_hint.setText(
+            "Все действующие абонементы, новые сверху. " + sub_tip)
+        self.finished_subs_hint.setText(
+            "Все законченные абонементы, новые сверху. " + sub_tip)
         card_keys = norm_keys(self.bindings.get("card", ""))
         self.card_button.setText(
             f"Карточка ученика ({card_keys})" if card_keys
@@ -2156,6 +2276,8 @@ class MainWindow(QMainWindow):
             self.speak_earnings()
         elif action == "export":
             self.export_text()
+        elif action == "subexport":
+            self.export_subscription()
         elif action == "settings":
             self.open_settings()
 

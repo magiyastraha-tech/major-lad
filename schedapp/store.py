@@ -584,6 +584,60 @@ class Store:
         os.replace(tmp, target)
         return target
 
+    def subscription_lessons(self, sub: Subscription) -> list[Lesson]:
+        """Все уроки абонемента по порядку — что записано, то и есть."""
+        return sorted((l for l in self.lessons if l.subscription == sub.uid),
+                      key=lambda l: l.stamp)
+
+    def export_subscription(self, sub: Subscription,
+                            path: Path | None = None) -> Path:
+        """Один абонемент текстом: покупка, начало и все уроки по датам.
+
+        Отдельный файл на каждый абонемент: его удобно отдать ученику или
+        просто прочитать диктором, не продираясь через всю базу.
+        """
+        if path is not None:
+            target = Path(path)
+        else:
+            name = sub.student
+            for bad in '<>:"/\\|?*':
+                name = name.replace(bad, "-")
+            name = name.strip().strip(".") or "Без имени"
+            target = self.folder / (
+                f"Абонемент {name} {dates.fmt_date(sub.bought)}.txt")
+        lines = ["Мажорный лад Расписание. Абонемент.", ""]
+        lines.append(f"Ученик: {sub.student}.")
+        lines.append(f"Направление: {sub.direction}.")
+        lines.append(f"Дата покупки: {dates.fmt_date(sub.bought)}.")
+        lines.append(f"Абонемент действует с: {dates.fmt_date(sub.begins)}.")
+        if sub.total > 0:
+            word = plural(sub.total, "урок", "урока", "уроков")
+            lines.append(f"Уроков в абонементе: {sub.total} {word}.")
+            lines.append(f"Проведено: {sub.used} из {sub.total}. "
+                         f"Осталось: {sub.left}.")
+        else:
+            word = plural(sub.used, "урок", "урока", "уроков")
+            lines.append(f"Проведено уроков: {sub.used} {word}.")
+        lines.append("Состояние: "
+                     + ("законченный." if sub.finished else "действующий."))
+        if sub.price:
+            lines.append(f"Стоимость: {money(sub.price)} рублей.")
+        lines.append("")
+        lessons = self.subscription_lessons(sub)
+        if lessons:
+            lines.append(f"Уроки: {len(lessons)}.")
+            for lesson in lessons:
+                when = dates.fmt_date(lesson.day)
+                if lesson.time:
+                    when += f" в {lesson.time}"
+                lines.append(f"{when}, {lesson.status}.")
+        else:
+            lines.append("Уроков в этом абонементе пока нет.")
+        tmp = target.parent / (target.name + ".tmp")
+        tmp.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        os.replace(tmp, target)
+        return target
+
     # --- ученики ---------------------------------------------------------
 
     @staticmethod
