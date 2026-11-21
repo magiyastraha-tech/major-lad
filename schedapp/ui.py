@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1574,6 +1575,7 @@ class SettingsDialog(QDialog):
         self.volume = settings.volume_value(volume)
         self.cue_volume = settings.cue_volume_value(cue_volume)
         self._worker: UpdateWorker | None = None
+        self._update_ready = False
         self.setWindowTitle("Настройки")
         self.setMinimumWidth(560)
         self.resize(600, 700)
@@ -1735,10 +1737,15 @@ class SettingsDialog(QDialog):
     def on_installed(self, text: str) -> None:
         self.status.setText(text)
         announce(self, text + " Программа перезапускается.", assertive=True)
-        QApplication.instance().quit()
+        # Закрываемся не здесь, а когда поток обновления действительно
+        # закончил: закрыться раньше — значит убить поток на полуслове.
+        self._update_ready = True
 
     def on_worker_finished(self) -> None:
         self.check_button.setEnabled(True)
+        if self._update_ready:
+            self._update_ready = False
+            QTimer.singleShot(300, QApplication.quit)
 
     # --- остальные кнопки ------------------------------------------------
 
@@ -1962,10 +1969,12 @@ class MainWindow(QMainWindow):
         # --- вкладки абонементов
         (self.active_subs_page, self.active_subs_hint,
          self.active_subs_list) = self._subs_tab(
-            "Действующие абонементы", "Список действующих абонементов")
+            "Действующие абонементы", "Список действующих абонементов",
+            historical=False)
         (self.finished_subs_page, self.finished_subs_hint,
          self.finished_subs_list) = self._subs_tab(
-            "Законченные абонементы", "Список законченных абонементов")
+            "Законченные абонементы", "Список законченных абонементов",
+            historical=True)
         self.update_hints()
 
         # --- горячие клавиши на всё приложение
@@ -2043,9 +2052,9 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, lesson.uid)
             self.schedule_list.addItem(item)
 
-    def _subs_tab(self, title: str,
-                  name: str) -> tuple[QWidget, QLabel, QListWidget]:
-        """Вкладка со списком абонементов: подсказка сверху, список ниже.
+    def _subs_tab(self, title: str, name: str, historical: bool
+                  ) -> tuple[QWidget, QLabel, QListWidget]:
+        """Вкладка со списком абонементов: подсказка, список, кнопки.
 
         Двойной щелчок открывает карточку ученика, чей это абонемент.
         Правый щелчок или клавиша «Меню» открывает меню абонемента.
@@ -2062,6 +2071,23 @@ class MainWindow(QMainWindow):
         lst.customContextMenuRequested.connect(
             lambda pos, box=lst: self.subs_menu(box, pos))
         lay.addWidget(lst, 1)
+
+        row = QHBoxLayout()
+        add_button = QPushButton("Добавить абонемент")
+        add_button.clicked.connect(
+            lambda _checked=False, old=historical: self.add_subscription(old))
+        row.addWidget(add_button)
+        edit_button = QPushButton("Редактировать абонемент")
+        edit_button.clicked.connect(
+            lambda _checked=False: self.edit_subscription())
+        row.addWidget(edit_button)
+        remove_button = QPushButton("Удалить абонемент")
+        remove_button.clicked.connect(
+            lambda _checked=False: self.delete_subscription())
+        row.addWidget(remove_button)
+        row.addStretch(1)
+        lay.addLayout(row)
+
         self.tabs.addTab(page, title)
         return page, hint, lst
 
@@ -2136,7 +2162,8 @@ class MainWindow(QMainWindow):
         """Меню абонемента: правый щелчок или клавиша «Меню».
 
         Клавиатура присылает точку в центре списка, а не на строке, —
-        тогда меню открывается у выбранного абонемента. Меню родное,
+        тогда меню открывается у выбранного абонемента. «Добавить» есть
+        всегда, остальные пункты — когда абонемент выбран. Меню родное,
         диктор читает пункты сам.
         """
         item = lst.itemAt(pos)
@@ -2144,27 +2171,81 @@ class MainWindow(QMainWindow):
             item = lst.currentItem()
             if item is not None:
                 pos = lst.visualItemRect(item).center()
-        if item is None:
-            announce(self, "Выбери абонемент в списке, потом открой меню.",
-                     assertive=True)
-            return
-        sub = self.store.subscription_by_uid(
-            item.data(Qt.ItemDataRole.UserRole))
-        if sub is None:
-            return
-        lst.setCurrentItem(item)
+        sub = None
+        if item is not None:
+            sub = self.store.subscription_by_uid(
+                item.data(Qt.ItemDataRole.UserRole))
+            lst.setCurrentItem(item)
         menu = QMenu(lst)
-        menu.setAccessibleName(f"Абонемент {sub.student}")
-        edit = menu.addAction("Редактировать")
-        remove = menu.addAction("Удалить")
-        export = menu.addAction("Экспортировать")
+        menu.setAccessibleName(
+            f"Абонемент {sub.student}" if sub is not None else "Абонементы")
+        add = menu.addAction("Добавить абонемент")
+        edit = remove = export = None
+        if sub is not None:
+            menu.addSeparator()
+            edit = menu.addAction("Редактировать")
+            remove = menu.addAction("Удалить")
+            export = menu.addAction("Экспортировать")
         chosen = menu.exec(lst.mapToGlobal(pos))
-        if chosen is edit:
+        if chosen is None:
+            return
+        if chosen is add:
+            self.add_subscription()
+        elif chosen is edit:
             self.edit_subscription(sub)
         elif chosen is remove:
             self.delete_subscription(sub)
         elif chosen is export:
             self.export_subscription(sub)
+
+    def add_subscription(self, historical: bool | None = None) -> None:
+        """Добавить абонемент со вкладки абонементов.
+
+        На вкладке законченных заводится старый абонемент, на действующих —
+        новый. Ученика выбираем отдельно: на этих вкладках их несколько.
+        """
+        if not self.store.students:
+            announce(self, "Учеников нет. Сначала добавь ученика на вкладке "
+                           "Ученики.", assertive=True)
+            return
+        if historical is None:
+            historical = self.tabs.currentWidget() is self.finished_subs_page
+        picker = StudentPickDialog(
+            self.store,
+            "Законченный абонемент" if historical else "Новый абонемент",
+            "Чей абонемент добавить? Выбери ученика в списке и нажми "
+            "«Дальше».",
+            self)
+        if picker.exec() != QDialog.DialogCode.Accepted \
+                or picker.picked is None:
+            announce(self, "Абонемент не добавлен.")
+            return
+        student = picker.picked
+        dialog = SubscriptionDialog(self.store, student,
+                                    historical=historical, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Абонемент не добавлен.")
+            return
+        sub = dialog.subscription
+        self.refresh_all()
+        if historical:
+            self.tabs.setCurrentWidget(self.finished_subs_page)
+            text = (f"Законченный абонемент {student.name} с "
+                    f"{dates.fmt_date(sub.begins)} добавлен. Отметь в нём "
+                    f"проведённые уроки в карточке ученика.")
+        else:
+            self.tabs.setCurrentWidget(self.active_subs_page)
+            text = (f"{student.name}, абонемент с "
+                    f"{dates.fmt_date(sub.begins)} добавлен.")
+            if sub.total:
+                text += f" Уроки 0 из {sub.total}."
+            if dialog.schedule_added:
+                word = plural(dialog.schedule_added, "урок", "урока", "уроков")
+                text += (f" Расписание записано, {dialog.schedule_added} "
+                         f"{word}.")
+            elif dialog.schedule_empty:
+                text += " Расписание не записано: ни один день не отмечен."
+        announce(self, text, assertive=True)
 
     def edit_subscription(
             self, sub: data.Subscription | None = None) -> None:
@@ -2290,9 +2371,9 @@ class MainWindow(QMainWindow):
         sub_tip = (f"{sub_keys} — выгрузить выбранный абонемент "
                    f"в текстовый файл." if sub_keys
                    else "Выгрузка абонемента в текстовый файл без клавиши.")
-        sub_menu = ("Правый щелчок или клавиша «Меню» на клавиатуре "
-                    "открывает меню абонемента: редактировать, удалить, "
-                    "экспортировать.")
+        sub_menu = ("Кнопки под списком и меню по правому щелчку или "
+                    "клавише «Меню»: добавить, редактировать, удалить "
+                    "абонемент. Выгрузить можно из меню.")
         self.active_subs_hint.setText(
             "Все действующие абонементы, новые сверху. " + sub_tip + " "
             + sub_menu)
@@ -2733,8 +2814,14 @@ def run_installer(pid: int, target: Path) -> int:
     """
     if not getattr(sys, "frozen", False):
         return 1
-    updater.wait_previous(pid, timeout=120.0)
-    ok, message = updater.finish_install(target)
+    try:
+        updater.log(f"Установщик: запущен, цель {target}, жду pid {pid}.")
+        updater.wait_previous(pid, timeout=120.0)
+        updater.log("Установщик: прошлая программа закрылась.")
+        ok, message = updater.finish_install(target)
+    except Exception as error:  # noqa: BLE001 — установщик не падает молча
+        updater.log(f"Установщик: сбой — {error!r}.")
+        ok, message = False, f"Обновление не установилось: {error}"
     if ok:
         updater.cleanup_download()
         return 0
@@ -2746,6 +2833,38 @@ def run_installer(pid: int, target: Path) -> int:
     box.setAccessibleName(message)
     box.exec()
     return 1
+
+
+_SINGLE_MUTEX = None
+
+
+def already_running() -> bool:
+    """Программа уже запущена? Держим именованный мьютекс Windows.
+
+    Две копии — это двойные напоминания и общий журнал, а ещё обновление
+    не может подменить exe, пока его держит хоть одна копия. Мьютекс
+    система отпускает сама, когда процесс закрывается, — даже если он
+    упал.
+    """
+    global _SINGLE_MUTEX
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL,
+                                      wintypes.LPCWSTR)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.CreateMutexW(None, False, "Local\\MajorLadSchedule")
+    if not handle:
+        return False
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return True
+    _SINGLE_MUTEX = handle
+    return False
 
 
 def main() -> int:
@@ -2769,6 +2888,17 @@ def main() -> int:
     sounds.ensure()
 
     app = QApplication(sys.argv)
+    if already_running():
+        box = QMessageBox()
+        box.setWindowTitle("Мажорный лад Расписание")
+        box.setIcon(QMessageBox.Icon.Information)
+        text = ("Программа уже запущена. Посмотри в трее — это значок "
+                "рядом с часами: щёлкни по нему и выбери «Открыть». "
+                "Второй раз запускать не нужно.")
+        box.setText(text)
+        box.setAccessibleName(text)
+        box.exec()
+        return 0
     app.setApplicationName("Мажорный лад Расписание")
     app.setApplicationDisplayName("Мажорный лад Расписание")
     app.setOrganizationName("Мажорный лад")

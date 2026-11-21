@@ -36,10 +36,35 @@ TIMEOUT = 25
 TEMP_DIR = "majorlad-schedule-update"
 INSTALL_FLAG = "--install-update"
 STAGED_SUFFIX = ".new.exe"
+LOG_NAME = "Обновление.txt"
+LOG_LIMIT = 200_000
 
 
 class UpdateError(Exception):
     """Понятная человеку причина, почему обновление не вышло."""
+
+
+def log(text: str) -> None:
+    """Строка в журнал обновления `Data/Обновление.txt`.
+
+    Журнал нужен, когда обновление не дошло до конца: по нему видно, на
+    каком шаге всё встало. Пишем молча — сбой журнала не должен мешать
+    самому обновлению.
+    """
+    try:
+        from . import paths
+
+        path = paths.data_dir() / LOG_NAME
+        try:
+            if path.exists() and path.stat().st_size > LOG_LIMIT:
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        stamp = time.strftime("%d.%m.%Y %H:%M:%S")
+        with path.open("a", encoding="utf-8") as out:
+            out.write(f"{stamp} {text}\n")
+    except Exception:  # noqa: BLE001 — журнал не мешает обновлению
+        pass
 
 
 # --- версии ---------------------------------------------------------------
@@ -241,7 +266,7 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
-def _start_later(exe: Path) -> None:
+def _start_later(exe: Path) -> subprocess.Popen:
     flags = 0
     if os.name == "nt":
         flags = (subprocess.DETACHED_PROCESS
@@ -249,10 +274,11 @@ def _start_later(exe: Path) -> None:
     kwargs = {"cwd": str(exe.parent), "env": _clean_env(), "close_fds": True}
     if os.name == "nt":
         kwargs["creationflags"] = flags
-    subprocess.Popen([str(exe), "--wait-pid", str(os.getpid())], **kwargs)
+    return subprocess.Popen(
+        [str(exe), "--wait-pid", str(os.getpid())], **kwargs)
 
 
-def _start_installer(staged: Path, target: Path) -> None:
+def _start_installer(staged: Path, target: Path) -> subprocess.Popen:
     """Запустить скачанную версию установщиком: она ждёт нас и меняет exe."""
     kwargs = {"cwd": str(target.parent), "env": _clean_env(),
               "close_fds": True}
@@ -261,7 +287,31 @@ def _start_installer(staged: Path, target: Path) -> None:
                                    | subprocess.CREATE_NO_WINDOW)
     args = [str(staged), INSTALL_FLAG, str(target),
             "--wait-pid", str(os.getpid())]
-    subprocess.Popen(args, **kwargs)
+    return subprocess.Popen(args, **kwargs)
+
+
+def _launch_checked(exe: Path, tries: int = 3) -> tuple[bool, str, int]:
+    """Запустить exe и убедиться, что он не упал сразу же.
+
+    Свежепоставленная версия иногда не стартует: её не пускает антивирус
+    или скопировалась она не целиком. Две секунды достаточно, чтобы
+    понять, что процесс живёт, а не закрылся на первом же шаге.
+    """
+    last = "процесс сразу закрылся"
+    for attempt in range(1, tries + 1):
+        try:
+            proc = _start_later(exe)
+        except OSError as error:
+            last = f"запуск не удался: {error}"
+        else:
+            time.sleep(2.0)
+            if _process_alive(proc.pid):
+                log(f"Обновление: {exe.name} запущен, pid {proc.pid}.")
+                return True, "", proc.pid
+            last = "процесс сразу закрылся"
+        log(f"Обновление: попытка запуска {attempt} не вышла — {last}.")
+        time.sleep(1.0)
+    return False, last, 0
 
 
 def install_and_restart(new_file: Path) -> tuple[bool, str]:
@@ -278,19 +328,24 @@ def install_and_restart(new_file: Path) -> tuple[bool, str]:
         return False, "Обновление работает только у собранной программы."
     exe = Path(sys.executable).resolve()
     staged = staged_path_for(exe)
+    log(f"Обновление: ставлю {new_file.name} вместо {exe}.")
     try:
         if staged.exists():
             staged.unlink()
         shutil.copy2(str(new_file), str(staged))
+        log(f"Обновление: новая версия скопирована в {staged.name}.")
     except OSError as error:
+        log(f"Обновление: скопировать не вышло — {error}.")
         return False, (f"Не удалось положить новую версию в папку программы "
                        f"{exe.parent}: {error}. Похоже, в эту папку нельзя "
                        f"писать — перенеси программу вместе с папкой Дата "
                        f"в свою папку, например в Документы, и обновление "
                        f"пройдёт.")
     try:
-        _start_installer(staged, exe)
+        proc = _start_installer(staged, exe)
+        log(f"Обновление: установщик запущен, pid {proc.pid}.")
     except OSError as error:
+        log(f"Обновление: установщик не запустился — {error}.")
         try:
             staged.unlink(missing_ok=True)
         except OSError:
@@ -328,12 +383,14 @@ def finish_install(target: Path) -> tuple[bool, str]:
     target = Path(target)
     old = backup_path_for(target)
     last_error: OSError | None = None
+    log(f"Установщик: ставлю {me.name} на место {target}.")
 
     # Windows отпускает exe не мгновенно после выхода процесса: ещё
     # работает загрузчик PyInstaller, иногда файл держит антивирус.
-    # Полминуты ждём и пробуем снова — обычно хватает одной-двух попыток.
+    # Минуту ждём и пробуем снова — обычно хватает одной-двух попыток,
+    # а минута выручает, когда рядом остался второй запуск программы.
     moved = False
-    deadline = time.monotonic() + 30.0
+    deadline = time.monotonic() + 60.0
     while not moved and time.monotonic() < deadline:
         try:
             if old.exists():
@@ -345,8 +402,12 @@ def finish_install(target: Path) -> tuple[bool, str]:
             last_error = error
             time.sleep(0.5)
     if not moved:
+        log(f"Установщик: старый файл не освободился — {last_error}.")
         return False, (f"Не удалось освободить файл программы "
-                       f"{target.name}: {last_error}")
+                       f"{target.name}: {last_error}. Похоже, программа всё "
+                       f"ещё запущена — закрой все её окна и значки в трее "
+                       f"и запусти обновление снова.")
+    log("Установщик: старый файл убран, копирую новый.")
 
     copied = False
     deadline = time.monotonic() + 30.0
@@ -358,6 +419,7 @@ def finish_install(target: Path) -> tuple[bool, str]:
             last_error = error
             time.sleep(0.5)
     if not copied:
+        log(f"Установщик: скопировать новый файл не вышло — {last_error}.")
         try:
             target.unlink(missing_ok=True)
             if old.exists():
@@ -366,11 +428,42 @@ def finish_install(target: Path) -> tuple[bool, str]:
             pass
         return False, f"Не удалось поставить новую версию: {last_error}"
 
+    ok, reason, _pid = _launch_checked(target)
+    if ok:
+        log("Установщик: новая версия установлена и запущена.")
+        return True, "Новая версия установлена."
+
+    # Новая версия не поднялась — возвращаем прошлую, чтобы человек не
+    # остался без программы, и честно говорим, что случилось.
+    log(f"Установщик: новая версия не запускается ({reason}), "
+        f"возвращаю прошлую.")
+    restored = False
     try:
-        _start_later(target)
+        bad = target.with_name(_stem(target) + ".failed.exe")
+        if target.exists():
+            target.rename(bad)
+        if old.exists():
+            old.rename(target)
+        restored = True
+        try:
+            bad.unlink(missing_ok=True)
+        except OSError:
+            pass
     except OSError as error:
-        return False, f"Новая версия на месте, но запустить её не вышло: {error}"
-    return True, "Новая версия установлена."
+        log(f"Установщик: вернуть прошлую версию не вышло — {error}.")
+    if restored:
+        try:
+            _start_later(target)
+        except OSError as error:
+            log(f"Установщик: прошлую версию запустить не вышло — {error}.")
+            return False, (f"Новая версия не запустилась ({reason}), прошлую "
+                           f"вернуть на место удалось, но запустить её не "
+                           f"вышло: {error}. Запусти программу вручную.")
+        return False, (f"Новая версия не запустилась ({reason}). Программа "
+                       f"вернулась к прошлой версии и уже запущена снова. "
+                       f"Попробуй обновление ещё раз позже.")
+    return False, (f"Новая версия не запустилась ({reason}). Запусти "
+                   f"программу вручную и попробуй обновление ещё раз позже.")
 
 
 # --- ожидание прошлого процесса ------------------------------------------
