@@ -826,6 +826,23 @@ class SettingsDialog(QDialog):
         form.addRow(label_for("Размер буфера звука", self.buffer_combo),
                     self.buffer_combo)
 
+        # Битрейт Opus. Действует на исходящий поток: чем выше, тем лучше
+        # качество и тем больше данных нужно каналу. Для урока хватает 96.
+        self.opus_bitrate_combo = QComboBox()
+        self.opus_bitrate_combo.setAccessibleName("Битрейт сжатия звука")
+        self.opus_bitrate_combo.setAccessibleDescription(
+            "Сколько данных уходит собеседнику. 96 кбит/с — для урока "
+            "достаточно, 128–320 — если канал позволяет. Работает, когда "
+            "оба конца поддерживают сжатие Opus.")
+        for kbps in (96, 128, 192, 320):
+            self.opus_bitrate_combo.addItem(f"{kbps} кбит/с", kbps)
+        index = self.opus_bitrate_combo.findData(
+            int(self.cfg["audio"].get("opus_bitrate", 96) or 96))
+        self.opus_bitrate_combo.setCurrentIndex(index if index >= 0 else 0)
+        form.addRow(label_for("Битрейт сжатия звука",
+                              self.opus_bitrate_combo),
+                    self.opus_bitrate_combo)
+
         # Компенсация задержки: клик, MIDI и трек ждут, пока голос пройдёт
         # микрофон и входной буфер, и только потом уходят собеседнику.
         # Ноль — программа считает задержку сама по открытым устройствам.
@@ -1183,6 +1200,8 @@ class SettingsDialog(QDialog):
         cfg["audio"]["midi_fixed_velocity"] = self.midi_fixed_box.isChecked()
         cfg["audio"]["show_all_drivers"] = self.all_drivers_box.isChecked()
         cfg["audio"]["buffer"] = str(self.buffer_combo.currentData() or "normal")
+        cfg["audio"]["opus_bitrate"] = int(
+            self.opus_bitrate_combo.currentData() or 96)
         cfg["audio"]["tx_delay_ms"] = int(self.tx_delay_spin.value())
         cfg["shortcuts"] = dict(self.shortcut_map)
 
@@ -2244,6 +2263,8 @@ class MainWindow(QMainWindow):
         # Ручная компенсация нужна движку до старта: авто он посчитает сам,
         # когда откроет устройства.
         self.engine.tx_delay_ms = int(cfg_audio.get("tx_delay_ms", 0) or 0)
+        self.engine.set_opus_bitrate(
+            int(cfg_audio.get("opus_bitrate", 96) or 96))
         devices = {
             "in1": cfg_audio.get("device1", ""),
             "in2": cfg_audio.get("device2", ""),
@@ -3938,6 +3959,9 @@ class MainWindow(QMainWindow):
         # Компенсация задержки — тоже без перезапуска звука.
         self.engine.set_tx_delay(
             int(self.cfg["audio"].get("tx_delay_ms", 0) or 0))
+        # Битрейт применяется к следующему кодировщику, поток не рвём.
+        self.engine.set_opus_bitrate(
+            int(self.cfg["audio"].get("opus_bitrate", 96) or 96))
         # Новый шаг перемотки из настроек — на кнопках плеера.
         self._update_player_buttons()
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.

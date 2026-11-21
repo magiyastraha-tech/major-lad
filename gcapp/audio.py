@@ -187,6 +187,12 @@ class Ring:
         # звук из-за сети, буфера или перегруза входа.
         self.overflows = 0
         self.underruns = 0
+        # Подрезка буфера — это разрыв звука: выбрасываем кусок из середины.
+        # cut_flag говорит читателю, что после этого отсчёта нужен плавный
+        # вход, иначе в наушниках щёлкает.
+        self.trims = 0
+        self.cut_frames = 0
+        self.cut_flag = False
 
     def write(self, data: np.ndarray) -> None:
         data = np.asarray(data, dtype=np.float32).reshape(-1)
@@ -259,11 +265,16 @@ class Ring:
         """
         limit = keep if max_keep is None else max_keep
         with self._lock:
+            self.cut_flag = False
             if self._count <= limit:
                 return
             excess = self._count - keep
             self._read = (self._read + excess) % self._size
             self._count = keep
+            if excess > 0:
+                self.trims += 1
+                self.cut_frames += excess
+                self.cut_flag = True
 
     def clear(self) -> None:
         with self._lock:
@@ -273,6 +284,8 @@ class Ring:
         with self._lock:
             self.overflows = 0
             self.underruns = 0
+            self.trims = 0
+            self.cut_frames = 0
 
 
 class DelayLine:
@@ -441,6 +454,9 @@ class Source:
         # микрофон: устройство может открыться и молчать, а в настройках
         # оно выглядит рабочим.
         self.frames_in = 0
+        # Сколько раз драйвер сообщил о переполнении входа: звук пришёл
+        # быстрее, чем мы его забрали, и часть потерялась.
+        self.status_overflows = 0
 
     @property
     def stereo(self) -> bool:
@@ -455,6 +471,9 @@ class Source:
         # если один драйвер не открылся, пробуем следующий.
         want = 1 if self.mode == "ch1" else 2
         choices = [want] if want == 1 else [2, 1]
+        # Задержки драйверов — заранее, в настраивающем потоке: из
+        # аудиопотока PortAudio и COM спрашивать нельзя.
+        _prewarm_hostapi(self.device_indices)
         last_error: Exception | None = None
         for index in self.device_indices:
             self.device_index = index
@@ -492,6 +511,11 @@ class Source:
 
     def _callback(self, indata, frames, time_info, status) -> None:
         self.frames_in += frames
+        try:
+            if status and getattr(status, "input_overflow", False):
+                self.status_overflows += 1
+        except Exception:
+            pass
         # Задержку входа берём из отметок драйвера: паспортная у WASAPI
         # бывает нулём, и тогда голос у собеседника обгоняет клик ровно на
         # незамеренную задержку устройства. Сглаживаем — отметки дрожат на
@@ -876,21 +900,55 @@ HOSTAPI_LATENCY = (
 )
 
 
-def _hostapi_latency(index: int | None) -> float | None:
+# Задержка по драйверу нужна в каждом звуковом блоке, а sd.query_devices
+# и sd.query_hostapis лезут в PortAudio, а на Windows — в COM. Из
+# аудиопотока это нельзя: COM отвечает «вызвано из неверного потока»
+# (0x8001010d), и звук рвётся. Поэтому спрашиваем один раз при запуске —
+# _prewarm_hostapi — и дальше только читаем таблицу.
+_HOSTAPI_CACHE: dict[int, float | None] = {}
+
+
+def _hostapi_latency(index: int | None, refresh: bool = False) -> float | None:
     """Оценка задержки по драйверу устройства. Последний довод, когда
     точных чисел нет: MME медленнее всех, WASAPI в общей очереди — заметно
-    быстрее."""
-    if sd is None or index is None or int(index) < 0:
+    быстрее.
+
+    Из аудиопотока вызывается с refresh=False: только таблица, без
+    обращений к PortAudio. Значение None тоже кэшируется — неизвестный
+    драйвер не заставляет спрашивать снова и снова.
+    """
+    if sd is None or index is None:
         return None
+    index = int(index)
+    if index < 0:
+        return None
+    if not refresh and index in _HOSTAPI_CACHE:
+        return _HOSTAPI_CACHE[index]
+    value: float | None = None
     try:
-        api = sd.query_hostapis(sd.query_devices(int(index))["hostapi"])
+        api = sd.query_hostapis(sd.query_devices(index)["hostapi"])
         name = str(api["name"]).lower()
+        for part, latency in HOSTAPI_LATENCY:
+            if part in name:
+                value = latency
+                break
     except Exception:
-        return None
-    for part, value in HOSTAPI_LATENCY:
-        if part in name:
-            return value
-    return None
+        value = None
+    _HOSTAPI_CACHE[index] = value
+    return value
+
+
+def _prewarm_hostapi(indices) -> None:
+    """Заполняет таблицу задержек заранее — до открытия потока.
+
+    Вызывается из обычного потока настройки, где PortAudio и COM отвечают
+    нормально. Дальше звуковой блок берёт готовое число.
+    """
+    for index in list(indices or []):
+        try:
+            _hostapi_latency(index, refresh=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +970,32 @@ class AudioEngine:
         # Собеседник умеет принимать Opus. Пока не подтвердил — шлём
         # несжатый звук: старая версия сжатый пакет не разберёт.
         self._peer_opus = False
+        # Собеседник прислал свои возможности. Пока их нет, свои шлём
+        # настойчивее: иначе сторона, услышавшая чужие раньше, замолкает и
+        # вторая так и не узнаёт про Opus — звук идёт несжатым.
+        self._peer_caps = False
+        # Звук собеседника: до первого наполнения буфера молчим, а не
+        # читаем по капле — иначе старт связи начинается с треска.
+        self._peer_live = False
+        self._peer_wait = 0.0
+        # Разрыв в потоке собеседника: первый целый пакет после него
+        # вводим плавно, иначе слышно щелчок.
+        self._peer_gap = False
+        # Последний отсчёт и остаток плавного входа для каждого канала
+        # собеседника — состояние медленного читателя.
+        self._peer_last = [0.0, 0.0]
+        self._peer_fade = [0, 0]
+        # Запас приёма: постоянный (от медленного драйвера) и добавка,
+        # которую движок поднимает, если звук собеседника рвался, и потом
+        # медленно отпускает.
+        self._recv_base = 0
+        self._recv_adapt = 0
+        self._recv_starve = 0
+        self._recv_clean_t = 0.0
+        self._recv_note = ""
+        self._recv_note_t = 0.0
+        # Счётчики сбоев драйвера вывода.
+        self._out_underflow = 0
         # Счётчики сбоев кодека: первый попадёт в журнал, остальные молча.
         self._opus_errors = 0
         self._opus_fail_logged = False
@@ -977,6 +1061,10 @@ class AudioEngine:
         # сразу. Задерживаем передающую копию этих сигналов на задержку
         # тракта, чтобы у собеседника они совпали с голосом. 0 — авто.
         self.tx_delay_ms = 0
+        # Битрейт Opus в кбит/с. Он влияет только на исходящий поток:
+        # собеседник декодирует то, что получил, и его настройка ничего не
+        # меняет. 96 хватает для урока, 128–320 — если канал позволяет.
+        self.opus_bitrate = 96
         self._tx_delay = DelayLine()
         self._tx_delay_auto = 0
         # Сглаженное заполнение входного буфера. Оно гуляет на размер блока
@@ -1050,6 +1138,8 @@ class AudioEngine:
         if output and not find_devices(output, "output"):
             self.log(f"Устройство вывода «{output}» не найдено — ищу другое.")
         out_indices = output_candidates(output)
+        # Задержки драйверов — заранее: звуковой блок спрашивать их не может.
+        _prewarm_hostapi(out_indices)
         # Звуковая карта может не принимать моно: тогда открываем стерео
         # и дублируем сигнал в оба канала. Драйверы перебираем от быстрого
         # к медленному — WASAPI первым, MME последним. Если «низкая
@@ -1139,6 +1229,20 @@ class AudioEngine:
         else:
             recv = 0
         set_recv_reserve(recv)
+        # Запас приёма: постоянная часть — от медленного драйвера, добавка
+        # живёт в движке и растёт, если поток собеседника всё равно рвётся.
+        self._recv_base = recv
+        self._recv_adapt = 0
+        self._recv_starve = 0
+        self._recv_clean_t = 0.0
+        self._recv_note = ""
+        self._recv_note_t = 0.0
+        self._peer_live = False
+        self._peer_wait = 0.0
+        self._peer_gap = False
+        self._peer_last = [0.0, 0.0]
+        self._peer_fade = [0, 0]
+        self._out_underflow = 0
         if slow:
             at = f" ({latency:.3f} с)" if latency is not None else ""
             self.log(f"Внимание: вывод открыт на медленном драйвере{at} — "
@@ -1199,6 +1303,18 @@ class AudioEngine:
             self.log(f"Компенсация задержки: {delay} мс ({how}). "
                      f"Выход {out_ms:.0f} мс, вход {in_ms:.0f} мс, "
                      f"буфер {fill_ms:.0f} мс{note}.")
+            # Вручную выставленное число со временем устаревает: тракт
+            # изменился, а компенсация осталась. Ученик слышит клик мимо
+            # игры. Говорим прямо, если ручное сильно расходится с расчётом.
+            manual = int(self.tx_delay_ms)
+            if manual > 0 and self._tx_delay_auto > 0:
+                diff = manual - self._tx_delay_auto
+                if abs(diff) > 30:
+                    self.log(
+                        f"Компенсация выставлена вручную: {manual} мс, а по "
+                        f"задержке устройств выходит {self._tx_delay_auto} мс "
+                        f"(разница {diff:+d} мс). Если метроном у собеседника "
+                        f"не совпадает с игрой, поставь «Автоматически».")
 
         if midi_enabled:
             self.set_midi(True, midi_port, midi_fixed_velocity)
@@ -1335,6 +1451,12 @@ class AudioEngine:
         self._recv_stereo = False
         self._peer_stereo = False
         self._peer_opus = False
+        self._peer_caps = False
+        self._peer_live = False
+        self._peer_wait = 0.0
+        self._peer_gap = False
+        self._peer_last = [0.0, 0.0]
+        self._peer_fade = [0, 0]
         while True:
             try:
                 self._send_q.get_nowait()
@@ -1373,6 +1495,18 @@ class AudioEngine:
         """
         self.tx_delay_ms = max(0, min(1000, int(ms)))
         return self._apply_tx_delay()
+
+    def set_opus_bitrate(self, kbps: int) -> int:
+        """Битрейт сжатия Opus в кбит/с: 96, 128, 192 или 320.
+
+        Действует на исходящий поток. Новое значение подхватит следующий
+        кодировщик: тот, что уже работает, доживает до конца соединения.
+        """
+        value = int(kbps or 0)
+        if value not in (96, 128, 192, 320):
+            value = 96
+        self.opus_bitrate = value
+        return value
 
     def _out_latency(self) -> float:
         """Задержка вывода в секундах: на столько позже выходит звук клика.
@@ -1501,6 +1635,13 @@ class AudioEngine:
         тишину и считаем сбои — они видны в журнале.
         """
         try:
+            # Драйвер сам говорит, что не успел забрать блок. Это слышно
+            # как треск, и раньше никто этого не замечал — теперь считаем.
+            if status and getattr(status, "output_underflow", False):
+                self._out_underflow += 1
+        except Exception:
+            pass
+        try:
             # Задержку вывода меряем по отметкам драйвера: от вызова callback
             # до момента, когда блок зазвучит. Паспортная у WASAPI бывает
             # нулём, и клик у собеседника тогда опережает голос на всю
@@ -1564,14 +1705,29 @@ class AudioEngine:
         # микрофонный буфер, но и звук собеседника. Раньше запас давали
         # только входу, поэтому у медленного драйвера рвался именно приём.
         keep, maximum = student_bounds()
+        target = keep + (maximum - keep) // 4
         student_vol = self.volumes["student"]
-        self.student.trim(keep, maximum)
-        local_l = self.student.read(frames) * student_vol
-        if self._recv_stereo:
-            self.student_r.trim(keep, maximum)
-            local_r = self.student_r.read(frames) * student_vol
+        # Первое наполнение: пока буфер не набрал цель, лучше молчать
+        # несколько десятков миллисекунд, чем начать связь с треска.
+        # Предохранитель на 1,5 с — на случай совсем плохой сети, чтобы
+        # не остаться без звука совсем.
+        if not self._peer_live:
+            self._peer_wait += frames / SAMPLE_RATE
+            if self.student.level >= target or self._peer_wait >= 1.5:
+                self._peer_live = True
+            else:
+                self.student.trim(keep, maximum)
+                if self._recv_stereo:
+                    self.student_r.trim(keep, maximum)
+        if self._peer_live:
+            local_l = self._read_peer(self.student, frames, 0) * student_vol
+            if self._recv_stereo:
+                local_r = self._read_peer(self.student_r, frames, 1) * student_vol
+            else:
+                # Собеседник шлёт моно: правый канал — копия левого.
+                local_r = local_l.copy()
         else:
-            # Собеседник шлёт моно: правый канал — копия левого.
+            local_l = np.zeros(frames, dtype=np.float32)
             local_r = local_l.copy()
         if synth_out is not None:
             local_l += synth_out * midi_local
@@ -1658,6 +1814,9 @@ class AudioEngine:
             self._send_q.put_nowait(packet_data)
         except queue.Full:
             self._tx_dropped += 1
+        # Запас приёма подстраивается по факту: провал буфера — добавляем,
+        # десять секунд чисто — потихоньку отпускаем.
+        self._adapt_recv(frames)
 
     # -- статистика ---------------------------------------------------------
 
@@ -1678,11 +1837,120 @@ class AudioEngine:
         diff = (seq - last) & 0xFFFFFFFF
         return diff - 1 if 1 < diff < 1000 else 0
 
+    def _read_peer(self, ring: Ring, frames: int, channel: int) -> np.ndarray:
+        """Читает звук собеседника, подстраивая скорость под уровень буфера.
+
+        Часы двух компьютеров идут чуть по-разному, и буфер либо пустеет,
+        либо копит. Копить нельзя — растёт задержка; пустеть тоже — это
+        треск. Поэтому читаем то чуть быстрее, то чуть медленнее цели,
+        растягивая блок на доли процента: на слух незаметно, а буфер
+        держится около цели. Подрезку до max оставляем как аварийный
+        выход, но после неё плавно входим — без щелчка.
+        """
+        keep, maximum = student_bounds()
+        target = keep + (maximum - keep) // 4
+        ring.trim(target, maximum)
+        fade = self._peer_fade[channel]
+        if ring.cut_flag:
+            # Выбросили кусок из середины — на стыке был бы щелчок.
+            fade = FADE_FRAMES
+        level = ring.level
+        ratio = 1.0
+        if level > target:
+            ratio = 1.0 + min(0.01, (level - target) / max(1.0, target * 4.0))
+        elif level < target:
+            ratio = 1.0 - min(0.01, (target - level) / max(1.0, target * 4.0))
+        n = frames if ratio == 1.0 else max(1, int(round(frames * ratio)))
+        out = ring.read(n)
+        got = ring.last_got
+        starved = got < n
+        if starved:
+            # Не хватило звука: гасим с последнего отсчёта, а не обрывом.
+            start = float(self._peer_last[channel])
+            if got:
+                start = float(out[got - 1])
+            span = min(n - got, FADE_FRAMES)
+            if span > 0:
+                out[got:got + span] = start * np.linspace(
+                    1.0, 0.0, span, dtype=np.float32)
+            self._recv_starve += n - got
+            fade = FADE_FRAMES
+        if n != frames:
+            # Растягиваем или сжимаем блок до нужной длины. Линейная
+            # интерполяция стоит дёшево и на десятимиллисекундном блоке
+            # не слышна.
+            src = np.arange(n, dtype=np.float32)
+            dst = np.linspace(0.0, float(n - 1), frames, dtype=np.float32)
+            out = np.interp(dst, src, out).astype(np.float32)
+        if fade > 0 and not starved:
+            span = min(frames, fade)
+            out[:span] *= np.linspace(0.0, 1.0, span, dtype=np.float32)
+            fade -= span
+        self._peer_fade[channel] = fade
+        self._peer_last[channel] = float(out[-1]) if out.size else 0.0
+        return out
+
+    def _adapt_recv(self, frames: int) -> None:
+        """Поднимает запас приёма по факту провала и медленно отпускает.
+
+        Постоянный запас из start() учитывает медленный драйвер, но не
+        сеть. Если приём всё равно голодал, добавляем буфер: треск хуже
+        лишних ста миллисекунд задержки. Через десять секунд чистого
+        приёма запас уменьшается — по шагу, чтобы не устроить новый провал.
+        """
+        if self._recv_starve > 0:
+            deficit = self._recv_starve
+            self._recv_starve = 0
+            add = min(BLOCK * 8, max(BLOCK, deficit * 2))
+            self._recv_adapt = min(BLOCK * 40, self._recv_adapt + add)
+            self._apply_recv_reserve(True)
+            self._recv_clean_t = 0.0
+            return
+        self._recv_clean_t += frames / SAMPLE_RATE
+        if self._recv_clean_t >= 10.0:
+            self._recv_clean_t = 0.0
+            if self._recv_adapt > 0:
+                self._recv_adapt = max(0, self._recv_adapt - BLOCK * 2)
+                self._apply_recv_reserve(False)
+
+    def _apply_recv_reserve(self, grow: bool) -> None:
+        total = self._recv_base + self._recv_adapt
+        set_recv_reserve(total)
+        ms = total * 1000 // SAMPLE_RATE
+        if grow:
+            # Запас растёт шагами по 10–80 мс: во время рваной связи такие
+            # шаги идут подряд, а журнал не должен захлебнуться. Пишем не
+            # чаще раза в две секунды.
+            now = time.monotonic()
+            if now - self._recv_note_t >= 2.0:
+                self._recv_note_t = now
+                self._recv_note = (f"Звук собеседника рвался — запас "
+                                   f"приёма увеличен до {ms} мс.")
+        else:
+            self._recv_note = (f"Приём устойчив — запас приёма уменьшен "
+                               f"до {ms} мс.")
+
     def _write_peer(self, samples: np.ndarray, stereo: bool) -> None:
         """Кладёт пришедший звук в буферы воспроизведения."""
         if samples.size == 0:
             return
         data = samples.astype(np.float32) / 32768.0
+        if self._peer_gap:
+            # После потери пакетов и предсказания первый настоящий звук
+            # начинается не с нуля — без плавного входа слышен щелчок.
+            self._peer_gap = False
+            if stereo:
+                pair = data.size // 2
+                span = min(FADE_FRAMES, pair)
+                if span > 0:
+                    ramp = np.linspace(0.0, 1.0, span, dtype=np.float32)
+                    data[0:span * 2:2] *= ramp
+                    data[1:span * 2:2] *= ramp
+            else:
+                span = min(FADE_FRAMES, data.size)
+                if span > 0:
+                    data[:span] *= np.linspace(0.0, 1.0, span,
+                                               dtype=np.float32)
         if stereo:
             frames = data.size // 2
             if not frames:
@@ -1785,6 +2053,15 @@ class AudioEngine:
         self._stat_frames_t0 = self._out_frames
         realtime = frames / max(1e-6, seconds * SAMPLE_RATE) * 100.0
         head = "Итог звука" if final else "Звук"
+        # Запас приёма и отказы драйвера: по ним видно, что связь рвётся не
+        # из-за сети, а из-за звуковой карты или слишком маленького буфера.
+        recv_ms = (self._recv_base + self._recv_adapt) * 1000 // SAMPLE_RATE
+        out_under = self._out_underflow
+        self._out_underflow = 0
+        status_ovf = 0
+        for source in self.sources.values():
+            status_ovf += source.status_overflows
+            source.status_overflows = 0
         parts = [
             f"принято {self._rx_packets} пакетов",
             f"потеряно {self._rx_lost}",
@@ -1792,6 +2069,7 @@ class AudioEngine:
             f"пустых буферов {gaps_ms:.0f} мс "
             f"(собеседник {peer_gap_ms:.0f}, микрофон {mic_gap_ms:.0f})",
             f"выброшено {over_ms:.0f} мс",
+            f"запас приёма {recv_ms} мс",
             f"уровень входа {peak:.2f}",
             f"перегруз входа {in_clip}",
             f"отправлено {self._tx_packets}",
@@ -1799,11 +2077,22 @@ class AudioEngine:
             f"ошибок отправки {self._tx_errors}",
             f"перегруз отправки {self._tx_clip}",
             f"выведено {realtime:.0f}% реального времени",
+            f"отказов вывода {out_under}",
+            f"переполнений драйвера {status_ovf}",
             f"сбоев потока {self._cb_errors}",
         ]
         return f"{head} за {seconds:.0f} с: " + ", ".join(parts) + "."
 
     def _maybe_log_stats(self, now: float) -> None:
+        # Сообщение об изменении запаса приёма пишем один раз, даже если
+        # собеседник уже отключился: это итог, а не текущее состояние.
+        note = self._recv_note
+        if note:
+            self._recv_note = ""
+            try:
+                self.log(note)
+            except Exception:
+                pass
         if self._peer is None:
             return
         if not self._stat_connected:
@@ -1889,6 +2178,7 @@ class AudioEngine:
                 flags = data[4] if len(data) > 4 else CAPS_STEREO
                 self._peer_stereo = bool(flags & CAPS_STEREO)
                 self._peer_opus = bool(flags & CAPS_OPUS)
+                self._peer_caps = True
                 if self._is_server:
                     try:
                         sock.sendto(MAGIC_CAPS + self._caps_flags(), addr)
@@ -1905,11 +2195,15 @@ class AudioEngine:
                 self._peer = addr
 
             if magic == MAGIC_AUDIO:
+                if self._seq_gap(data):
+                    self._peer_gap = True
                 self._note_seq(data)
                 pcm = np.frombuffer(data[8:], dtype=np.int16)
                 self._recv_stereo = False
                 self.student.write(pcm.astype(np.float32) / 32768.0)
             elif magic == MAGIC_AUDIO_STEREO:
+                if self._seq_gap(data):
+                    self._peer_gap = True
                 self._note_seq(data)
                 # Пары int16 вперемешку: левый, правый, левый, правый…
                 samples = np.frombuffer(data[8:], dtype=np.int16)
@@ -1923,6 +2217,8 @@ class AudioEngine:
                 stereo = magic == MAGIC_AUDIO_OPUS_STEREO
                 gap = self._seq_gap(data)
                 self._note_seq(data)
+                if gap:
+                    self._peer_gap = True
                 channels = 2 if stereo else 1
                 if channels not in decoders:
                     try:
@@ -1946,9 +2242,11 @@ class AudioEngine:
                         self._write_peer(np.frombuffer(fec, np.int16),
                                          stereo)
                     elif gap > 1:
-                        # Дырку закрываем предсказанием, но не длиннее
-                        # 50 мс: дальше это уже выдуманный звук.
-                        for _ in range(min(gap, 5)):
+                        # Дырку закрываем предсказанием. Раньше хватало
+                        # 50 мс, но и после них в буфере оставалась дыра,
+                        # которая слышалась треском: теперь до 200 мс, а
+                        # настоящий звук после дырки входит плавно.
+                        for _ in range(min(gap, 20)):
                             plc = decoder.decode(b"")
                             self._write_peer(np.frombuffer(plc, np.int16),
                                              stereo)
@@ -1971,6 +2269,11 @@ class AudioEngine:
         hello_at = 0.0
         caps_at = 0.0
         caps_sent = 0
+        # Когда собеседник появился и когда мы уже сказали в журнал, каким
+        # форматом идёт звук. Без этой строки по журналу не понять, почему
+        # один компьютер сжимает звук, а второй шлёт его целиком.
+        peer_at = 0.0
+        mode_logged = False
         # Своя библиотека Opus есть? Если нет — о сжатии не заикаемся.
         local_opus = opus_codec.available()
         encoders: dict[int, object] = {}
@@ -1990,19 +2293,42 @@ class AudioEngine:
                         sock.sendto(MAGIC_HELLO, self._server_addr)
                     except OSError:
                         pass
-            # Как только связь есть, пару раз сообщаем, что умеем: стерео
-            # и, если библиотека нашлась, Opus. Повтор на случай потери
-            # пакета; ответ собеседника включит новые форматы, молчание —
-            # значит он старый или не умеет.
-            if (self._peer is not None
-                    and not (self._peer_stereo
-                             and (self._peer_opus or not local_opus))
-                    and caps_sent < 5 and now - caps_at > 1.0):
-                caps_at = now
-                caps_sent += 1
+            # Как только связь есть, сообщаем, что умеем: стерео и, если
+            # библиотека нашлась, Opus. Отправляем свои возможности всегда,
+            # пока собеседник не подтвердил свои: раньше условие замолкало,
+            # как только приходили его возможности, и он мог так и не
+            # узнать про наше сжатие. Пять повторов на случай потери пакета,
+            # и до двенадцати, если подтверждения всё нет.
+            if self._peer is not None and now - caps_at > 1.0:
+                if peer_at == 0.0:
+                    peer_at = now
+                limit = 5 if self._peer_caps else 12
+                if caps_sent < limit:
+                    caps_at = now
+                    caps_sent += 1
+                    try:
+                        sock.sendto(
+                            MAGIC_CAPS + self._caps_flags(), self._peer)
+                    except OSError:
+                        pass
+            # Через несколько секунд после установления связи пишем в
+            # журнал, каким форматом реально идёт звук.
+            if (self._peer is not None and not mode_logged and peer_at > 0.0
+                    and now - peer_at >= 3.0
+                    and (self._peer_caps or now - peer_at >= 6.0)):
+                mode_logged = True
                 try:
-                    sock.sendto(MAGIC_CAPS + self._caps_flags(), self._peer)
-                except OSError:
+                    if self._peer_opus and local_opus:
+                        bits = self.opus_bitrate
+                        mode = "стерео" if self._peer_stereo else "моно"
+                        self.log(f"Формат звука: Opus, {bits} кбит/с, {mode}.")
+                    elif not local_opus:
+                        self.log("Формат звука: несжатый PCM, "
+                                 "библиотека Opus не найдена.")
+                    elif not self._peer_opus:
+                        self.log("Формат звука: несжатый PCM, собеседник "
+                                 "не подтвердил сжатие (старая версия?).")
+                except Exception:
                     pass
             try:
                 stereo, pcm = send_q.get(timeout=0.2)
@@ -2046,7 +2372,7 @@ class AudioEngine:
                     opus_logged = True
                     try:
                         self.log(f"Звук сжимается кодеком Opus, "
-                                 f"{opus_codec.bitrate(stereo)} кбит/с.")
+                                 f"{self.opus_bitrate} кбит/с.")
                     except Exception:
                         pass
         for encoder in encoders.values():
@@ -2058,12 +2384,16 @@ class AudioEngine:
 
     def _encoder(self, cache: dict, channels: int):
         """Кодировщик на нужное число каналов; None — этот компьютер не смог."""
-        if channels in cache:
-            return cache[channels]
+        # Ключ включает битрейт: при смене настройки на лету создаётся
+        # новый кодировщик, а старый закрывается вместе с потоком отправки.
+        key = (channels, self.opus_bitrate)
+        if key in cache:
+            return cache[key]
         try:
-            encoder = opus_codec.Encoder(channels)
+            encoder = opus_codec.Encoder(
+                channels, self.opus_bitrate * 1000)
         except Exception as exc:
-            cache[channels] = None
+            cache[key] = None
             if not self._opus_fail_logged:
                 self._opus_fail_logged = True
                 try:
@@ -2072,7 +2402,7 @@ class AudioEngine:
                 except Exception:
                     pass
             return None
-        cache[channels] = encoder
+        cache[key] = encoder
         return encoder
 
     def _send_audio(self, sock, stereo: bool, payload: bytes,

@@ -22,7 +22,12 @@ import urllib.request
 from pathlib import Path
 
 REPO = "magiyastraha-tech/major-lad"
-API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
+# Не releases/latest: в этом же репозитории выходит «Расписание», и его
+# свежий релиз не содержит exe звонка. latest указывал бы на расписание,
+# нужного файла там нет — программа отвечала «это последняя версия»,
+# хотя новая уже вышла. Поэтому берём список и ищем ближайший релиз,
+# в котором есть наш exe.
+API_RELEASES = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
 
 ASSETS = {
     "teacher": "MajorLad-Teacher.exe",
@@ -71,22 +76,32 @@ def latest_release(role: str, current: str) -> dict:
     Исключения не ловит: вызывающий показывает их человеку словами.
     """
     asset_name = ASSETS.get(role, ASSETS["teacher"])
-    data = json.loads(_get(API_LATEST).decode("utf-8"))
-    version = str(data.get("tag_name") or data.get("name") or "").strip()
-    url = ""
-    for asset in data.get("assets") or []:
-        if asset.get("name") == asset_name:
-            url = asset.get("browser_download_url") or ""
-            break
-    if not version or not url:
-        return {"none": True}
-    if not is_newer(version, current):
-        return {"none": True, "version": version}
-    return {
-        "version": version,
-        "url": url,
-        "notes": str(data.get("body") or "").strip(),
-    }
+    data = json.loads(_get(API_RELEASES).decode("utf-8"))
+    releases = data if isinstance(data, list) else []
+    for release in releases:
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        version = str(
+            release.get("tag_name") or release.get("name") or "").strip()
+        # Релизы расписания живут в том же репозитории и к звонку отношения
+        # не имеют — даже если тег случайно окажется «новее».
+        if version.lower().startswith("schedule"):
+            continue
+        url = ""
+        for asset in release.get("assets") or []:
+            if asset.get("name") == asset_name:
+                url = asset.get("browser_download_url") or ""
+                break
+        if not version or not url:
+            continue
+        if not is_newer(version, current):
+            continue
+        return {
+            "version": version,
+            "url": url,
+            "notes": str(release.get("body") or "").strip(),
+        }
+    return {"none": True}
 
 
 def download(url: str, progress=None) -> Path:
