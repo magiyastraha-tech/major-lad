@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAccessible, QAccessibleEvent
-from PySide6.QtWidgets import QLabel, QWidget
+from PySide6.QtGui import QAccessible, QAccessibleEvent, QKeySequence
+from PySide6.QtWidgets import (QApplication, QKeySequenceEdit, QLabel,
+                               QWidget)
 
 try:  # Qt 6.8 и новее умеют объявления напрямую
     from PySide6.QtGui import QAccessibleAnnouncementEvent
@@ -115,28 +116,67 @@ def announce(widget: QWidget, text: str, assertive: bool = False) -> None:
     widget.setAccessibleName(text)
 
 
+def key_text(sequence: QKeySequence) -> str:
+    """Клавиши единой записью — по ней же сравниваем и ищем совпадения."""
+    return sequence.toString(QKeySequence.SequenceFormat.PortableText)
+
+
 class ShortcutFilter(QObject):
     """Перехват горячих клавиш на всё приложение.
 
-    F2, F3, F4, F5 и F9 должны работать из любого окна программы, даже
-    если фокус в поле ввода: иначе нажатие уйдёт в поле и ничего не
-    случится.
+    Горячие клавиши должны работать из любого окна программы, даже если
+    фокус в поле ввода: иначе нажатие уйдёт в поле и ничего не случится.
+    Набор клавиш приходит из настроек: он меняется без перезапуска.
+
+    В окне настройки клавиш перехват выключается — иначе нажатие, которое
+    человек как раз назначает, сработало бы как команда программы.
     """
 
-    def __init__(self, handler, parent: QObject | None = None):
+    def __init__(self, handler, bindings: dict[str, str] | None = None,
+                 parent: QObject | None = None):
         super().__init__(parent)
         self._handler = handler
-        self._keys = {
-            Qt.Key.Key_F2, Qt.Key.Key_F3, Qt.Key.Key_F4, Qt.Key.Key_F5,
-            Qt.Key.Key_F9,
-        }
+        self._keys: dict[str, str] = {}
+        self.set_bindings(bindings or {})
+
+    def set_bindings(self, bindings: dict[str, str]) -> None:
+        keys: dict[str, str] = {}
+        for action, text in (bindings or {}).items():
+            if not text:
+                continue
+            sequence = QKeySequence(text)
+            if sequence.isEmpty():
+                continue
+            keys[key_text(sequence)] = action
+        self._keys = keys
+
+    @staticmethod
+    def _editing_keys() -> bool:
+        """Фокус в поле настройки сочетания — не перехватываем."""
+        widget = QApplication.focusWidget()
+        seen: set[int] = set()
+        while widget is not None and id(widget) not in seen:
+            if isinstance(widget, QKeySequenceEdit):
+                return True
+            seen.add(id(widget))
+            widget = widget.parentWidget()
+        return False
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt)
-        if event.type() == QEvent.Type.KeyPress:
-            key = event.key()
-            if key in self._keys and not (
-                    event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
-                self._handler(key)
-                event.accept()
-                return True
+        if event.type() != QEvent.Type.KeyPress or self._editing_keys():
+            return super().eventFilter(obj, event)
+        key = event.key()
+        if key in (0, Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt,
+                   Qt.Key.Key_Meta):
+            return super().eventFilter(obj, event)
+        mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        try:
+            sequence = QKeySequence(int(key) | int(mods))
+        except (TypeError, ValueError):
+            return super().eventFilter(obj, event)
+        action = self._keys.get(key_text(sequence))
+        if action:
+            self._handler(action)
+            event.accept()
+            return True
         return super().eventFilter(obj, event)

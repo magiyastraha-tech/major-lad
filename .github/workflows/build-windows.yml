@@ -71,14 +71,15 @@ jobs:
 
       # Расписание — отдельная программа, звук и MIDI ей не нужны.
       # Собираем под латинским именем, а в папку dist кладём под русским:
-      # кириллица в пути сборки иногда ломает PyInstaller.
+      # кириллица в пути сборки иногда ломает PyInstaller. Латинский файл
+      # остаётся в dist намеренно: обновление программы ищет в релизе файл
+      # ровно с этим именем (MajorLad-Schedule.exe).
       - name: Build schedule exe
         shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --onefile --windowed `
             --name MajorLad-Schedule --exclude-module tkinter schedule_main.py
           Copy-Item dist/MajorLad-Schedule.exe "dist/Мажорный лад Расписание.exe"
-          Remove-Item dist/MajorLad-Schedule.exe
 
       - name: Upload exe
         uses: actions/upload-artifact@v4

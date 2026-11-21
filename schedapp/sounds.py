@@ -1,0 +1,133 @@
+"""Звуки программы.
+
+Три звука: напоминание, начало урока, конец урока. При первом запуске
+программа сама кладёт в папку `Sound` простые WAV-файлы, чтобы было что
+услышать сразу. Свой звук — это замена файла с тем же именем: программа
+читает файл заново на каждое событие, перезапускать её не нужно.
+
+Если файла нет или он не читается, вызывающий включает системный писк.
+"""
+from __future__ import annotations
+
+import math
+import wave
+from array import array
+from pathlib import Path
+
+from . import paths
+
+RATE = 44100
+VOLUME = 0.38
+
+SOON_FILE = "Напоминание.wav"
+START_FILE = "Начало урока.wav"
+FINISH_FILE = "Конец урока.wav"
+
+FILES = {
+    "soon": SOON_FILE,
+    "start": START_FILE,
+    "finish": FINISH_FILE,
+}
+
+MEMO_FILE = "Как заменить звуки.txt"
+MEMO = """Звуки программы «Мажорный лад Расписание».
+
+Здесь лежат три звука:
+Напоминание.wav — когда до урока осталось немного.
+Начало урока.wav — вопрос «начинаем?» в начале урока.
+Конец урока.wav — вопрос «урок прошёл?» в конце.
+
+Чтобы поставить свой звук, замени файл с тем же именем своим.
+Подходит формат WAV. Программа читает файл каждый раз заново, поэтому
+перезапускать её не нужно.
+
+Если файла нет или он не читается, программа подаёт системный звук.
+"""
+
+# Мелодии: (частота, секунды). Паузы — частотой 0.
+_SOON = ((880, 0.14), (0, 0.07), (880, 0.14), (0, 0.07), (1175, 0.22))
+_START = ((523, 0.14), (659, 0.14), (784, 0.26))
+_FINISH = ((784, 0.14), (659, 0.14), (523, 0.30))
+
+_MELODIES = {
+    "soon": _SOON,
+    "start": _START,
+    "finish": _FINISH,
+}
+
+
+def _tone(freq: float, seconds: float) -> array:
+    count = int(RATE * seconds)
+    fade = max(1, int(RATE * 0.01))
+    data = array("h")
+    for index in range(count):
+        if freq <= 0:
+            data.append(0)
+            continue
+        level = 1.0
+        if index < fade:
+            level = index / fade
+        elif index > count - fade:
+            level = (count - index) / fade
+        sample = math.sin(2 * math.pi * freq * index / RATE)
+        data.append(int(VOLUME * level * sample * 32767))
+    return data
+
+
+def _wav_bytes(melody) -> bytes:
+    data = array("h")
+    for freq, seconds in melody:
+        data.extend(_tone(freq, seconds))
+    import io
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(RATE)
+        handle.writeframes(data.tobytes())
+    return buffer.getvalue()
+
+
+def ensure(folder: Path | None = None) -> None:
+    """Создать папку звуков и недостающие файлы по умолчанию.
+
+    Существующие файлы не трогаются: там может быть уже свой звук.
+    """
+    target = Path(folder) if folder is not None else paths.sound_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for kind, name in FILES.items():
+            path = target / name
+            if path.exists() and path.stat().st_size > 44:
+                continue
+            path.write_bytes(_wav_bytes(_MELODIES[kind]))
+        memo = target / MEMO_FILE
+        if not memo.exists():
+            memo.write_text(MEMO, encoding="utf-8")
+    except OSError:
+        # Без звуков программа работает: системный писк остаётся.
+        pass
+
+
+def play(kind: str, folder: Path | None = None) -> bool:
+    """Проиграть звук. False — не вышло, пусть вызывающий пищит."""
+    name = FILES.get(kind)
+    if not name:
+        return False
+    target = Path(folder) if folder is not None else paths.sound_dir()
+    path = target / name
+    if not path.exists():
+        return False
+    try:
+        import winsound
+    except ImportError:
+        return False
+    try:
+        winsound.PlaySound(
+            str(path),
+            winsound.SND_FILENAME | winsound.SND_ASYNC
+            | winsound.SND_NODEFAULT)
+        return True
+    except RuntimeError:
+        return False

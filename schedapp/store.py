@@ -28,13 +28,13 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from . import dates, paths
+from . import dates, mirror, paths
 
 DB_FILE = "Мажорный лад Расписание.db"
 BACKUP_DIR = "Резерв"
 ARCHIVE_DIR = "Архив старой версии"
 BACKUP_KEEP = 14
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Старые текстовые файлы: из них переносим данные при первом запуске.
 STUDENTS_FILE = "Ученики.txt"
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS students (
 CREATE TABLE IF NOT EXISTS subscriptions (
     uid INTEGER PRIMARY KEY,
     bought TEXT NOT NULL,
+    started TEXT NOT NULL DEFAULT '',
     student TEXT NOT NULL,
     direction TEXT NOT NULL DEFAULT '',
     total INTEGER NOT NULL DEFAULT 0,
@@ -118,10 +119,17 @@ class Subscription:
     total: int
     used: int = 0
     price: int = 0
+    # С какого числа абонемент действует. Может не совпадать с датой
+    # покупки: купили в конце месяца — уроки начались с первого.
+    started: date | None = None
 
     @property
     def left(self) -> int:
         return max(0, int(self.total) - int(self.used))
+
+    @property
+    def begins(self) -> date:
+        return self.started or self.bought
 
 
 @dataclass
@@ -225,14 +233,38 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         with self._conn:
             self._conn.executescript(_SCHEMA)
-            self._conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema', ?)",
-                (str(SCHEMA_VERSION),))
+        self._migrate()
         self.load()
         if migrated:
             self._import_legacy()
+        self._refresh_files()
 
     # --- база ------------------------------------------------------------
+
+    def _migrate(self) -> None:
+        """Довести старую базу до текущей схемы, ничего не теряя."""
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(subscriptions)")}
+        if "started" not in columns:
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE subscriptions ADD COLUMN started "
+                    "TEXT NOT NULL DEFAULT ''")
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
+                (str(SCHEMA_VERSION),))
+
+    def _refresh_files(self) -> None:
+        """Пересобрать читаемые файлы рядом с базой.
+
+        База — источник правды; если txt не записался (папка только для
+        чтения, файл занят), программа продолжает работать.
+        """
+        try:
+            mirror.refresh(self)
+        except OSError:
+            pass
 
     def _backup(self) -> None:
         """Копия базы перед запуском, по одной на день, последние 14."""
@@ -296,10 +328,12 @@ class Store:
         for row in self._conn.execute(
                 "SELECT * FROM subscriptions ORDER BY uid"):
             day = dates.parse_date(row["bought"]) or date.today()
+            started = dates.parse_date(row["started"]) if row["started"] else None
             self.subscriptions.append(Subscription(
                 uid=row["uid"], bought=day, student=row["student"],
                 direction=row["direction"], total=_int(row["total"]),
-                used=_int(row["used"]), price=_int(row["price"])))
+                used=_int(row["used"]), price=_int(row["price"]),
+                started=started))
 
         self.lessons = []
         for row in self._conn.execute("SELECT * FROM lessons ORDER BY uid"):
@@ -431,14 +465,17 @@ class Store:
                      "direction", "note"),
                     [(s.uid, s.name, s.phone, s.email, s.lesson_format,
                       s.direction, s.note) for s in self.students])
+        self._refresh_files()
 
     def save_subscriptions(self) -> None:
         self._write("subscriptions",
-                    ("uid", "bought", "student", "direction", "total",
-                     "used", "price"),
-                    [(s.uid, dates.fmt_date(s.bought), s.student,
+                    ("uid", "bought", "started", "student", "direction",
+                     "total", "used", "price"),
+                    [(s.uid, dates.fmt_date(s.bought),
+                      dates.fmt_date(s.begins), s.student,
                       s.direction, s.total, s.used, s.price)
                      for s in self.subscriptions])
+        self._refresh_files()
 
     def save_lessons(self) -> None:
         self._write("lessons",
@@ -447,11 +484,13 @@ class Store:
                     [(l.uid, dates.fmt_date(l.day), l.time, l.student,
                       l.lesson_format, l.direction, l.status, l.price,
                       l.note) for l in self.lessons])
+        self._refresh_files()
 
     def save_payments(self) -> None:
         self._write("payments", ("uid", "day", "student", "what", "amount"),
                     [(p.uid, dates.fmt_date(p.day), p.student, p.what,
                       p.amount) for p in self.payments])
+        self._refresh_files()
 
     def close(self) -> None:
         try:
@@ -535,15 +574,18 @@ class Store:
 
     def add_subscription(self, student: str, total: int, price: int = 0,
                          direction: str = DIRECTIONS[2],
-                         bought: date | None = None) -> Subscription:
+                         bought: date | None = None,
+                         started: date | None = None) -> Subscription:
+        bought_day = bought or date.today()
         item = Subscription(
             uid=self._next_uid(self.subscriptions),
-            bought=bought or date.today(),
+            bought=bought_day,
             student=student,
             direction=direction,
             total=max(0, int(total)),
             used=0,
             price=int(price),
+            started=started or bought_day,
         )
         self.subscriptions.append(item)
         self.save_subscriptions()
@@ -579,9 +621,16 @@ class Store:
     # --- уроки -----------------------------------------------------------
 
     def add_lesson(self, student: str, day: date, time: str,
-                   lesson_format: str = FORMATS[0],
-                   direction: str = DIRECTIONS[2],
+                   lesson_format: str | None = None,
+                   direction: str | None = None,
                    note: str = "") -> Lesson:
+        # Не указали формат или тип — берём из карточки ученика: у него
+        # занятия онлайн, а урок не должен молча стать «очно».
+        owner = self.find_student(student)
+        if lesson_format is None:
+            lesson_format = owner.lesson_format if owner else FORMATS[0]
+        if direction is None:
+            direction = owner.direction if owner else DIRECTIONS[2]
         lesson = Lesson(
             uid=self._next_uid(self.lessons),
             day=day,
