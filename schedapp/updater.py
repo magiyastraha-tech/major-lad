@@ -34,6 +34,8 @@ HEADERS = {
 }
 TIMEOUT = 25
 TEMP_DIR = "majorlad-schedule-update"
+INSTALL_FLAG = "--install-update"
+STAGED_SUFFIX = ".new.exe"
 
 
 class UpdateError(Exception):
@@ -171,17 +173,62 @@ def download(url: str, on_progress=None, size_hint: int = 0) -> Path:
 # --- установка ------------------------------------------------------------
 
 
+def _stem(exe: Path) -> str:
+    stem = exe.stem
+    if stem.lower().endswith(".exe"):
+        stem = stem[:-4]
+    return stem
+
+
+def backup_path_for(exe: Path) -> Path:
+    """Куда уходит старая версия при установке: рядом, с меткой .old."""
+    return exe.with_name(_stem(exe) + ".old.exe")
+
+
+def staged_path_for(exe: Path) -> Path:
+    """Куда кладётся новая версия до установки: рядом, с меткой .new."""
+    return exe.with_name(_stem(exe) + STAGED_SUFFIX)
+
+
 def backup_path() -> Path:
-    exe = Path(sys.executable).resolve()
-    return exe.with_name(exe.stem.replace(".exe", "") + ".old.exe")
+    return backup_path_for(Path(sys.executable).resolve())
+
+
+def _remove_file(path: Path) -> bool:
+    """Удалить файл, подождав, если его ещё держит прошлый процесс."""
+    for attempt in range(10):
+        try:
+            if not path.exists():
+                return True
+            path.unlink(missing_ok=True)
+            return True
+        except OSError:
+            time.sleep(0.3)
+    return False
 
 
 def cleanup_backup() -> None:
     """Убрать копию прошлой версии, оставшуюся после обновления."""
     try:
-        path = backup_path()
-        if path.exists():
-            path.unlink(missing_ok=True)
+        _remove_file(backup_path())
+    except OSError:
+        pass
+
+
+def cleanup_staged() -> None:
+    """Убрать временную копию новой версии, если она осталась."""
+    try:
+        _remove_file(staged_path_for(Path(sys.executable).resolve()))
+    except OSError:
+        pass
+
+
+def cleanup_download() -> None:
+    """Убрать скачанный exe из временной папки — он уже установлен."""
+    try:
+        folder = Path(tempfile.gettempdir()) / TEMP_DIR
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
     except OSError:
         pass
 
@@ -205,28 +252,122 @@ def _start_later(exe: Path) -> None:
     subprocess.Popen([str(exe), "--wait-pid", str(os.getpid())], **kwargs)
 
 
+def _start_installer(staged: Path, target: Path) -> None:
+    """Запустить скачанную версию установщиком: она ждёт нас и меняет exe."""
+    kwargs = {"cwd": str(target.parent), "env": _clean_env(),
+              "close_fds": True}
+    if os.name == "nt":
+        kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
+                                   | subprocess.CREATE_NO_WINDOW)
+    args = [str(staged), INSTALL_FLAG, str(target),
+            "--wait-pid", str(os.getpid())]
+    subprocess.Popen(args, **kwargs)
+
+
 def install_and_restart(new_file: Path) -> tuple[bool, str]:
-    """Подменить exe новой версией и запустить её."""
+    """Поставить новую версию рядом с программой и запустить установщик.
+
+    Запущенный exe на Windows держит сам себя — подменить его на месте
+    нельзя, Windows не отдаёт файл. Поэтому здесь ничего не подменяется:
+    скачанная версия ложится в папку программы под именем
+    «...new.exe», запускается установщиком и ждёт, пока мы закроемся.
+    Установщик уже после нашего выхода убирает старый файл и встаёт на
+    его место — когда файл никто не держит.
+    """
     if not getattr(sys, "frozen", False):
         return False, "Обновление работает только у собранной программы."
     exe = Path(sys.executable).resolve()
-    old = backup_path()
+    staged = staged_path_for(exe)
     try:
-        if old.exists():
-            old.unlink()
-        exe.rename(old)
+        if staged.exists():
+            staged.unlink()
+        shutil.copy2(str(new_file), str(staged))
     except OSError as error:
-        return False, f"Не удалось освободить файл программы: {error}"
+        return False, (f"Не удалось положить новую версию в папку программы "
+                       f"{exe.parent}: {error}. Похоже, в эту папку нельзя "
+                       f"писать — перенеси программу вместе с папкой Дата "
+                       f"в свою папку, например в Документы, и обновление "
+                       f"пройдёт.")
     try:
-        shutil.move(str(new_file), str(exe))
+        _start_installer(staged, exe)
     except OSError as error:
         try:
-            old.rename(exe)
+            staged.unlink(missing_ok=True)
         except OSError:
             pass
-        return False, f"Не удалось поставить новую версию: {error}"
+        return False, f"Не удалось запустить установщик обновления: {error}"
+    return True, "Новая версия скачана. Программа перезапустится сама."
+
+
+# --- установка (в процессе-установщике) -----------------------------------
+
+
+def take_install_target() -> Path | None:
+    """Вынуть из аргументов `--install-update <путь>`: мы — установщик."""
+    args = sys.argv
+    for index, value in enumerate(args):
+        if value == INSTALL_FLAG and index + 1 < len(args):
+            target = args[index + 1]
+            del args[index:index + 2]
+            return Path(target)
+        if value.startswith(INSTALL_FLAG + "="):
+            target = value.split("=", 1)[1]
+            del args[index]
+            return Path(target)
+    return None
+
+
+def finish_install(target: Path) -> tuple[bool, str]:
+    """Встать новой версией на место старой и запустить её.
+
+    Здесь уже нечему мешать: прошлая программа закрыта, exe свободен.
+    Копируем себя (мы запущены из «...new.exe») на место программы, а не
+    переименовываем: переименовывать запущенный файл Windows не даёт.
+    """
+    me = Path(sys.executable).resolve()
+    target = Path(target)
+    old = backup_path_for(target)
+    last_error: OSError | None = None
+
+    # Windows отпускает exe не мгновенно после выхода процесса: ещё
+    # работает загрузчик PyInstaller, иногда файл держит антивирус.
+    # Полминуты ждём и пробуем снова — обычно хватает одной-двух попыток.
+    moved = False
+    deadline = time.monotonic() + 30.0
+    while not moved and time.monotonic() < deadline:
+        try:
+            if old.exists():
+                old.unlink(missing_ok=True)
+            if target.exists():
+                target.rename(old)
+            moved = True
+        except OSError as error:
+            last_error = error
+            time.sleep(0.5)
+    if not moved:
+        return False, (f"Не удалось освободить файл программы "
+                       f"{target.name}: {last_error}")
+
+    copied = False
+    deadline = time.monotonic() + 30.0
+    while not copied and time.monotonic() < deadline:
+        try:
+            shutil.copy2(str(me), str(target))
+            copied = True
+        except OSError as error:
+            last_error = error
+            time.sleep(0.5)
+    if not copied:
+        try:
+            target.unlink(missing_ok=True)
+            if old.exists():
+                old.rename(target)
+        except OSError:
+            pass
+        return False, f"Не удалось поставить новую версию: {last_error}"
+
     try:
-        _start_later(exe)
+        _start_later(target)
     except OSError as error:
         return False, f"Новая версия на месте, но запустить её не вышло: {error}"
     return True, "Новая версия установлена."

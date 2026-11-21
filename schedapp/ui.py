@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from PySide6.QtCore import QDate, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon,
@@ -2135,12 +2136,41 @@ class MainWindow(QMainWindow):
         announce(self, "Программа свёрнута в трей. Напоминания продолжают работать.")
 
 
+def run_installer(pid: int, target: Path) -> int:
+    """Мы запущены как установщик обновления: поставить новую версию.
+
+    Ждём, пока старая программа закроется и отпустит свой exe, ставим
+    новую версию на её место и запускаем. Окна у установщика нет; если
+    что-то не вышло — показываем одно окно с причиной, чтобы диктор её
+    прочитал и старая версия осталась работать.
+    """
+    if not getattr(sys, "frozen", False):
+        return 1
+    updater.wait_previous(pid, timeout=120.0)
+    ok, message = updater.finish_install(target)
+    if ok:
+        updater.cleanup_download()
+        return 0
+    app = QApplication(sys.argv)
+    box = QMessageBox()
+    box.setWindowTitle("Обновление не установилось")
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText(message)
+    box.setAccessibleName(message)
+    box.exec()
+    return 1
+
+
 def main() -> int:
     # После обновления нас запускает новая версия с `--wait-pid N`:
     # ждём, пока прошлый процесс отпустит exe, и убираем его копию.
     pid = updater.take_wait_pid()
+    target = updater.take_install_target()
+    if target is not None:
+        return run_installer(pid, target)
     updater.wait_previous(pid)
     updater.cleanup_backup()
+    updater.cleanup_staged()
     sounds.ensure()
 
     app = QApplication(sys.argv)
