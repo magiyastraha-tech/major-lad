@@ -551,20 +551,49 @@ class ScheduleDialog(QDialog):
 
 
 class ServiceDialog(QDialog):
-    """Услуга: аренда, настройка, студия — и сумма в журнал оплат."""
+    """Услуга: аренда, настройка, студия — и сумма в журнал оплат.
 
-    def __init__(self, store: Store, student: data.Student, parent=None):
+    Из карточки ученика ученик уже известен и не выбирается. На вкладке
+    услуг его выбираем здесь. Если передан payment, это не новая услуга,
+    а правка записанной.
+    """
+
+    def __init__(self, store: Store, student: data.Student | None = None,
+                 parent=None, payment: data.Payment | None = None):
         super().__init__(parent)
         self.store = store
         self.student = student
-        self.setWindowTitle("Добавить услугу")
+        self.payment = payment
+        self.setWindowTitle("Изменить услугу" if payment is not None
+                            else "Добавить услугу")
         self.setMinimumWidth(420)
         lay = QVBoxLayout(self)
         form = QFormLayout()
 
+        self.who: QComboBox | None = None
+        if student is not None:
+            who = QLabel(student.name)
+            who.setAccessibleName("Ученик")
+            form.addRow("Ученик", who)
+        else:
+            self.who = QComboBox()
+            names = [s.name for s in sorted(store.students,
+                                            key=lambda s: s.name.casefold())]
+            if payment is not None and payment.student not in names:
+                names.insert(0, payment.student)
+            self.who.addItems(names)
+            self.who.setAccessibleName("Ученик, кому услуга")
+            if payment is not None:
+                self.who.setCurrentText(payment.student)
+            form.addRow("Ученик", self.who)
+
         self.service = QComboBox()
         self.service.addItems(SERVICES)
         self.service.setAccessibleName("Услуга")
+        if payment is not None:
+            if payment.what not in SERVICES:
+                self.service.insertItem(0, payment.what)
+            self.service.setCurrentText(payment.what)
         form.addRow("Услуга", self.service)
 
         self.amount = QSpinBox()
@@ -572,20 +601,38 @@ class ServiceDialog(QDialog):
         self.amount.setSingleStep(500)
         self.amount.setSuffix(" ₽")
         self.amount.setAccessibleName("Сумма услуги")
+        if payment is not None:
+            self.amount.setValue(payment.amount)
         form.addRow("Сумма", self.amount)
+
+        self.day = make_date_edit("Дата услуги",
+                                  payment.day if payment is not None else None)
+        form.addRow("Дата", self.day)
         lay.addLayout(form)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Готово")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Сохранить" if payment is not None else "Готово")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         buttons.accepted.connect(self._add)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
     def _add(self) -> None:
-        self.store.add_payment(self.student.name, self.service.currentText(),
-                               self.amount.value())
+        name = (self.student.name if self.student is not None
+                else self.who.currentText())
+        what = self.service.currentText()
+        amount = self.amount.value()
+        day = picked_date(self.day)
+        if self.payment is not None:
+            self.payment.student = name
+            self.payment.what = what
+            self.payment.amount = amount
+            self.payment.day = day
+            self.store.update_payment(self.payment)
+        else:
+            self.payment = self.store.add_payment(name, what, amount, day)
         self.accept()
 
 
@@ -1975,6 +2022,9 @@ class MainWindow(QMainWindow):
          self.finished_subs_list) = self._subs_tab(
             "Законченные абонементы", "Список законченных абонементов",
             historical=True)
+
+        # --- вкладка услуг
+        self._services_tab()
         self.update_hints()
 
         # --- горячие клавиши на всё приложение
@@ -2328,10 +2378,195 @@ class MainWindow(QMainWindow):
                        f"{path.name}. Он лежит в папке Данные, внутри "
                        f"папки Абонементы.", assertive=True)
 
+    # --- услуги -----------------------------------------------------------
+
+    def _services_tab(self) -> QWidget:
+        """Вкладка услуг: список оплаченных услуг и кнопки под ним.
+
+        Правый щелчок или клавиша «Меню» открывают меню услуги. Двойной
+        щелчок открывает карточку ученика, которому эта услуга.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        self.services_hint = QLabel()
+        self.services_hint.setWordWrap(True)
+        lay.addWidget(self.services_hint)
+
+        self.services_list = QListWidget()
+        self.services_list.setAccessibleName("Список услуг")
+        self.services_list.itemDoubleClicked.connect(self.open_service_card)
+        self.services_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.services_list.customContextMenuRequested.connect(
+            lambda pos: self.services_menu(self.services_list, pos))
+        lay.addWidget(self.services_list, 1)
+
+        row = QHBoxLayout()
+        add_button = QPushButton("Добавить услугу")
+        add_button.clicked.connect(lambda _checked=False: self.add_service())
+        row.addWidget(add_button)
+        edit_button = QPushButton("Редактировать услугу")
+        edit_button.clicked.connect(lambda _checked=False: self.edit_service())
+        row.addWidget(edit_button)
+        remove_button = QPushButton("Удалить услугу")
+        remove_button.clicked.connect(
+            lambda _checked=False: self.delete_service())
+        row.addWidget(remove_button)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.tabs.addTab(page, "Услуги")
+        return page
+
+    def service_line(self, payment: data.Payment) -> str:
+        """Услуга одной фразой: как её прочитает диктор."""
+        return (f"{dates.fmt_date(payment.day)}, {payment.student}, "
+                f"{payment.what.casefold()}, {rubles(payment.amount)}")
+
+    def refresh_services(self) -> None:
+        """Показать оплаченные услуги; новые сверху."""
+        current = None
+        item = self.services_list.currentItem()
+        if item is not None:
+            current = item.data(Qt.ItemDataRole.UserRole)
+        self.services_list.clear()
+        services = (p for p in self.store.payments if p.what in SERVICES)
+        for payment in sorted(services, key=lambda p: (p.day, p.uid),
+                              reverse=True):
+            item = QListWidgetItem(self.service_line(payment))
+            item.setData(Qt.ItemDataRole.UserRole, payment.uid)
+            self.services_list.addItem(item)
+        if current is not None:
+            for row in range(self.services_list.count()):
+                item = self.services_list.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == current:
+                    self.services_list.setCurrentRow(row)
+                    break
+
+    def selected_service(self) -> data.Payment | None:
+        """Услуга, выбранная в списке услуг."""
+        item = self.services_list.currentItem()
+        if item is None:
+            return None
+        return self.store.payment_by_uid(
+            item.data(Qt.ItemDataRole.UserRole))
+
+    def open_service_card(self, item: QListWidgetItem) -> None:
+        """Из списка услуг — в карточку ученика, которому услуга."""
+        payment = self.store.payment_by_uid(
+            item.data(Qt.ItemDataRole.UserRole))
+        if payment is None:
+            return
+        student = self.store.find_student(payment.student)
+        if student is None:
+            announce(self, f"Ученик {payment.student} не найден в списке.",
+                     assertive=True)
+            return
+        self.select_uid(student.uid)
+        self.open_card()
+
+    def services_menu(self, lst: QListWidget, pos) -> None:
+        """Меню услуги: правый щелчок или клавиша «Меню».
+
+        Клавиатура присылает точку в центре списка, а не на строке, —
+        тогда меню открывается у выбранной услуги. «Добавить» есть
+        всегда, остальные пункты — когда услуга выбрана.
+        """
+        item = lst.itemAt(pos)
+        if item is None:
+            item = lst.currentItem()
+            if item is not None:
+                pos = lst.visualItemRect(item).center()
+        payment = None
+        if item is not None:
+            payment = self.store.payment_by_uid(
+                item.data(Qt.ItemDataRole.UserRole))
+            lst.setCurrentItem(item)
+        menu = QMenu(lst)
+        menu.setAccessibleName(
+            f"Услуга {payment.what}" if payment is not None else "Услуги")
+        add = menu.addAction("Добавить услугу")
+        edit = remove = None
+        if payment is not None:
+            menu.addSeparator()
+            edit = menu.addAction("Редактировать")
+            remove = menu.addAction("Удалить")
+        chosen = menu.exec(lst.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is add:
+            self.add_service()
+        elif chosen is edit:
+            self.edit_service(payment)
+        elif chosen is remove:
+            self.delete_service(payment)
+
+    def add_service(self) -> None:
+        """Новая услуга со вкладки услуг: ученика выбираем в форме."""
+        if not self.store.students:
+            announce(self, "Учеников нет. Сначала добавь ученика на вкладке "
+                           "Ученики.", assertive=True)
+            return
+        dialog = ServiceDialog(self.store, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted \
+                or dialog.payment is None:
+            announce(self, "Услуга не добавлена.")
+            return
+        payment = dialog.payment
+        self.refresh_services()
+        announce(self, f"Услуга {payment.what.casefold()} для "
+                       f"{payment.student} записана, "
+                       f"{rubles(payment.amount)}.", assertive=True)
+
+    def edit_service(self, payment: data.Payment | None = None) -> None:
+        """Правка услуги: из меню или для выбранной в списке."""
+        if payment is None:
+            payment = self.selected_service()
+        if payment is None:
+            announce(self, "Сначала выбери услугу в списке на вкладке "
+                           "Услуги.", assertive=True)
+            return
+        dialog = ServiceDialog(self.store, parent=self, payment=payment)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Правка отменена.")
+            return
+        self.refresh_services()
+        announce(self, f"Услуга сохранена: {self.service_line(payment)}.",
+                 assertive=True)
+
+    def delete_service(self, payment: data.Payment | None = None) -> None:
+        """Удалить услугу из журнала оплат — с подтверждением."""
+        if payment is None:
+            payment = self.selected_service()
+        if payment is None:
+            announce(self, "Сначала выбери услугу в списке на вкладке "
+                           "Услуги.", assertive=True)
+            return
+        text = (f"Удалить услугу {payment.what.casefold()} для "
+                f"{payment.student} от {dates.fmt_date(payment.day)}, "
+                f"{rubles(payment.amount)}? Запись пропадёт из журнала "
+                f"оплат.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Удалить услугу")
+        box.setText(text)
+        yes = box.addButton("Удалить", QMessageBox.ButtonRole.DestructiveRole)
+        no = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        announce(self, text, assertive=True)
+        box.exec()
+        if box.clickedButton() is not yes:
+            announce(self, "Удаление отменено.")
+            return
+        self.store.delete_payment(payment)
+        self.refresh_services()
+        announce(self, f"Услуга {payment.what.casefold()} для "
+                       f"{payment.student} удалена.", assertive=True)
+
     def refresh_all(self) -> None:
         self.refresh_students()
         self.refresh_schedule()
         self.refresh_subscriptions()
+        self.refresh_services()
 
     def selected_uid(self) -> int | None:
         item = self.students_list.currentItem()
@@ -2380,6 +2615,10 @@ class MainWindow(QMainWindow):
         self.finished_subs_hint.setText(
             "Все законченные абонементы, новые сверху. " + sub_tip + " "
             + sub_menu)
+        self.services_hint.setText(
+            "Оплаченные услуги, новые сверху. Кнопки под списком и меню по "
+            "правому щелчку или клавише «Меню»: добавить, редактировать, "
+            "удалить услугу. Двойной щелчок открывает карточку ученика.")
         card_keys = norm_keys(self.bindings.get("card", ""))
         self.card_button.setText(
             f"Карточка ученика ({card_keys})" if card_keys

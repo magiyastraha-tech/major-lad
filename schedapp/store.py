@@ -1076,6 +1076,22 @@ class Store:
         self.save_payments()
         return item
 
+    def payment_by_uid(self, uid: int) -> Payment | None:
+        for payment in self.payments:
+            if payment.uid == uid:
+                return payment
+        return None
+
+    def update_payment(self, payment: Payment) -> None:
+        """Сохранить правку оплаты: поля уже изменены на месте."""
+        if any(p.uid == payment.uid for p in self.payments):
+            self.save_payments()
+
+    def delete_payment(self, payment: Payment) -> None:
+        """Убрать оплату из журнала совсем."""
+        self.payments = [p for p in self.payments if p.uid != payment.uid]
+        self.save_payments()
+
     def earned_in_month(self, year: int, month: int) -> int:
         return sum(p.amount for p in self.payments
                    if p.day.year == year and p.day.month == month)
