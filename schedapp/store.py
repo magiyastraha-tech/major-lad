@@ -25,7 +25,7 @@ import os
 import shutil
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from . import dates, mirror, paths
@@ -217,6 +217,40 @@ def plural(count: int, one: str, few: str, many: str) -> str:
 
 def lessons_word(count: int) -> str:
     return plural(count, "урок", "урока", "уроков")
+
+
+def plan_shift(lessons: list[Lesson], lesson: Lesson, new_day: date,
+               new_time: str) -> list[tuple[Lesson, date, str]]:
+    """Куда поедут уроки графика при переносе одного из них.
+
+    Сдвиг такой же, как задали у выбранного урока: столько же дней и,
+    если время есть у обоих, столько же часов и минут. Сдвигается весь
+    график того же ученика из того же абонемента после выбранного дня —
+    чужой урок ученика на тот же день остаётся на месте.
+    """
+    day_delta = (new_day - lesson.day).days
+    old_time = dates.parse_time(lesson.time)
+    new_time_parsed = dates.parse_time(new_time)
+    minute_delta = 0
+    if old_time is not None and new_time_parsed is not None:
+        minute_delta = ((new_time_parsed[0] * 60 + new_time_parsed[1])
+                        - (old_time[0] * 60 + old_time[1]))
+    moved: list[tuple[Lesson, date, str]] = []
+    for row in lessons:
+        if (row is lesson or row.student != lesson.student
+                or row.subscription != lesson.subscription
+                or row.day <= lesson.day):
+            continue
+        day = row.day + timedelta(days=day_delta)
+        time = row.time
+        minutes = dates.parse_time(row.time)
+        if minutes is not None and minute_delta:
+            total = minutes[0] * 60 + minutes[1] + minute_delta
+            day += timedelta(days=total // 1440)
+            total %= 1440
+            time = dates.fmt_time(total // 60, total % 60)
+        moved.append((row, day, time))
+    return moved
 
 
 class Store:

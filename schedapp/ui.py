@@ -967,14 +967,22 @@ class LessonPickDialog(QDialog):
 
 
 class LessonEditDialog(QDialog):
-    """Правка проведённого урока: дата и, если нужно, время."""
+    """Правка урока: дата и, если нужно, время.
 
-    def __init__(self, lesson: data.Lesson, parent=None):
+    В карточке ученика так правят проведённые уроки — дата в будущем там
+    ошибка. Из расписания переносят предстоящий урок, поэтому там
+    `allow_future=True`.
+    """
+
+    def __init__(self, lesson: data.Lesson, parent=None,
+                 allow_future: bool = False,
+                 title: str = "Редактировать урок"):
         super().__init__(parent)
         self.lesson = lesson
+        self.allow_future = allow_future
         self.new_day: date | None = None
         self.new_time = ""
-        self.setWindowTitle("Редактировать урок")
+        self.setWindowTitle(title)
         self.setMinimumWidth(440)
         lay = QVBoxLayout(self)
         text = f"Урок {dates.fmt_date(lesson.day)}"
@@ -1033,7 +1041,7 @@ class LessonEditDialog(QDialog):
 
     def _save(self) -> None:
         day = picked_date(self.day)
-        if day > date.today():
+        if day > date.today() and not self.allow_future:
             announce(self, "Дата урока не может быть в будущем: урок уже прошёл.",
                      assertive=True)
             return
@@ -2180,6 +2188,12 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.schedule_hint)
         self.schedule_list = QListWidget()
         self.schedule_list.setAccessibleName("Расписание уроков")
+        self.schedule_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.schedule_list.customContextMenuRequested.connect(
+            self.schedule_menu)
+        self.schedule_list.itemDoubleClicked.connect(
+            lambda _item: self.lesson_card())
         lay.addWidget(self.schedule_list, 1)
         self.tabs.addTab(page, "Расписание")
 
@@ -2313,6 +2327,241 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(lesson_line(lesson))
             item.setData(Qt.ItemDataRole.UserRole, lesson.uid)
             self.schedule_list.addItem(item)
+
+    # --- меню урока в расписании ------------------------------------------
+
+    def selected_lesson(self) -> data.Lesson | None:
+        """Урок, выбранный в списке расписания."""
+        item = self.schedule_list.currentItem()
+        if item is None:
+            return None
+        uid = item.data(Qt.ItemDataRole.UserRole)
+        for lesson in self.store.lessons:
+            if lesson.uid == uid:
+                return lesson
+        return None
+
+    def schedule_menu(self, pos) -> None:
+        """Меню урока: правый щелчок или клавиша «Меню».
+
+        Клавиатура присылает точку в центре списка, а не на строке, —
+        тогда меню открывается у выбранного урока. Меню родное, диктор
+        читает пункты сам.
+        """
+        lst = self.schedule_list
+        item = lst.itemAt(pos)
+        if item is None:
+            item = lst.currentItem()
+            if item is not None:
+                pos = lst.visualItemRect(item).center()
+        if item is not None:
+            lst.setCurrentItem(item)
+        lesson = self.selected_lesson()
+        if lesson is None:
+            announce(self, "Выбери урок в списке расписания.")
+            return
+        when = dates.fmt_date(lesson.day)
+        if lesson.time:
+            when += f" в {lesson.time}"
+        menu = QMenu(lst)
+        menu.setAccessibleName(f"Урок {lesson.student}, {when}")
+        edit = menu.addAction("Редактировать урок")
+        shift = menu.addAction("Перенести урок")
+        done = menu.addAction("Снять отметку «проведён»"
+                              if lesson.status == LESSON_DONE
+                              else "Отметить урок проведённым")
+        card = menu.addAction("Открыть карточку ученика")
+        menu.addSeparator()
+        remove = menu.addAction("Удалить урок")
+        chosen = menu.exec(lst.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is edit:
+            self.edit_lesson_here(lesson)
+        elif chosen is shift:
+            self.shift_lesson(lesson)
+        elif chosen is done:
+            self.toggle_lesson_done(lesson)
+        elif chosen is card:
+            self.lesson_card(lesson)
+        elif chosen is remove:
+            self.delete_lesson_here(lesson)
+
+    def lesson_card(self, lesson: data.Lesson | None = None) -> None:
+        """Открыть карточку ученика этого урока."""
+        if lesson is None:
+            lesson = self.selected_lesson()
+        if lesson is None:
+            announce(self, "Выбери урок в списке расписания.")
+            return
+        student = self.store.find_student(lesson.student)
+        if student is None:
+            announce(self, f"Ученик {lesson.student} не найден в списке.",
+                     assertive=True)
+            return
+        self.select_uid(student.uid)
+        self.open_card()
+
+    def edit_lesson_here(self, lesson: data.Lesson) -> None:
+        """Перенести урок на другую дату или время из расписания."""
+        dialog = LessonEditDialog(lesson, self, allow_future=True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Урок не изменён.")
+            return
+        new_day = dialog.new_day or lesson.day
+        new_time = dialog.new_time
+        if new_day == lesson.day and new_time == lesson.time:
+            announce(self, "Урок не изменён.")
+            return
+        for other in self.store.lessons:
+            if (other is not lesson and other.student == lesson.student
+                    and other.day == new_day and other.time == new_time):
+                announce(self, f"У {lesson.student} на "
+                               f"{dates.fmt_date(new_day)} в это время уже "
+                               f"есть урок. Выбери другое время.",
+                         assertive=True)
+                return
+        old_text = dates.fmt_date(lesson.day)
+        lesson.day = new_day
+        lesson.time = new_time
+        self.store.update_lesson(lesson)
+        when = dates.fmt_date(new_day)
+        if new_time:
+            when += f" в {new_time}"
+        announce(self, f"Урок {lesson.student} перенесён: было {old_text}, "
+                       f"теперь {when}.")
+        self.refresh_all()
+
+    def shift_lesson(self, lesson: data.Lesson) -> None:
+        """Сдвинуть урок и весь его график на ту же величину.
+
+        Так переносят пропущенный вторник: урок со вторника уезжает,
+        например, на среду, и все следующие уроки этого графика тоже
+        сдвигаются на день вперёд — ритм занятий сохраняется.
+        """
+        dialog = LessonEditDialog(lesson, self, allow_future=True,
+                                  title="Перенести урок")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            announce(self, "Урок не перенесён.")
+            return
+        new_day = dialog.new_day or lesson.day
+        new_time = dialog.new_time
+        if new_day == lesson.day and new_time == lesson.time:
+            announce(self, "Урок не изменён.")
+            return
+        # Тот же график — уроки того же ученика с тем же абонементом
+        # после выбранного дня. Куда именно они уедут, считает хранилище.
+        moved = data.plan_shift(self.store.lessons, lesson, new_day, new_time)
+
+        # После сдвига уроки не должны лечь на чужое время того же ученика.
+        shifted = {id(lesson)} | {id(row) for row, _day, _time in moved}
+        for row, day, time in [(lesson, new_day, new_time)] + moved:
+            for other in self.store.lessons:
+                if (id(other) in shifted or other.student != row.student
+                        or other.day != day or other.time != time):
+                    continue
+                when = dates.fmt_date(day)
+                if time:
+                    when += f" в {time}"
+                announce(self, f"Не переношу: у {row.student} на {when} уже "
+                               f"есть другой урок. Выбери другое время.",
+                         assertive=True)
+                return
+
+        old_when = dates.fmt_date(lesson.day)
+        if lesson.time:
+            old_when += f" в {lesson.time}"
+        new_when = dates.fmt_date(new_day)
+        if new_time:
+            new_when += f" в {new_time}"
+        if moved:
+            last_day, last_time = max(
+                ((day, time) for _row, day, time in moved),
+                key=lambda item: (item[0], item[1]))
+            last_when = dates.fmt_date(last_day)
+            if last_time:
+                last_when += f" в {last_time}"
+            word = plural(len(moved), "урок", "урока", "уроков")
+            text = (f"Урок {lesson.student} перенесётся с {old_when} на "
+                    f"{new_when}. Вместе с ним сдвинутся ещё {len(moved)} "
+                    f"{word} этого графика, последний — на {last_when}. "
+                    f"Перенести?")
+        else:
+            text = (f"Урок {lesson.student} перенесётся с {old_when} на "
+                    f"{new_when}. Следующих уроков в этом графике нет — "
+                    f"сдвинется только он. Перенести?")
+        box = QMessageBox(self)
+        box.setWindowTitle("Перенести урок")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes
+                               | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            announce(self, "Урок не перенесён.")
+            return
+
+        lesson.day = new_day
+        lesson.time = new_time
+        for row, day, time in moved:
+            row.day = day
+            row.time = time
+        self.store.save_lessons()
+        result = (f"Урок {lesson.student} перенесён с {old_when} на "
+                  f"{new_when}.")
+        if moved:
+            word = plural(len(moved), "урок", "урока", "уроков")
+            result += (f" Вместе с ним сдвинулись ещё {len(moved)} {word}, "
+                       f"последний теперь {last_when}.")
+        announce(self, result)
+        self.refresh_all()
+
+    def toggle_lesson_done(self, lesson: data.Lesson) -> None:
+        """Отметить урок проведённым или снять отметку из расписания.
+
+        Оплату это не трогает: записывается сам факт урока, а счётчик
+        абонемента пересчитывается по урокам. Если ученик на абонементе,
+        урок приписывается к действующему — как в карточке ученика.
+        """
+        when = dates.fmt_date(lesson.day)
+        if lesson.time:
+            when += f" в {lesson.time}"
+        if lesson.status == LESSON_DONE:
+            lesson.status = LESSON_WAIT
+            self.store.update_lesson(lesson)
+            self.store.recount_used()
+            announce(self, f"Урок {lesson.student}, {when}, снова ожидается.")
+        else:
+            lesson.status = LESSON_DONE
+            if not lesson.subscription:
+                sub = self.store.current_subscription(lesson.student)
+                if sub is not None:
+                    lesson.subscription = sub.uid
+            self.store.update_lesson(lesson)
+            self.store.recount_used()
+            text = f"Урок {lesson.student}, {when}, отмечен проведённым."
+            used, total = self.store.balance(lesson.student)
+            if total:
+                text += f" Уроки {used} из {total}."
+            announce(self, text)
+        self.refresh_all()
+
+    def delete_lesson_here(self, lesson: data.Lesson) -> None:
+        """Удалить урок из расписания — с подтверждением."""
+        when = dates.fmt_date(lesson.day)
+        if lesson.time:
+            when += f" в {lesson.time}"
+        answer = QMessageBox.question(
+            self, "Удалить урок",
+            f"Удалить урок {lesson.student}, {when}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            announce(self, "Урок не удалён.")
+            return
+        self.store.delete_lesson(lesson)
+        announce(self, f"Урок {lesson.student}, {when}, удалён.")
+        self.refresh_all()
 
     def _subs_tab(self, title: str, name: str, historical: bool
                   ) -> tuple[QWidget, QLabel, QListWidget]:
@@ -2817,7 +3066,12 @@ class MainWindow(QMainWindow):
         self.students_hint.setText(
             "Стрелки вверх и вниз — переход по ученикам. " + tail)
         self.schedule_hint.setText(
-            "Стрелки вверх и вниз — уроки по порядку. " + tail)
+            "Стрелки вверх и вниз — уроки по порядку. Правый щелчок или "
+            "клавиша «Меню» открывают меню урока: редактировать — "
+            "перенести один урок, перенести — сдвинуть урок вместе со "
+            "всем следующим графиком ученика, отметить урок проведённым, "
+            "открыть карточку ученика, удалить. Двойной щелчок открывает "
+            "карточку ученика. " + tail)
         sub_keys = norm_keys(self.bindings.get("subexport", ""))
         sub_tip = (f"{sub_keys} — выгрузить выбранный абонемент "
                    f"в текстовый файл." if sub_keys
