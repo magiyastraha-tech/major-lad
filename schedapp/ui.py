@@ -1502,9 +1502,14 @@ class SettingsDialog(QDialog):
         if level == 0:
             announce(self, "Громкость ноль, сигналы выключены.", assertive=True)
             return
-        if not sounds.play("soon", self.store.folder / "Sound", level):
+        folder = self.store.folder / "Sound"
+        if not sounds.play("soon", folder, level):
             QApplication.beep()
-        announce(self, f"Сигнал напоминания, громкость {level} процентов.")
+        wait = sounds.length("soon", folder) + 0.15
+        QTimer.singleShot(
+            int(wait * 1000),
+            lambda: announce(
+                self, f"Сигнал напоминания, громкость {level} процентов."))
 
     # --- клавиши ----------------------------------------------------------
 
