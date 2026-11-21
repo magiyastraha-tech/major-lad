@@ -90,6 +90,16 @@ def _student_lines(store, student) -> list[str]:
     else:
         lines.append(f"Законченных абонементов: {len(history)}.")
         for item in history:
+            if item.trial:
+                tail = ", ".join(part for part in
+                                 (item.lesson_format.casefold(),
+                                  item.direction) if part)
+                line = f"Пробный урок: {dates.fmt_date(item.bought)}"
+                if tail:
+                    line += f", {tail}"
+                line += ", проведён." if item.used else "."
+                lines.append(line)
+                continue
             tail = f"Стоимость: {_money(item.price)} рублей." if item.price else ""
             lines.append(
                 f"Законченный абонемент с {dates.fmt_date(item.begins)}: "

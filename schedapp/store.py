@@ -75,7 +75,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     total INTEGER NOT NULL DEFAULT 0,
     used INTEGER NOT NULL DEFAULT 0,
     price INTEGER NOT NULL DEFAULT 0,
-    finished INTEGER NOT NULL DEFAULT 0
+    finished INTEGER NOT NULL DEFAULT 0,
+    trial INTEGER NOT NULL DEFAULT 0,
+    lesson_format TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS lessons (
     uid INTEGER PRIMARY KEY,
@@ -130,6 +132,12 @@ class Subscription:
     # новый урок на него не записывается. Помечается сам, когда уроки
     # кончились, либо вручную, когда заводится следующий абонемент.
     finished: bool = False
+    # Пробный урок. Не абонемент, а одно занятие: уроков всегда один,
+    # денег нет, в истории он так и называется — «пробный урок».
+    # Формат («Очно», «Онлайн») нужен только ему: у абонемента он у
+    # ученика, а пробный урок бывает разовым.
+    trial: bool = False
+    lesson_format: str = ""
 
     @property
     def left(self) -> int:
@@ -312,6 +320,14 @@ class Store:
             statements.append(
                 "ALTER TABLE subscriptions ADD COLUMN finished "
                 "INTEGER NOT NULL DEFAULT 0")
+        if "trial" not in sub_columns:
+            statements.append(
+                "ALTER TABLE subscriptions ADD COLUMN trial "
+                "INTEGER NOT NULL DEFAULT 0")
+        if "lesson_format" not in sub_columns:
+            statements.append(
+                "ALTER TABLE subscriptions ADD COLUMN lesson_format "
+                "TEXT NOT NULL DEFAULT ''")
         if "subscription" not in lesson_columns:
             statements.append(
                 "ALTER TABLE lessons ADD COLUMN subscription "
@@ -432,7 +448,9 @@ class Store:
                 uid=row["uid"], bought=day, student=row["student"],
                 direction=row["direction"], total=_int(row["total"]),
                 used=_int(row["used"]), price=_int(row["price"]),
-                started=started, finished=bool(row["finished"])))
+                started=started, finished=bool(row["finished"]),
+                trial=bool(row["trial"]),
+                lesson_format=row["lesson_format"] or ""))
 
         self.lessons = []
         for row in self._conn.execute("SELECT * FROM lessons ORDER BY uid"):
@@ -574,11 +592,13 @@ class Store:
     def save_subscriptions(self) -> None:
         self._write("subscriptions",
                     ("uid", "bought", "started", "student", "direction",
-                     "total", "used", "price", "finished"),
+                     "total", "used", "price", "finished", "trial",
+                     "lesson_format"),
                     [(s.uid, dates.fmt_date(s.bought),
                       dates.fmt_date(s.begins), s.student,
                       s.direction, s.total, s.used, s.price,
-                      1 if s.finished else 0)
+                      1 if s.finished else 0, 1 if s.trial else 0,
+                      s.lesson_format)
                      for s in self.subscriptions])
         self._refresh_files()
 
@@ -623,6 +643,16 @@ class Store:
             if history:
                 lines.append(f"Законченных абонементов: {len(history)}.")
             for sub in history:
+                if sub.trial:
+                    line = f"Пробный урок: {dates.fmt_date(sub.bought)}"
+                    tail = ", ".join(part for part in
+                                     (sub.lesson_format.casefold(),
+                                      sub.direction) if part)
+                    if tail:
+                        line += f", {tail}"
+                    line += ", проведён." if sub.used else "."
+                    lines.append(line)
+                    continue
                 lines.append(
                     f"Законченный абонемент: куплен "
                     f"{dates.fmt_date(sub.bought)}, действует с "
@@ -672,8 +702,24 @@ class Store:
             for bad in '<>:"/\\|?*':
                 name = name.replace(bad, "-")
             name = name.strip().strip(".") or "Без имени"
+            prefix = "Пробный урок" if sub.trial else "Абонемент"
             target = self.folder / SUBS_DIR / (
-                f"Абонемент {name} {dates.fmt_date(sub.bought)}.txt")
+                f"{prefix} {name} {dates.fmt_date(sub.bought)}.txt")
+        if sub.trial:
+            lines = ["Мажорный лад Расписание. Пробный урок.", ""]
+            lines.append(f"Ученик: {sub.student}.")
+            lines.append(f"Направление: {sub.direction}.")
+            if sub.lesson_format:
+                lines.append(f"Формат: {sub.lesson_format}.")
+            lines.append(f"Дата пробного урока: {dates.fmt_date(sub.bought)}.")
+            lines.append("Состояние: "
+                         + ("проведён." if sub.used else "записан."))
+            lines.append("")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.parent / (target.name + ".tmp")
+            tmp.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+            os.replace(tmp, target)
+            return target
         lines = ["Мажорный лад Расписание. Абонемент.", ""]
         lines.append(f"Ученик: {sub.student}.")
         lines.append(f"Направление: {sub.direction}.")
@@ -787,15 +833,24 @@ class Store:
                          direction: str = DIRECTIONS[2],
                          bought: date | None = None,
                          started: date | None = None,
-                         finished: bool = False) -> Subscription:
+                         finished: bool = False,
+                         trial: bool = False,
+                         lesson_format: str = "") -> Subscription:
         """Завести абонемент.
 
         `finished=True` — старый, для истории: его уроки вводятся вручную
         кнопкой «Добавить проведённый урок», деньги в журнал не идут.
         Новый действующий абонемент сам закрывает предыдущий: уроки из
         старого больше не списываются, он остаётся в истории.
+
+        `trial=True` — пробный урок: одно занятие вместо абонемента. По
+        смыслу это история, поэтому он сразу законченный и действующего
+        абонемента ученику не закрывает. Уроков у него всегда один,
+        цена не спрашивается и в журнал оплат не идёт.
         """
         bought_day = bought or date.today()
+        if trial:
+            total, price, finished = 1, 0, True
         if not finished:
             for other in self.subscriptions:
                 if other.student == student and not other.finished:
@@ -810,6 +865,8 @@ class Store:
             price=int(price),
             started=started or bought_day,
             finished=finished,
+            trial=trial,
+            lesson_format=lesson_format if trial else "",
         )
         self.subscriptions.append(item)
         self.save_subscriptions()
