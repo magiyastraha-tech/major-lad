@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
     QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget, QSystemTrayIcon,
 )
 
-from . import (__version__, autostart, dates, settings, sounds,
+from . import (__version__, autostart, dates, services, settings, sounds,
                store as data, updater)
-from .reminders import ReminderService, soon_text
+from .reminders import ReminderService, service_text, soon_text
 from .store import (DIRECTIONS, FORMATS, LESSON_CANCELLED, LESSON_DONE,
                     LESSON_WAIT, SERVICES, Store, money, plural)
 from .uikit import Announcer, announce, key_text
@@ -2035,6 +2035,7 @@ class MainWindow(QMainWindow):
         # --- напоминания
         self.reminders = ReminderService(self.store, self)
         self.reminders.soon.connect(self.on_soon)
+        self.reminders.service_soon.connect(self.on_service_soon)
         self.reminders.ask_start.connect(self.on_ask_start)
         self.reminders.ask_finish.connect(self.on_ask_finish)
 
@@ -2420,8 +2421,12 @@ class MainWindow(QMainWindow):
 
     def service_line(self, payment: data.Payment) -> str:
         """Услуга одной фразой: как её прочитает диктор."""
-        return (f"{dates.fmt_date(payment.day)}, {payment.student}, "
+        line = (f"{dates.fmt_date(payment.day)}, {payment.student}, "
                 f"{payment.what.casefold()}, {rubles(payment.amount)}")
+        end = services.service_end(payment)
+        if end is not None:
+            line += f", до {dates.fmt_date(end)}"
+        return line
 
     def refresh_services(self) -> None:
         """Показать оплаченные услуги; новые сверху."""
@@ -2618,7 +2623,9 @@ class MainWindow(QMainWindow):
         self.services_hint.setText(
             "Оплаченные услуги, новые сверху. Кнопки под списком и меню по "
             "правому щелчку или клавише «Меню»: добавить, редактировать, "
-            "удалить услугу. Двойной щелчок открывает карточку ученика.")
+            "удалить услугу. Двойной щелчок открывает карточку ученика. "
+            "За три дня и за день до конца аренды гитары или гарантии на "
+            "настройку программа напомнит об этом вслух.")
         card_keys = norm_keys(self.bindings.get("card", ""))
         self.card_button.setText(
             f"Карточка ученика ({card_keys})" if card_keys
@@ -2920,6 +2927,11 @@ class MainWindow(QMainWindow):
 
     def on_soon(self, lesson: data.Lesson, kind: str) -> None:
         text = soon_text(lesson, kind)
+        self._play_then(
+            "soon", lambda: announce(self, text, assertive=True))
+
+    def on_service_soon(self, payment: data.Payment, end, days: int) -> None:
+        text = service_text(payment, end, days)
         self._play_then(
             "soon", lambda: announce(self, text, assertive=True))
 

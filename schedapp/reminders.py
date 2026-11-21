@@ -1,9 +1,12 @@
-"""Напоминания об уроках.
+"""Напоминания об уроках и сроках услуг.
 
 Программа тикает раз в полминуты и смотрит, не пора ли что-то сказать:
 за день до урока, за час и за десять минут. Отдельно она спрашивает в
 начале урока, идёт ли он, и через сорок минут — прошёл ли. Если ответа
 нет, вопрос повторяется через час, пока не будет ответа.
+
+Ещё она следит за сроками услуг: за три дня и за день до конца аренды
+гитары или гарантии на настройку.
 
 Само напоминание здесь не показывается: служба только говорит «пора»,
 а окно решает, как это озвучить. Так проще проверять логику отдельно от
@@ -11,11 +14,12 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from .store import LESSON_WAIT, Lesson
+from . import dates, services
+from .store import LESSON_WAIT, Lesson, Payment, plural
 
 DAY = timedelta(days=1)
 HOUR = timedelta(hours=1)
@@ -38,21 +42,25 @@ KINDS = (
 class ReminderService(QObject):
     """Сторож уроков: говорит, когда напоминать и о чём спрашивать."""
 
-    soon = Signal(object, str)      # урок, вид напоминания
-    ask_start = Signal(object)      # урок: «идёт ли у вас урок?»
-    ask_finish = Signal(object)     # урок: «прошёл ли урок?»
+    soon = Signal(object, str)              # урок, вид напоминания
+    service_soon = Signal(object, object, int)  # услуга, конец срока, дней
+    ask_start = Signal(object)              # урок: «идёт ли у вас урок?»
+    ask_finish = Signal(object)             # урок: «прошёл ли урок?»
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
         self.store = store
-        self._fired: set[tuple[int, str]] = set()
+        self._fired: set[tuple] = set()
         self._started: dict[int, datetime] = {}
         self._next_ask: dict[int, datetime] = {}
         self._timer = QTimer(self)
         self._timer.setInterval(30_000)
         self._timer.timeout.connect(self.tick)
         self._timer.start()
-        self.tick()
+        # Первую проверку делаем, когда окно уже подключило сигналы, —
+        # иначе напоминание, срок которого наступил при запуске, будет
+        # помечено сработавшим и пропадёт.
+        QTimer.singleShot(0, self.tick)
 
     # --- ответы окна на вопросы -------------------------------------------
 
@@ -129,6 +137,37 @@ class ReminderService(QObject):
                 self._next_ask[lesson.uid] = now + ASK_EVERY
                 self.ask_start.emit(lesson)
 
+        self._check_services(now)
+
+    def _check_services(self, now: datetime) -> None:
+        """Сроки услуг: за три дня и за день до конца аренды или гарантии.
+
+        Срок выводится из даты услуги, поэтому отметка срабатывания
+        включает сам конец срока: поправил дату — напоминание взведено
+        заново, удалил услугу — оно пропадает вместе с записью.
+
+        Если программа была закрыта в нужный день, напоминание скажет,
+        сколько дней осталось на самом деле, — но только пока срок не
+        кончился.
+        """
+        today = now.date()
+        window = max(services.DAYS_BEFORE)
+        for payment in list(self.store.payments):
+            end = services.service_end(payment)
+            if end is None:
+                continue
+            days = (end - today).days
+            if days < 0 or days > window:
+                continue
+            # Две ступени: «за три дня» и «за день». Первая — пока до
+            # конца больше дня, вторая — последний день и день конца.
+            stage = "три" if days > 1 else "день"
+            mark = (payment.uid, "услуга", stage, end.isoformat())
+            if mark in self._fired:
+                continue
+            self._fired.add(mark)
+            self.service_soon.emit(payment, end, days)
+
 
 def soon_text(lesson: Lesson, kind: str) -> str:
     """Фраза напоминания до урока — одна на все три вида.
@@ -142,3 +181,25 @@ def soon_text(lesson: Lesson, kind: str) -> str:
     if kind == "час":
         return f"Через час урок. {who}"
     return f"Через десять минут урок. {who}"
+
+
+def _day_words(day: date) -> str:
+    """«21 ноября» — без цифр, которые диктор читает по одной."""
+    return f"{day.day} {dates.MONTHS[day.month - 1]}"
+
+
+def service_text(payment: Payment, end: date, days: int) -> str:
+    """Фраза о конце срока услуги — аренды гитары или гарантии.
+
+    Имя ставим после слова «ученик», в именительном падеже: склонять
+    фамилии программа не умеет, а «ученик Иван Петров» звучит верно.
+    """
+    if days <= 0:
+        when = f"сегодня, {_day_words(end)}"
+    elif days == 1:
+        when = f"завтра, {_day_words(end)}"
+    else:
+        when = (f"{_day_words(end)}, осталось {days} "
+                f"{plural(days, 'день', 'дня', 'дней')}")
+    return (f"{services.service_title(payment)}, ученик {payment.student}, "
+            f"заканчивается {when}.")
