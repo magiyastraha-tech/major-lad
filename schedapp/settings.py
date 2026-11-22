@@ -56,13 +56,36 @@ ACTIONS = (
     ("settings", "Настройки", "Ctrl+P"),
 )
 
+# Кнопки на вкладках главного окна. Их тоже можно назначить на клавиши;
+# по умолчанию клавиш нет — человек выбирает сам в настройках. Пока
+# действия не назначены, список остаётся каким был.
+BUTTON_ACTIONS = (
+    ("add_student", "Добавить ученика", ""),
+    ("edit_student", "Редактировать ученика", ""),
+    ("remove_student", "Удалить ученика", ""),
+    # Код не «cues»: так называется строка включения подсказок в файле.
+    ("toggle_cues", "Включить или выключить подсказки времени", ""),
+    ("trial", "Добавить пробный урок", ""),
+    ("single", "Добавить разовый урок", ""),
+    ("sub_add", "Добавить абонемент", ""),
+    ("sub_done", "Отметить урок проведённым", ""),
+    ("sub_edit", "Редактировать абонемент", ""),
+    ("sub_remove", "Удалить абонемент", ""),
+    ("sub_order", "Порядок абонементов", ""),
+    ("service_add", "Добавить услугу", ""),
+    ("service_edit", "Редактировать услугу", ""),
+    ("service_remove", "Удалить услугу", ""),
+)
+
+ALL_ACTIONS = ACTIONS + BUTTON_ACTIONS
+
 # Раньше настройки открывались по F10. Если в файле так и осталось —
 # подставляем новую клавишу, иначе Ctrl+P не заработает у тех, кто уже
 # запускал программу. Если человек выбрал что-то своё — не трогаем.
 OLD_SETTINGS_KEY = "F10"
 
-CODES = tuple(code for code, _, _ in ACTIONS)
-TITLES = {code: title for code, title, _ in ACTIONS}
+CODES = tuple(code for code, _, _ in ALL_ACTIONS)
+TITLES = {code: title for code, title, _ in ALL_ACTIONS}
 
 HEADER = """# Настройки программы «Мажорный лад Расписание».
 # Слева — действие, справа — клавиши. Пусто справа — без клавиши.
@@ -70,7 +93,7 @@ HEADER = """# Настройки программы «Мажорный лад Р
 
 
 def defaults() -> dict[str, str]:
-    return {code: keys for code, _, keys in ACTIONS}
+    return {code: keys for code, _, keys in ALL_ACTIONS}
 
 
 def load(folder: Path) -> dict[str, str]:
@@ -169,7 +192,7 @@ def save_subs_order(folder: Path, order: str) -> Path:
     """Записать только порядок абонементов, не трогая остальные настройки."""
     values = _values(folder)
     bindings = {code: values.get(code, keys)
-                for code, _title, keys in ACTIONS}
+                for code, _title, keys in ALL_ACTIONS}
     return save(folder, bindings, subs_order=subs_order_value(order))
 
 
@@ -177,7 +200,7 @@ def save_cloud(folder: Path, cloud: Path | str | None) -> Path:
     """Записать только папку для копий, не трогая остальные настройки."""
     values = _values(folder)
     bindings = {code: values.get(code, keys)
-                for code, _title, keys in ACTIONS}
+                for code, _title, keys in ALL_ACTIONS}
     return save(folder, bindings, load_volume(folder),
                 load_cue_volume(folder), load_cues(folder),
                 cloud="" if not cloud else str(cloud))
@@ -199,7 +222,7 @@ def save(folder: Path, bindings: dict[str, str],
     if subs_order is None:
         subs_order = load_subs_order(folder)
     lines = [HEADER]
-    for code, title, _ in ACTIONS:
+    for code, title, _ in ALL_ACTIONS:
         lines.append(f"# {title}")
         lines.append(f"{code} = {bindings.get(code, '')}")
     lines.append("# Громкость сигналов, проценты (0 — без звука)")

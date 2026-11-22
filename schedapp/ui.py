@@ -1848,12 +1848,23 @@ class SettingsDialog(QDialog):
         column.addWidget(hint)
 
         self.key_buttons: dict[str, QPushButton] = {}
-        for code, title, _keys in settings.ACTIONS:
-            button = QPushButton()
-            button.clicked.connect(
-                lambda _checked=False, c=code: self.assign_key(c))
-            self.key_buttons[code] = button
-            column.addWidget(button)
+
+        def add_key_buttons(actions) -> None:
+            for code, title, _keys in actions:
+                button = QPushButton()
+                button.clicked.connect(
+                    lambda _checked=False, c=code: self.assign_key(c))
+                self.key_buttons[code] = button
+                column.addWidget(button)
+
+        add_key_buttons(settings.ACTIONS)
+        column.addSpacing(8)
+        column.addWidget(section_label("Кнопки на вкладках"))
+        note = QLabel("Любую кнопку вкладки можно назначить на клавиши. "
+                      "Они работают на той вкладке, которая открыта.")
+        note.setWordWrap(True)
+        column.addWidget(note)
+        add_key_buttons(settings.BUTTON_ACTIONS)
         self._show_keys()
         column.addStretch(1)
 
@@ -2066,7 +2077,7 @@ class SettingsDialog(QDialog):
 
     def _show_keys(self) -> None:
         """Каждая кнопка называет действие и его клавиши — как в дикторе."""
-        for code, title, _keys in settings.ACTIONS:
+        for code, title, _keys in settings.ALL_ACTIONS:
             keys = norm_keys(self.bindings.get(code, ""))
             text = f"{title}: {keys}" if keys else f"{title}: без клавиши"
             button = self.key_buttons[code]
@@ -2108,7 +2119,7 @@ class SettingsDialog(QDialog):
     def save_bindings(self) -> None:
         result: dict[str, str] = {}
         seen: dict[str, str] = {}
-        for code, title, _keys in settings.ACTIONS:
+        for code, title, _keys in settings.ALL_ACTIONS:
             text = norm_keys(self.bindings.get(code, ""))
             if text:
                 other = seen.get(text)
@@ -2162,6 +2173,49 @@ class SettingsDialog(QDialog):
 
 
 # --- главное окно --------------------------------------------------------
+
+
+class ReminderWindow(QDialog):
+    """Окно напоминания: диктор читает его сам, даже из трея.
+
+    Объявление через Announcer диктор пропускает, если окно программы
+    свёрнуто в трей или не в фокусе. Появление окна и фокус на кнопке —
+    обычное событие, которое экранный диктор читает всегда. Поэтому
+    текст напоминания стоит и в названии кнопки: как только окно
+    откроется, диктор проговорит его целиком.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Напоминание")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.resize(560, 220)
+        lay = QVBoxLayout(self)
+        self.label = QLabel()
+        self.label.setWordWrap(True)
+        lay.addWidget(self.label, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.button = QPushButton("Хорошо")
+        self.button.setDefault(True)
+        self.button.clicked.connect(self.close)
+        row.addWidget(self.button)
+        lay.addLayout(row)
+        self.announcer = Announcer(self)
+
+    def show_text(self, text: str) -> None:
+        """Показать окно с текстом и проговорить его."""
+        self.label.setText(text)
+        self.label.setAccessibleName(text)
+        self.button.setAccessibleName(
+            f"{text} Нажмите Enter, чтобы закрыть напоминание.")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.button.setFocus()
+        # Ещё одно объявление — на случай, если окно не забрало фокус.
+        QTimer.singleShot(400, lambda: announce(self, text, assertive=True))
 
 
 class MainWindow(QMainWindow):
@@ -2318,6 +2372,8 @@ class MainWindow(QMainWindow):
         self.reminders.service_soon.connect(self.on_service_soon)
         self.reminders.ask_start.connect(self.on_ask_start)
         self.reminders.ask_finish.connect(self.on_ask_finish)
+        # Одно окно на все напоминания: новое заменяет текст старого.
+        self._reminder_window: ReminderWindow | None = None
 
         # --- подсказки времени урока
         self._cue_anchor: datetime | None = None
@@ -3485,7 +3541,7 @@ class MainWindow(QMainWindow):
             shortcut.deleteLater()
         self._shortcuts = []
         enabled = not self._settings_open
-        for code, _title, _keys in settings.ACTIONS:
+        for code, _title, _keys in settings.ALL_ACTIONS:
             text = norm_keys(self.bindings.get(code, ""))
             if not text:
                 continue
@@ -3693,6 +3749,35 @@ class MainWindow(QMainWindow):
             self.export_subscription()
         elif action == "settings":
             self.open_settings()
+        # Кнопки на вкладках — то же самое, что щелчок по кнопке.
+        elif action == "add_student":
+            self.add_student()
+        elif action == "edit_student":
+            self.edit_student()
+        elif action == "remove_student":
+            self.remove_student()
+        elif action == "toggle_cues":
+            self.toggle_cues()
+        elif action == "trial":
+            self.add_trial_lesson()
+        elif action == "single":
+            self.add_single_lesson()
+        elif action == "sub_add":
+            self.add_subscription()
+        elif action == "sub_done":
+            self.add_done_lesson()
+        elif action == "sub_edit":
+            self.edit_subscription()
+        elif action == "sub_remove":
+            self.delete_subscription()
+        elif action == "sub_order":
+            self.toggle_subs_order()
+        elif action == "service_add":
+            self.add_service()
+        elif action == "service_edit":
+            self.edit_service()
+        elif action == "service_remove":
+            self.delete_service()
 
     def speak_day(self, day: date, what: str) -> None:
         lessons = [l for l in self.store.lessons
@@ -3752,15 +3837,19 @@ class MainWindow(QMainWindow):
             return
         QTimer.singleShot(int(wait * 1000), action)
 
+    def show_reminder(self, text: str) -> None:
+        """Показать окно напоминания: диктор прочитает его сам."""
+        if self._reminder_window is None:
+            self._reminder_window = ReminderWindow(self)
+        self._reminder_window.show_text(text)
+
     def on_soon(self, lesson: data.Lesson, kind: str) -> None:
         text = soon_text(lesson, kind)
-        self._play_then(
-            "soon", lambda: announce(self, text, assertive=True))
+        self._play_then("soon", lambda: self.show_reminder(text))
 
     def on_service_soon(self, payment: data.Payment, end, days: int) -> None:
         text = service_text(payment, end, days)
-        self._play_then(
-            "soon", lambda: announce(self, text, assertive=True))
+        self._play_then("soon", lambda: self.show_reminder(text))
 
     def on_ask_start(self, lesson: data.Lesson) -> None:
         now = datetime.now()
@@ -3776,6 +3865,7 @@ class MainWindow(QMainWindow):
         box.setDefaultButton(yes)
 
         def ask() -> None:
+            self.bring_forward()
             announce(self, text, assertive=True)
             box.exec()
             chosen = box.clickedButton()
@@ -3801,6 +3891,7 @@ class MainWindow(QMainWindow):
         last = sub is not None and sub.total > 0 and sub.left == 1
 
         def ask() -> None:
+            self.bring_forward()
             announce(self, text, assertive=True)
             dialog = LessonPayDialog(lesson.student, self,
                                      amount=lesson.price, question=text)
@@ -3837,6 +3928,7 @@ class MainWindow(QMainWindow):
             return
 
         def promo() -> None:
+            self.bring_forward()
             announce(self, LAST_LESSON_TEXT, assertive=True)
             # Даём диктору проговорить фразу целиком, потом обычный вопрос.
             QTimer.singleShot(3000, lambda: self._play_then("finish", ask))
@@ -3870,6 +3962,13 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         self.students_list.setFocus()
+
+    def bring_forward(self) -> None:
+        """Показать окно и забрать фокус: тогда диалог прочитает диктор."""
+        if self.isMinimized() or not self.isVisible():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def quit_app(self) -> None:
         self.tray.hide()
