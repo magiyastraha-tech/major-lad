@@ -36,6 +36,19 @@ def _chat_id() -> str:
     return uuid.uuid4().hex
 
 
+def _metro_int(value, default: int, low: int, high: int) -> int:
+    """Целое из сообщения собеседника, зажатое в разумные пределы.
+
+    Значение приходит по сети, и испорченное число не должно ронять
+    разговор: при непонятном берём умолчание.
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, out))
+
+
 def _is_refused(exc: OSError) -> bool:
     """Кабинет закрыт: на том конце никто не слушает порт.
 
@@ -114,7 +127,7 @@ class Server:
 
     def __init__(self, name: str, on_status=None, on_chat=None, on_file=None,
                  on_peer=None, on_join_request=None, on_video_state=None,
-                 on_chat_delete=None, on_chat_edit=None,
+                 on_metro_state=None, on_chat_delete=None, on_chat_edit=None,
                  on_history_loaded=None, on_media_list=None,
                  on_media_saved=None,
                  chat_history: list | None = None,
@@ -138,6 +151,9 @@ class Server:
         self.on_media_saved = on_media_saved or (lambda *a: None)
         self.on_peer = on_peer or (lambda *a: None)
         self.on_video_state = on_video_state or (lambda *a: None)
+        # Метроном включил или выключил ученик: щелчки заводит только одна
+        # сторона, вторая свой метроном гасит.
+        self.on_metro_state = on_metro_state or (lambda *a: None)
         # Второй ученик не входит молча и не висит в очереди: преподаватель
         # решает сам — заменить текущего или отказать.
         self.on_join_request = on_join_request or (lambda *a: None)
@@ -347,6 +363,23 @@ class Server:
             return False
         return session.send_json({"type": "video", "on": bool(on)})
 
+    def send_metro_state(self, on: bool, bpm: int = 90,
+                         beats: int = 4, hello: bool = False) -> bool:
+        """Сообщаем ученику, кто сейчас ведёт метроном.
+
+        Щелчки рождаются только у того, кто включил метроном, и идут
+        собеседнику в том же потоке, что и голос. Получив это сообщение,
+        вторая сторона свой метроном выключает — иначе два щелчка идут
+        вразнобой. hello — состояние сразу после входа в кабинет: тогда
+        при обоюдном включении метроном остаётся за преподавателем.
+        """
+        session = self.current()
+        if session is None:
+            return False
+        return session.send_json({"type": "metro", "on": bool(on),
+                                  "bpm": int(bpm), "beats": int(beats),
+                                  "hello": bool(hello)})
+
     def _accept_loop(self) -> None:
         while self._running:
             try:
@@ -517,6 +550,12 @@ class _Session:
                     self.send_media(path)
             elif kind == "video":
                 self.server.on_video_state(bool(msg.get("on")))
+            elif kind == "metro":
+                self.server.on_metro_state(
+                    bool(msg.get("on")),
+                    _metro_int(msg.get("bpm"), 90, 20, 400),
+                    _metro_int(msg.get("beats"), 4, 1, 16),
+                    bool(msg.get("hello")))
         self.server.leave(self)
         self.close()
 
@@ -579,7 +618,8 @@ class Client:
                  on_status=None, on_chat=None, on_file=None,
                  on_ready=None, on_busy=None, on_peer=None,
                  on_ended=None, on_media_list=None, on_media_saved=None,
-                 on_video_state=None, on_chat_delete=None, on_chat_edit=None,
+                 on_video_state=None, on_metro_state=None,
+                 on_chat_delete=None, on_chat_edit=None,
                  on_history=None):
         self.name = name
         self.host = host
@@ -603,6 +643,9 @@ class Client:
         self.on_media_saved = on_media_saved or (lambda *a: None)
         # Камера собеседника включилась или погасла.
         self.on_video_state = on_video_state or (lambda *a: None)
+        # Метроном включил или выключил преподаватель: свой гасим, его
+        # щелчки слышим в общем потоке.
+        self.on_metro_state = on_metro_state or (lambda *a: None)
         self._sock: socket.socket | None = None
         self._send_lock = threading.Lock()
         self._connected = False
@@ -790,6 +833,12 @@ class Client:
                     self.on_status(str(msg.get("text") or "Трек не получен."))
                 elif kind == "video":
                     self.on_video_state(bool(msg.get("on")))
+                elif kind == "metro":
+                    self.on_metro_state(
+                        bool(msg.get("on")),
+                        _metro_int(msg.get("bpm"), 90, 20, 400),
+                        _metro_int(msg.get("beats"), 4, 1, 16),
+                        bool(msg.get("hello")))
                 elif kind == "ended":
                     reason = str(msg.get("reason") or "closed")
                     break
@@ -935,6 +984,27 @@ class Client:
             return False
         try:
             send_json(sock, {"type": "video", "on": bool(on)}, self._send_lock)
+            return True
+        except OSError:
+            self.disconnect()
+            return False
+
+    def send_metro_state(self, on: bool, bpm: int = 90,
+                         beats: int = 4, hello: bool = False) -> bool:
+        """Сообщить преподавателю, что метроном включён или выключен.
+
+        Метроном заводит только одна сторона: включил у себя — щелчки
+        уходят собеседнику потоком, и его собственный метроном молчит.
+        hello — состояние сразу после подключения, а не нажатие кнопки.
+        """
+        sock = self._sock
+        if sock is None or not self._connected:
+            return False
+        try:
+            send_json(sock, {"type": "metro", "on": bool(on),
+                             "bpm": int(bpm), "beats": int(beats),
+                             "hello": bool(hello)},
+                      self._send_lock)
             return True
         except OSError:
             self.disconnect()

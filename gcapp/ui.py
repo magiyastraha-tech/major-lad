@@ -1378,6 +1378,9 @@ class MainWindow(QMainWindow):
     # Пришёл файл: кто прислал и где он лежит на диске.
     sig_file_message = Signal(str, str)
     sig_peer_video = Signal(bool)
+    # Собеседник включил или выключил метроном: состояние, темп, доли и
+    # признак «это состояние при входе в кабинет, а не нажатие кнопки».
+    sig_peer_metro = Signal(bool, int, int, bool)
     # Порция прошлой переписки от преподавателя: список сообщений и
     # признак «раньше есть ещё».
     sig_history = Signal(object, bool)
@@ -1409,6 +1412,12 @@ class MainWindow(QMainWindow):
         self._loading_history = False
         self.video_sender: VideoSender | None = None
         self.connected = False
+        # Метроном ведёт только одна сторона: у кого он включён, тот и
+        # щёлкает, второй слышит щелчки общим потоком и свой гасит.
+        # _peer_metro_on — у собеседника метроном включён; _metro_held —
+        # свой выключен именно ради этого, чтобы вернуть его после урока.
+        self._peer_metro_on = False
+        self._metro_held = False
         # Начало текущего урока: от него считается длительность, которая
         # потом ложится строкой в чат и в историю ученика.
         self._lesson_start: datetime | None = None
@@ -1870,6 +1879,7 @@ class MainWindow(QMainWindow):
         self.sig_media_list.connect(self._on_media_list)
         self.sig_media_saved.connect(self._on_media_saved)
         self.sig_peer_video.connect(self._on_peer_video)
+        self.sig_peer_metro.connect(self._on_peer_metro)
 
     # -- запуск ролей -------------------------------------------------------
 
@@ -1887,6 +1897,7 @@ class MainWindow(QMainWindow):
             on_peer=self.sig_peer.emit,
             on_join_request=self.sig_join_request.emit,
             on_video_state=self.sig_peer_video.emit,
+            on_metro_state=self.sig_peer_metro.emit,
             on_history_loaded=self.sig_history_loaded.emit,
             chat_history=self._history,
             port=int(self.cfg.get("server_port", 45800)),
@@ -1952,6 +1963,7 @@ class MainWindow(QMainWindow):
             on_media_list=self.sig_media_list.emit,
             on_media_saved=self.sig_media_saved.emit,
             on_video_state=self.sig_peer_video.emit,
+            on_metro_state=self.sig_peer_metro.emit,
             on_history=self.sig_history.emit,
         )
         if not silent:
@@ -2105,6 +2117,10 @@ class MainWindow(QMainWindow):
         self.connect_button.setText("Отключиться")
         self.connect_button.setAccessibleName("Отключиться")
         self._start_audio()
+        # Преподаватель должен знать, не остался ли метроном включённым с
+        # прошлого урока: метроном ведёт только одна сторона.
+        if self.client is not None and not self.is_teacher:
+            self._send_metro_state(self.metro_button.isChecked(), hello=True)
         # Сразу подтягиваем последние сообщения прошлых занятий — так ученик
         # открывает чат и видит, о чём говорили в прошлый раз.
         if self.client is not None and not self.is_teacher:
@@ -2221,6 +2237,11 @@ class MainWindow(QMainWindow):
             self._stop_video()
             self._close_video_window()
             self.engine.student.clear()
+            self._peer_metro_on = False
+            if self._metro_held:
+                # Урок кончился — возвращаем свой метроном, который гасили
+                # ради щелчков собеседника.
+                self._metro_hold(False)
             if self.is_teacher:
                 # Кабинет остаётся открытым: местный звук, метроном и MIDI
                 # продолжают работать, пока ждём следующего ученика.
@@ -2251,6 +2272,9 @@ class MainWindow(QMainWindow):
                 self._start_video()
             else:
                 self._start_audio()
+            # Сообщаем ученику, кто ведёт метроном, — у него мог остаться
+            # включённым с прошлого урока.
+            self._send_metro_state(self.metro_button.isChecked(), hello=True)
 
     def _start_audio(self, local_only: bool = False) -> bool:
         """Открывает звуковой поток.
@@ -2346,6 +2370,79 @@ class MainWindow(QMainWindow):
                 self.client.send_video_state(on)
         except Exception:
             pass
+
+    def _send_metro_state(self, on: bool, hello: bool = False) -> None:
+        """Сказать собеседнику, кто сейчас ведёт метроном."""
+        try:
+            if self.is_teacher and self.server is not None:
+                self.server.send_metro_state(on, self.bpm_spin.value(),
+                                             self.beats_spin.value(), hello)
+            elif self.client is not None:
+                self.client.send_metro_state(on, self.bpm_spin.value(),
+                                             self.beats_spin.value(), hello)
+        except Exception:
+            pass
+
+    def _metro_hold(self, hold: bool) -> None:
+        """Выключает свой метроном (или возвращает) без нажатия кнопки.
+
+        Пока щелчки идут от собеседника, свой метроном молчит: два щелчка
+        вразнобой сбивают. Настройка сохраняется, чтобы после обрыва урока
+        метроном не включился сам в новой игре.
+        """
+        self._metro_held = bool(hold)
+        cfg_metro = self.cfg.setdefault("metronome", {})
+        cfg_metro["enabled"] = not hold
+        self.metro_button.blockSignals(True)
+        self.metro_button.setChecked(not hold)
+        self.metro_button.blockSignals(False)
+        self._update_metro_button()
+        self.engine.set_metronome(not hold, self.bpm_spin.value(),
+                                  self.beats_spin.value())
+        config.save(self.cfg)
+        self._refresh_volume_visibility()
+
+    def _on_peer_metro(self, on: bool, bpm: int, beats: int,
+                       hello: bool = False) -> None:
+        """Собеседник включил или выключил метроном.
+
+        Щелчки рождаются только у одной стороны и идут второй в общем
+        потоке с голосом. Получив «включил», свой метроном гасим.
+        """
+        on = bool(on)
+        if not on:
+            self._peer_metro_on = False
+            if self._metro_held:
+                self._metro_hold(False)
+                text = ("Собеседник выключил метроном. "
+                        "Свой метроном снова включён.")
+                self._set_status(text)
+                announce(self.status_label, text)
+            return
+        if hello and self.is_teacher and self.metro_button.isChecked():
+            # Оба вошли в кабинет с метрономом, оставшимся с прошлого
+            # урока. Метроном ведёт преподаватель; ученик получит наше
+            # «включён» и свой погасит.
+            self._send_metro_state(True)
+            return
+        first = not self._peer_metro_on
+        self._peer_metro_on = True
+        if not self.metro_button.isChecked():
+            if first:
+                text = (f"У собеседника включён метроном: {bpm} "
+                        f"{_plural(bpm, 'удар', 'удара', 'ударов')} в минуту, "
+                        f"{beats} {_plural(beats, 'доля', 'доли', 'долей')} "
+                        "в такте.")
+                self._set_status(text)
+                announce(self.status_label, text)
+            return
+        self._metro_hold(True)
+        text = (f"У собеседника включён метроном: {bpm} "
+                f"{_plural(bpm, 'удар', 'удара', 'ударов')} в минуту, "
+                f"{beats} {_plural(beats, 'доля', 'доли', 'долей')} в такте. "
+                "Свой метроном выключен, чтобы не сбивать.")
+        self._set_status(text)
+        announce(self.status_label, text)
 
     def _update_cam_button(self) -> None:
         # На кнопке — состояние, а не действие: диктор, попав на неё,
@@ -2721,6 +2818,10 @@ class MainWindow(QMainWindow):
     def _on_metronome_toggle(self, checked: bool) -> None:
         cfg_metro = self.cfg.setdefault("metronome", {})
         cfg_metro["enabled"] = bool(checked)
+        if checked:
+            # Человек сам включил метроном — значит, кнопкой, а не
+            # приостановкой ради собеседника.
+            self._metro_held = False
         self._update_metro_button()
         self.engine.set_metronome(checked, self.bpm_spin.value(),
                                   self.beats_spin.value())
@@ -2737,6 +2838,7 @@ class MainWindow(QMainWindow):
         if "metronome" in appeared:
             text += " Регулятор громкости метронома появился на главном экране."
         self._set_status(text)
+        self._send_metro_state(checked)
 
     def _on_metronome_value(self) -> None:
         cfg_metro = self.cfg.setdefault("metronome", {})
@@ -2746,6 +2848,10 @@ class MainWindow(QMainWindow):
         self.engine.set_metronome(self.metro_button.isChecked(),
                                   self.bpm_spin.value(), self.beats_spin.value())
         self._save_timer.start()
+        if self.metro_button.isChecked():
+            # Собеседник слышит наш метроном потоком — темп и доли ему
+            # нужны для голосового объявления.
+            self._send_metro_state(True)
 
     # -- плеер ---------------------------------------------------------------
 

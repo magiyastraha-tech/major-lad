@@ -1590,11 +1590,24 @@ class AudioEngine:
             return self.tx_delay_ms * SAMPLE_RATE / 1000.0
         if fill <= 0:
             return float(self._tx_delay.frames)
+        snap = False
         if self._tx_fill <= 0.0:
             self._tx_fill = float(fill)
         else:
-            self._tx_fill += (float(fill) - self._tx_fill) * 0.05
+            delta = float(fill) - self._tx_fill
+            if delta <= -0.015 * SAMPLE_RATE:
+                # Входной буфер подрезали или драйвер выбрал пачку — голос
+                # разом прыгнул вперёд на полтора десятка миллисекунд и
+                # больше. Плавно тянуть за ним клик полминуты нельзя: все
+                # эти секунды клик идёт мимо хлопков. Переставляем линию
+                # задержки сразу, тем же блоком, что и голос.
+                self._tx_fill = float(fill)
+                snap = True
+            else:
+                self._tx_fill += delta * 0.05
         total = self._tx_fill + (in_lat + out_lat) * SAMPLE_RATE
+        if snap:
+            self._tx_delay.set_delay(int(round(total)))
         self._tx_parts = (out_lat * 1000.0, in_lat * 1000.0,
                           self._tx_fill * 1000.0 / SAMPLE_RATE,
                           int(round(total * 1000.0 / SAMPLE_RATE)))
@@ -1856,10 +1869,19 @@ class AudioEngine:
             fade = FADE_FRAMES
         level = ring.level
         ratio = 1.0
-        if level > target:
-            ratio = 1.0 + min(0.01, (level - target) / max(1.0, target * 4.0))
-        elif level < target:
-            ratio = 1.0 - min(0.01, (target - level) / max(1.0, target * 4.0))
+        # Мёртвая зона: пока буфер рядом с целью, скорость не трогаем.
+        # Прежняя подстройка реагировала уже на пару миллисекунд и тянула
+        # весь входящий поток на процент — хлопки собеседника «плавали» по
+        # скорости, хотя щелчки у него шли ровно. Часы двух компьютеров
+        # расходятся на сотые доли процента, и подстройки 0.15% хватает с
+        # запасом, а на слух она неразличима.
+        dead = max(AUDIO_BLOCK, int(target * 0.2))
+        if level > target + dead:
+            over = level - target - dead
+            ratio = 1.0 + min(0.0015, over / max(1.0, target * 10.0))
+        elif level < target - dead:
+            under = target - dead - level
+            ratio = 1.0 - min(0.0015, under / max(1.0, target * 10.0))
         n = frames if ratio == 1.0 else max(1, int(round(frames * ratio)))
         out = ring.read(n)
         got = ring.last_got
