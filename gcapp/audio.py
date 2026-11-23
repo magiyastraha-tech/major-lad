@@ -662,7 +662,7 @@ class Source:
     def stereo(self) -> bool:
         return self.ring_r is not None
 
-    def open(self) -> None:
+    def open(self, size: int = 0) -> None:
         # Не всякое устройство отдаёт нужное число каналов: моно-микрофоны
         # и стереоинтерфейсы ведут себя по-разному. Второму каналу и стерео
         # нужно стереоустройство; если его нет, откатываемся на первый вход,
@@ -671,6 +671,14 @@ class Source:
         # если один драйвер не открылся, пробуем следующий.
         want = 2 if max(_mode_columns(self.mode)) > 0 else 1
         choices = [want] if want == 1 else [2, 1]
+        # block — размер блока, который человек выбрал в настройках (0 —
+        # как предлагает драйвер). Сначала пробуем его, потом штатные:
+        # слишком мелкий блок не всякая карта принимает, и вход не должен
+        # из-за этого пропасть.
+        blocks: list[int] = []
+        for value in (int(size or 0), AUDIO_BLOCK, BLOCK):
+            if value > 0 and value not in blocks:
+                blocks.append(value)
         # Задержки драйверов — заранее, в настраивающем потоке: из
         # аудиопотока PortAudio и COM спрашивать нельзя.
         _prewarm_hostapi(self.device_indices)
@@ -678,7 +686,7 @@ class Source:
         for index in self.device_indices:
             self.device_index = index
             for channels in choices:
-                for block in (AUDIO_BLOCK, BLOCK):
+                for block in blocks:
                     stream = None
                     try:
                         stream = sd.InputStream(
@@ -1490,8 +1498,8 @@ class AudioEngine:
               modes=None, output: str = "", midi_enabled: bool = False,
               midi_port: str = "", midi_options=None,
               driver: str = "", asio_device: str = "",
-              asio_in: int = 0, asio_out: int = 0, input_fx=None
-              ) -> tuple[bool, str]:
+              asio_in: int = 0, asio_out: int = 0, input_fx=None,
+              device_buffer: int = 0) -> tuple[bool, str]:
         self.stop()
         if sd is None:
             return False, "Не установлен модуль sounddevice — звук недоступен."
@@ -1513,7 +1521,9 @@ class AudioEngine:
             output=output, midi_enabled=midi_enabled, midi_port=midi_port,
             midi_options=dict(midi_options or {}), driver=driver,
             asio_device=asio_device, asio_in=asio_in, asio_out=asio_out,
-            input_fx=dict(input_fx or {}))
+            input_fx=dict(input_fx or {}),
+            device_buffer=int(device_buffer or 0))
+        self._device_buffer = int(device_buffer or 0)
         self._running = True
 
         try:
@@ -1545,7 +1555,8 @@ class AudioEngine:
         slow = False
         if asio:
             ok, why = self._open_duplex(asio_device, int(asio_in or 0),
-                                        int(asio_out or 0))
+                                        int(asio_out or 0),
+                                        self._device_buffer)
             if ok:
                 latency = _stream_latency(self._out, "out")
             else:
@@ -1553,7 +1564,7 @@ class AudioEngine:
                 self.log(f"ASIO не открылся ({why}) — беру обычный драйвер.")
                 asio = False
         if not asio:
-            ok, why = self._open_output(output)
+            ok, why = self._open_output(output, self._device_buffer)
             if not ok:
                 self.stop()
                 return False, why
@@ -1632,7 +1643,8 @@ class AudioEngine:
                 # У ASIO вход идёт из общего потока: своего потока у него
                 # быть не может, драйвер один на всю карту.
                 source = Source(key, self._out_index, mode)
-                source.open_duplex(self._asio_in_channels, AUDIO_BLOCK,
+                source.open_duplex(self._asio_in_channels,
+                                   self._device_buffer or AUDIO_BLOCK,
                                    _stream_latency(self._out, "in"))
                 self.sources[key] = source
                 self.log(f"Вход открыт: {device_name(self._out_index)}, "
@@ -1640,7 +1652,7 @@ class AudioEngine:
                 continue
             source = Source(key, indices, mode)
             try:
-                source.open()
+                source.open(self._device_buffer)
                 self.sources[key] = source
             except Exception as exc:
                 self.log(f"Не удалось открыть вход «{name}»: {exc}")
@@ -1683,7 +1695,7 @@ class AudioEngine:
             return True, f"Звук запущен. Задержка вывода {latency * 1000:.0f} мс."
         return True, "Звук запущен."
 
-    def _open_output(self, output: str) -> tuple[bool, str]:
+    def _open_output(self, output: str, size: int = 0) -> tuple[bool, str]:
         """Открывает обычный (не ASIO) аудиовыход.
 
         Карта может не принимать моно: тогда открываем стерео и дублируем
@@ -1705,7 +1717,14 @@ class AudioEngine:
                 tried.append(label)
             # Медленным драйверам сразу даём блок 10 мс: мельче они всё
             # равно отдают пачками, только чаще.
-            blocks = (BLOCK, AUDIO_BLOCK) if _hostapi_slow(index) else (AUDIO_BLOCK, BLOCK)
+            base = ((BLOCK, AUDIO_BLOCK) if _hostapi_slow(index)
+                    else (AUDIO_BLOCK, BLOCK))
+            # Выбранный человеком размер пробуем первым; не открылся —
+            # откатываемся на штатные, чтобы звук не пропал.
+            blocks: list[int] = []
+            for value in ((int(size or 0),) + base):
+                if value > 0 and value not in blocks:
+                    blocks.append(value)
             for channels in (1, 2):
                 opened = False
                 for block in blocks:
@@ -1764,7 +1783,7 @@ class AudioEngine:
         return True, ""
 
     def _open_duplex(self, name: str, in_channels: int,
-                     out_channels: int) -> tuple[bool, str]:
+                     out_channels: int, block: int = 0) -> tuple[bool, str]:
         """Открывает карту через ASIO: вход и выход одним потоком.
 
         Драйвер ASIO один на карту и работает только с одной программой
@@ -1802,42 +1821,52 @@ class AudioEngine:
             extra = None
         _prewarm_hostapi([index])
         error: Exception | None = None
-        for latency_mode in ("low", None):
-            stream = None
-            try:
-                stream = sd.Stream(
-                    device=index,
-                    channels=(left, right),
-                    samplerate=SAMPLE_RATE,
-                    blocksize=0,
-                    dtype="float32",
-                    latency=latency_mode,
-                    extra_settings=extra,
-                    callback=self._duplex_callback,
-                )
-                stream.start()
-                self._out = stream
-                self._duplex = stream
-                self._out_channels = right
-                self._out_index = index
-                self._out_measured = None
-                self._asio_in_channels = left
-                self._asio_out_channels = right
-                self._last_cb = time.monotonic()
-                out_latency = _stream_latency(stream, "out")
-                detail = (f", задержка {out_latency * 1000:.0f} мс"
-                          if out_latency is not None else "")
-                self.log(f"ASIO открыт: {device_name(index)}, вход {left} кан., "
-                         f"выход {right} кан.{detail}")
-                return True, ""
-            except Exception as exc:
-                error = exc
-                self.log(f"ASIO «{device_name(index)}» не открылся: {exc}")
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
+        # Размер блока — просьба к драйверу: у ASIO он принадлежит карте,
+        # и Focusrite ставит ближайший допустимый (32 может стать 48).
+        # Сначала пробуем выбранный, потом «как даст драйвер».
+        sizes: list[int] = []
+        for value in (int(block or 0), 0):
+            if value not in sizes:
+                sizes.append(value)
+        for size in sizes:
+            for latency_mode in ("low", None):
+                stream = None
+                try:
+                    stream = sd.Stream(
+                        device=index,
+                        channels=(left, right),
+                        samplerate=SAMPLE_RATE,
+                        blocksize=size,
+                        dtype="float32",
+                        latency=latency_mode,
+                        extra_settings=extra,
+                        callback=self._duplex_callback,
+                    )
+                    stream.start()
+                    self._out = stream
+                    self._duplex = stream
+                    self._out_channels = right
+                    self._out_index = index
+                    self._out_measured = None
+                    self._asio_in_channels = left
+                    self._asio_out_channels = right
+                    self._last_cb = time.monotonic()
+                    out_latency = _stream_latency(stream, "out")
+                    detail = (f", задержка {out_latency * 1000:.0f} мс"
+                              if out_latency is not None else "")
+                    where = f"блок {size}" if size else "блок по драйверу"
+                    self.log(f"ASIO открыт: {device_name(index)}, "
+                             f"вход {left} кан., выход {right} кан., "
+                             f"{where}{detail}")
+                    return True, ""
+                except Exception as exc:
+                    error = exc
+                    self.log(f"ASIO «{device_name(index)}» не открылся: {exc}")
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
         return False, str(error)
 
     def _duplex_callback(self, indata, outdata, frames, time_info,

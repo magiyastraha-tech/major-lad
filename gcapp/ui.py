@@ -894,6 +894,29 @@ class SettingsDialog(QDialog):
         self.asio_out_label = label_for("Выходных каналов", self.asio_out_spin)
         driver_form.addRow(self.asio_out_label, self.asio_out_spin)
 
+        self.device_buffer_combo = QComboBox()
+        self.device_buffer_combo.setAccessibleName("Размер буфера драйвера")
+        self.device_buffer_combo.setAccessibleDescription(
+            "Размер блока, который программа просит у драйвера. Меньше "
+            "блок — меньше задержка, но выше нагрузка: на 32 и 48 может "
+            "появляться треск. У карт ASIO точный размер принадлежит "
+            "драйверу: Focusrite ставит ближайший допустимый, и запрос 32 "
+            "может превратиться в 48. Точный размер виден в панели "
+            "драйвера. «По драйверу» — ничего не просить, как было раньше.")
+        for value, title in ((0, "По драйверу"), (32, "32 отсчёта"),
+                             (48, "48 отсчётов"), (64, "64 отсчёта"),
+                             (96, "96 отсчётов"), (128, "128 отсчётов"),
+                             (192, "192 отсчёта"), (256, "256 отсчётов"),
+                             (512, "512 отсчётов")):
+            self.device_buffer_combo.addItem(title, value)
+        buf_index = self.device_buffer_combo.findData(
+            int(self.cfg["audio"].get("device_buffer", 0) or 0))
+        self.device_buffer_combo.setCurrentIndex(
+            buf_index if buf_index >= 0 else 0)
+        driver_form.addRow(label_for("Буфер драйвера",
+                                     self.device_buffer_combo),
+                           self.device_buffer_combo)
+
         asio_hint = QLabel(
             "ASIO занимает карту целиком: другие программы во время урока "
             "звук через неё не получат. Какие именно каналы брать, "
@@ -1523,6 +1546,8 @@ class SettingsDialog(QDialog):
         cfg["audio"]["asio_device"] = str(self.asio_combo.currentData() or "")
         cfg["audio"]["asio_in_channels"] = int(self.asio_in_spin.value())
         cfg["audio"]["asio_out_channels"] = int(self.asio_out_spin.value())
+        cfg["audio"]["device_buffer"] = int(
+            self.device_buffer_combo.currentData() or 0)
         cfg["audio"]["device1"] = self.dev1_combo.currentData() or ""
         cfg["audio"]["device2"] = self.dev2_combo.currentData() or ""
         cfg["audio"]["usb"] = self.usb_combo.currentData() or ""
@@ -2694,6 +2719,7 @@ class MainWindow(QMainWindow):
             asio_in=int(cfg_audio.get("asio_in_channels", 2) or 2),
             asio_out=int(cfg_audio.get("asio_out_channels", 2) or 2),
             input_fx=input_fx,
+            device_buffer=int(cfg_audio.get("device_buffer", 0) or 0),
         )
         self._set_status(message)
         if ok:
@@ -4478,7 +4504,8 @@ class MainWindow(QMainWindow):
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.
         device_keys = ("device1", "device2", "usb", "output",
                        "mode1", "mode2", "usb_mode", "driver",
-                       "asio_device", "asio_in_channels", "asio_out_channels")
+                       "asio_device", "asio_in_channels", "asio_out_channels",
+                       "device_buffer")
         devices_changed = any(audio_before.get(key) != self.cfg["audio"].get(key)
                               for key in device_keys)
         if self.engine.running and devices_changed:
@@ -4497,7 +4524,8 @@ class MainWindow(QMainWindow):
         audio = self.cfg.get("audio", {})
         runlog.write(
             "Настройки сохранены: драйвер {drv}, карта ASIO {card} "
-            "({ain} вх. / {aout} вых.), буфер {b}, шаг перемотки {s} с, "
+            "({ain} вх. / {aout} вых.), буфер {b}, буфер драйвера {db}, "
+            "шаг перемотки {s} с, "
             "растяжение {a}, задержка компенсации {d} мс, устройства "
             "{dev1} / {dev2} / "
             "{out}, режим входа {m1} / {m2} / {mu}, вход 1: мониторинг "
@@ -4508,6 +4536,9 @@ class MainWindow(QMainWindow):
                 ain=int(audio.get("asio_in_channels", 0) or 0),
                 aout=int(audio.get("asio_out_channels", 0) or 0),
                 b=audio.get("buffer", "normal"),
+                db=(f"{int(audio.get('device_buffer', 0) or 0)} отсчётов"
+                    if int(audio.get("device_buffer", 0) or 0)
+                    else "по драйверу"),
                 s=(self.cfg.get("player", {}) or {}).get("skip", 5),
                 a=self._stretch_algo(),
                 d=int(audio.get("tx_delay_ms", 0) or 0),
