@@ -4,9 +4,11 @@
 за сутки до урока, за час и за пять минут. Каждое напоминание звучит на
 пять минут раньше круглой отметки: урок во вторник в 11:00 — напоминания
 в понедельник в 10:55, во вторник в 9:55 и во вторник в 10:55.
-Отдельно она спрашивает в
-начале урока, идёт ли он, и через сорок минут — прошёл ли. Если ответа
-нет, вопрос повторяется через час, пока не будет ответа.
+В начале урока ничего спрашивать не нужно: урок стартует сам по
+расписанию, и через сорок минут служба спрашивает, прошёл ли он. Если
+ответа нет, вопрос повторяется через час, пока не будет ответа.
+Кнопка «Начать урок» сдвигает отсчёт: урок начался раньше или позже —
+значит, и конец наступит через сорок минут после нажатия.
 
 Ещё она следит за сроками услуг: за три дня и за день до конца аренды
 гитары или гарантии на настройку.
@@ -52,7 +54,6 @@ class ReminderService(QObject):
 
     soon = Signal(object, str)              # урок, вид напоминания
     service_soon = Signal(object, object, int)  # услуга, конец срока, дней
-    ask_start = Signal(object)              # урок: «идёт ли у вас урок?»
     ask_finish = Signal(object)             # урок: «прошёл ли урок?»
 
     def __init__(self, store, parent=None):
@@ -72,10 +73,17 @@ class ReminderService(QObject):
 
     # --- ответы окна на вопросы -------------------------------------------
 
-    def mark_started(self, lesson: Lesson) -> None:
-        """Урок начался: через 40 минут спросим, прошёл ли он."""
-        self._started[lesson.uid] = datetime.now()
-        self._next_ask[lesson.uid] = datetime.now() + LESSON_LENGTH
+    def mark_started(self, lesson: Lesson,
+                     moment: datetime | None = None) -> None:
+        """Урок начался: через 40 минут спросим, прошёл ли он.
+
+        `moment` — когда урок начался на самом деле. Кнопка «Начать
+        урок» передаёт время нажатия, поэтому подсказки времени и
+        вопрос о конце отсчитываются от него, а не от расписания.
+        """
+        moment = moment or datetime.now()
+        self._started[lesson.uid] = moment
+        self._next_ask[lesson.uid] = moment + LESSON_LENGTH
 
     def mark_finished(self, lesson: Lesson) -> None:
         self._started.pop(lesson.uid, None)
@@ -125,25 +133,18 @@ class ReminderService(QObject):
                     self._fired.add(mark)
                     self.soon.emit(lesson, kind)
 
-            # Начало урока.
-            if lesson.uid in self._started:
-                moment = self._next_ask.get(lesson.uid)
-                if moment is not None and now >= moment:
-                    self._next_ask[lesson.uid] = now + ASK_EVERY
-                    self.ask_finish.emit(lesson)
-                continue
-            if now < stamp:
-                continue
+            # Начало урока: в назначенное время урок стартует сам.
+            # Кнопка «Начать урок» ставит свою отметку через
+            # mark_started — тогда отсчёт идёт от нажатия.
+            if lesson.uid not in self._started:
+                if now < stamp or now >= stamp + LATE_WINDOW:
+                    continue
+                self._started[lesson.uid] = stamp
+                self._next_ask[lesson.uid] = stamp + LESSON_LENGTH
             moment = self._next_ask.get(lesson.uid)
-            if moment is None:
-                # Первый вопрос — с начала урока и до конца окна.
-                if now < stamp + LATE_WINDOW:
-                    self._next_ask[lesson.uid] = now + ASK_EVERY
-                    self.ask_start.emit(lesson)
-                continue
-            if now >= moment:
+            if moment is not None and now >= moment:
                 self._next_ask[lesson.uid] = now + ASK_EVERY
-                self.ask_start.emit(lesson)
+                self.ask_finish.emit(lesson)
 
         self._check_services(now)
 

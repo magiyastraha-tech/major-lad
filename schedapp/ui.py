@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 
 from . import (__version__, autostart, dates, services, settings, sounds,
                store as data, sync, updater)
-from .reminders import ReminderService, service_text, soon_text
+from .reminders import (KINDS, LATE_WINDOW, LESSON_LENGTH, ReminderService,
+                        service_text, soon_text)
 from .store import (DIRECTIONS, FORMATS, LESSON_CANCELLED, LESSON_DONE,
                     LESSON_WAIT, SERVICES, Store, money, plural)
 from .uikit import Announcer, announce, key_text
@@ -71,11 +72,56 @@ def split_name(name: str) -> tuple[str, str]:
     return parts[0], " ".join(parts[1:])
 
 
-def lesson_line(lesson: data.Lesson, with_status: bool = True) -> str:
-    """Урок одной фразой: как его прочитает диктор."""
+def lesson_number(store: Store,
+                  lesson: data.Lesson) -> tuple[int, int] | None:
+    """Номер урока внутри абонемента и сколько в нём всего уроков.
+
+    Отменённый урок и урок без абонемента номера не получают. Для
+    проведённого номер — его место среди уроков абонемента, для
+    ожидающего — сколько уже проведено плюс сколько ожидающих идёт
+    раньше него: так номер в расписании не прыгает при переносе.
+    """
+    if lesson.status == LESSON_CANCELLED:
+        return None
+    sub = None
+    if lesson.subscription:
+        for item in store.subscriptions:
+            if item.uid == lesson.subscription:
+                sub = item
+                break
+    if sub is None or sub.one_off or not sub.total:
+        sub = store.current_subscription(lesson.student)
+    if sub is None or sub.one_off or not sub.total:
+        return None
+    if lesson.status == LESSON_DONE:
+        for index, item in enumerate(store.subscription_lessons(sub)):
+            if item.uid == lesson.uid:
+                return index + 1, sub.total
+        return None
+    number = sub.used + 1
+    for item in store.lessons:
+        if (item.uid != lesson.uid and item.student == lesson.student
+                and item.status == LESSON_WAIT
+                and item.subscription in (0, sub.uid)
+                and item.stamp < lesson.stamp):
+            number += 1
+    if number > sub.total:
+        return None
+    return number, sub.total
+
+
+def lesson_line(store: Store, lesson: data.Lesson,
+                with_status: bool = True) -> str:
+    """Урок одной фразой: как его прочитает диктор.
+
+    Если урок входит в абонемент, после имени звучит его номер: «урок 11».
+    """
     parts = [dates.human_date(lesson.day), f"в {lesson.time}",
-             lesson.student, lesson.direction.casefold(),
-             lesson.lesson_format.casefold()]
+             lesson.student]
+    number = lesson_number(store, lesson)
+    if number is not None:
+        parts.append(f"урок {number[0]}")
+    parts += [lesson.direction.casefold(), lesson.lesson_format.casefold()]
     if with_status:
         parts.append(lesson.status)
     return ", ".join(parts)
@@ -394,6 +440,7 @@ def add_weekly_lessons(store: Store, student: data.Student,
     """
     now = datetime.now()
     start = first or date.today()
+    uid = Store._next_uid(store.lessons)
     added = 0
     for offset in range(0, 28):
         day = start + timedelta(days=offset)
@@ -408,11 +455,17 @@ def add_weekly_lessons(store: Store, student: data.Student,
                        for l in store.lessons)
             if same:
                 continue
-            store.add_lesson(
-                student.name, day, time,
+            # Уроки копятся в памяти, а на диск пишутся один раз в конце:
+            # иначе двадцать восемь уроков заново сохраняют всю таблицу
+            # и текстовые копии — программа заметно подвисает.
+            store.lessons.append(data.Lesson(
+                uid=uid, day=day, time=time, student=student.name,
                 lesson_format=student.lesson_format,
-                direction=student.direction)
+                direction=student.direction))
+            uid += 1
             added += 1
+    if added:
+        store.save_lessons()
     return added
 
 
@@ -636,8 +689,11 @@ class SubscriptionDialog(QDialog):
             finished=self.historical)
         if not self.historical and price > 0:
             word = plural(count, "урок", "урока", "уроков")
+            # Оплата — в день покупки абонемента, а не всегда сегодня:
+            # иначе заработок месяца уезжает не туда.
             self.store.add_payment(
-                self.student.name, f"Абонемент, {count} {word}", price)
+                self.student.name, f"Абонемент, {count} {word}", price,
+                day=picked_date(self.bought))
         if self.schedule_box is not None and self.schedule_box.isChecked():
             picked = self.grid.picked()
             if picked:
@@ -2175,49 +2231,6 @@ class SettingsDialog(QDialog):
 # --- главное окно --------------------------------------------------------
 
 
-class ReminderWindow(QDialog):
-    """Окно напоминания: диктор читает его сам, даже из трея.
-
-    Объявление через Announcer диктор пропускает, если окно программы
-    свёрнуто в трей или не в фокусе. Появление окна и фокус на кнопке —
-    обычное событие, которое экранный диктор читает всегда. Поэтому
-    текст напоминания стоит и в названии кнопки: как только окно
-    откроется, диктор проговорит его целиком.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Напоминание")
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-        self.resize(560, 220)
-        lay = QVBoxLayout(self)
-        self.label = QLabel()
-        self.label.setWordWrap(True)
-        lay.addWidget(self.label, 1)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        self.button = QPushButton("Хорошо")
-        self.button.setDefault(True)
-        self.button.clicked.connect(self.close)
-        row.addWidget(self.button)
-        lay.addLayout(row)
-        self.announcer = Announcer(self)
-
-    def show_text(self, text: str) -> None:
-        """Показать окно с текстом и проговорить его."""
-        self.label.setText(text)
-        self.label.setAccessibleName(text)
-        self.button.setAccessibleName(
-            f"{text} Нажмите Enter, чтобы закрыть напоминание.")
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self.button.setFocus()
-        # Ещё одно объявление — на случай, если окно не забрало фокус.
-        QTimer.singleShot(400, lambda: announce(self, text, assertive=True))
-
-
 class MainWindow(QMainWindow):
     def __init__(self, store: Store, background: bool = False):
         super().__init__()
@@ -2293,6 +2306,16 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
 
         row = QHBoxLayout()
+        # Урок начинается сам по расписанию; эта кнопка — для случая,
+        # когда ученик пришёл раньше или чуть позже. От нажатия
+        # отсчитываются подсказки времени и вопрос о конце урока.
+        self.start_button = QPushButton("Начать урок")
+        self.start_button.setAccessibleName(
+            "Начать урок для выбранного ученика: отсчёт подсказок времени "
+            "и конца урока пойдёт от нажатия")
+        self.start_button.clicked.connect(
+            lambda _checked=False: self.start_lesson())
+        row.addWidget(self.start_button)
         self.card_button = QPushButton()
         self.card_button.clicked.connect(self.open_card)
         row.addWidget(self.card_button)
@@ -2341,6 +2364,9 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         self.tabs.addTab(page, "Расписание")
 
+        # --- вкладка уведомлений: всё, что ещё не подтверждено
+        self._notifications_tab()
+
         # --- вкладки абонементов
         (self.active_subs_page, self.active_subs_hint,
          self.active_subs_list, self.active_order_button) = self._subs_tab(
@@ -2357,6 +2383,18 @@ class MainWindow(QMainWindow):
             "Разовые и пробные уроки", "Список разовых и пробных уроков",
             historical=True, one_off=True)
 
+        # Будущие абонементы: вкладка видна, только когда есть что
+        # показать. Купили абонемент поверх действующего — он здесь
+        # ждёт; старый кончился — этот переехал в действующие, и вкладка
+        # снова спряталась.
+        (self.future_subs_page, self.future_subs_hint,
+         self.future_subs_list,
+         self.future_order_button) = self._subs_tab(
+            "Будущие абонементы", "Список будущих абонементов",
+            historical=False)
+        self.tabs.setTabVisible(
+            self.tabs.indexOf(self.future_subs_page), False)
+
         # --- вкладка услуг
         self._services_tab()
         self.update_hints()
@@ -2370,10 +2408,10 @@ class MainWindow(QMainWindow):
         self.reminders = ReminderService(self.store, self)
         self.reminders.soon.connect(self.on_soon)
         self.reminders.service_soon.connect(self.on_service_soon)
-        self.reminders.ask_start.connect(self.on_ask_start)
         self.reminders.ask_finish.connect(self.on_ask_finish)
-        # Одно окно на все напоминания: новое заменяет текст старого.
-        self._reminder_window: ReminderWindow | None = None
+        # Подтверждённые уведомления: их ключи помним между запусками,
+        # иначе вкладка «Уведомления» заново показывала бы старое.
+        self._dismissed = self.load_dismissed()
 
         # --- подсказки времени урока
         self._cue_anchor: datetime | None = None
@@ -2477,7 +2515,7 @@ class MainWindow(QMainWindow):
         self.schedule_list.clear()
         start = date.today() - timedelta(days=1)
         for lesson in self.store.lessons_between(start, date.max):
-            item = QListWidgetItem(lesson_line(lesson))
+            item = QListWidgetItem(lesson_line(self.store, lesson))
             item.setData(Qt.ItemDataRole.UserRole, lesson.uid)
             self.schedule_list.addItem(item)
 
@@ -2774,7 +2812,6 @@ class MainWindow(QMainWindow):
             parts.append(sub.direction)
             if sub.single and sub.price:
                 parts.append(f"{money(sub.price)} рублей")
-            parts.append("проведён" if sub.used else "записан")
             return ", ".join(parts)
         parts = [sub.student,
                  f"куплен {dates.fmt_date(sub.bought)}",
@@ -2839,6 +2876,12 @@ class MainWindow(QMainWindow):
                          if s.finished and not s.one_off])
         self._fill_subs(self.one_off_subs_list,
                         [s for s in self.store.subscriptions if s.one_off])
+        future = [s for s in self.store.subscriptions
+                  if s.future and not s.finished and not s.one_off]
+        self._fill_subs(self.future_subs_list, future)
+        # Пустая вкладка будущих абонементов прячется, пока она не нужна.
+        self.tabs.setTabVisible(
+            self.tabs.indexOf(self.future_subs_page), bool(future))
 
     # Порядок переключателя: каждое нажатие — следующий вид.
     SUBS_ORDERS = (settings.SUBS_ORDER_DATE, settings.SUBS_ORDER_NAME,
@@ -2888,7 +2931,7 @@ class MainWindow(QMainWindow):
         name = (f"Списки разложены {self.order_words()}. Нажми, чтобы "
                 f"разложить {self.ORDER_SHORT[self.next_order()]}")
         for button in (self.active_order_button, self.finished_order_button,
-                       self.one_off_order_button):
+                       self.one_off_order_button, self.future_order_button):
             button.setText(text)
             button.setAccessibleName(name)
 
@@ -3423,6 +3466,7 @@ class MainWindow(QMainWindow):
         self.refresh_schedule()
         self.refresh_subscriptions()
         self.refresh_services()
+        self.refresh_notifications()
 
     def selected_uid(self) -> int | None:
         item = self.students_list.currentItem()
@@ -3454,8 +3498,14 @@ class MainWindow(QMainWindow):
             if keys:
                 pieces.append(f"{keys} — {title.casefold()}")
         tail = " ".join(pieces)
+        start_keys = norm_keys(self.bindings.get("start", ""))
+        start_tip = (f"{start_keys} — начать урок. " if start_keys else "")
         self.students_hint.setText(
-            "Стрелки вверх и вниз — переход по ученикам. " + tail)
+            "Стрелки вверх и вниз — переход по ученикам. " + start_tip
+            + "Урок начинается сам по расписанию; кнопка «Начать урок» — "
+            "если ученик пришёл раньше или чуть позже. " + tail)
+        self.start_button.setText(
+            f"Начать урок ({start_keys})" if start_keys else "Начать урок")
         self.schedule_hint.setText(
             "Стрелки вверх и вниз — уроки по порядку. Кнопки под списком "
             "и меню по правому щелчку или клавише «Меню» добавляют "
@@ -3486,6 +3536,10 @@ class MainWindow(QMainWindow):
             + sub_tip + " " + sub_menu + " Кнопка «Порядок» переключает "
             "раскладку: по дате добавления, по алфавиту, по дате покупки "
             "и по дню первого урока.")
+        self.future_subs_hint.setText(
+            "Абонементы, купленные заранее. Когда действующий закончится, "
+            "самый ранний из них станет действующим, а эта вкладка "
+            "спрячется. " + order + sub_tip + " " + sub_menu)
         one_off_menu = ("Кнопки под списком и меню по правому щелчку или "
                         "клавише «Меню»: добавить пробный или разовый "
                         "урок, отметить урок проведённым, редактировать, "
@@ -3750,6 +3804,8 @@ class MainWindow(QMainWindow):
         elif action == "settings":
             self.open_settings()
         # Кнопки на вкладках — то же самое, что щелчок по кнопке.
+        elif action == "start":
+            self.start_lesson()
         elif action == "add_student":
             self.add_student()
         elif action == "edit_student":
@@ -3796,15 +3852,34 @@ class MainWindow(QMainWindow):
 
     def speak_earnings(self) -> None:
         today = date.today()
-        earned = self.store.earned_in_month(today.year, today.month)
+        parts = self.store.earnings_in_month(today.year, today.month)
+        earned = sum(parts.values())
         done = [l for l in self.store.lessons
                 if l.day.month == today.month and l.day.year == today.year
                 and l.status == LESSON_DONE]
         lessons_word = plural(len(done), "урок", "урока", "уроков")
+        # Разбивка по источникам: слышно, из чего сложилась сумма и нет
+        # ли в ней пробного урока.
+        pieces = []
+        if parts["active"]:
+            pieces.append(f"действующие абонементы {rubles(parts['active'])}")
+        if parts["finished"]:
+            pieces.append(f"законченные абонементы "
+                          f"{rubles(parts['finished'])}")
+        if parts["future"]:
+            pieces.append(f"будущие абонементы {rubles(parts['future'])}")
+        if parts["single"]:
+            pieces.append(f"разовые уроки {rubles(parts['single'])}")
+        if parts["service"]:
+            pieces.append(f"услуги {rubles(parts['service'])}")
+        if parts["other"]:
+            pieces.append(f"прочие поступления {rubles(parts['other'])}")
+        breakdown = (" В том числе: " + ", ".join(pieces) + ".") if pieces else ""
         announce(
             self,
             f"За {dates.MONTHS_NOM[today.month - 1]} заработано "
-            f"{rubles(earned)}. Проведено {len(done)} {lessons_word}.",
+            f"{rubles(earned)}.{breakdown} "
+            f"Проведено {len(done)} {lessons_word}.",
             assertive=True)
 
     def export_text(self) -> None:
@@ -3837,103 +3912,262 @@ class MainWindow(QMainWindow):
             return
         QTimer.singleShot(int(wait * 1000), action)
 
-    def show_reminder(self, text: str) -> None:
-        """Показать окно напоминания: диктор прочитает его сам."""
-        if self._reminder_window is None:
-            self._reminder_window = ReminderWindow(self)
-        self._reminder_window.show_text(text)
+    def notify(self, text: str) -> None:
+        """Сказать вслух и, если окно свёрнуто, показать в трее.
+
+        Всплывающие окна забирали фокус у скринридера, и попасть на них
+        было нельзя. Теперь фраза уходит в диктор, а когда программа
+        свёрнута — ещё и сообщением трея: NVDA читает его и из трея.
+        Всё, что не подтвердили, остаётся на вкладке «Уведомления».
+        """
+        announce(self, text, assertive=True)
+        tray = getattr(self, "tray", None)
+        if tray is not None and tray.isVisible():
+            tray.showMessage("Мажорный лад Расписание", text,
+                             QSystemTrayIcon.MessageIcon.Information, 8000)
+        self.refresh_notifications()
 
     def on_soon(self, lesson: data.Lesson, kind: str) -> None:
         text = soon_text(lesson, kind)
-        self._play_then("soon", lambda: self.show_reminder(text))
+        self._play_then("soon", lambda: self.notify(text))
 
     def on_service_soon(self, payment: data.Payment, end, days: int) -> None:
         text = service_text(payment, end, days)
-        self._play_then("soon", lambda: self.show_reminder(text))
-
-    def on_ask_start(self, lesson: data.Lesson) -> None:
-        now = datetime.now()
-        text = (f"Сейчас {now:%H:%M}. Вы подтверждаете, что урок идёт? "
-                f"{lesson.student}, в {lesson.time}.")
-        box = QMessageBox(self)
-        box.setWindowTitle("Начало урока")
-        box.setText(text)
-        yes = box.addButton("Да, урок идёт", QMessageBox.ButtonRole.YesRole)
-        in_five = box.addButton("Напомнить через 5 минут",
-                                QMessageBox.ButtonRole.NoRole)
-        box.addButton("Напомнить через час", QMessageBox.ButtonRole.NoRole)
-        box.setDefaultButton(yes)
-
-        def ask() -> None:
-            self.bring_forward()
-            announce(self, text, assertive=True)
-            box.exec()
-            chosen = box.clickedButton()
-            if chosen is yes:
-                self.reminders.mark_started(lesson)
-                announce(
-                    self, "Хорошо. Через сорок минут спрошу, прошёл ли урок.")
-            elif chosen is in_five:
-                self.reminders.snooze(lesson, timedelta(minutes=5))
-                announce(self, "Напомню через пять минут.")
-            else:
-                self.reminders.snooze(lesson)
-                announce(self, "Напомню через час.")
-
-        self._play_then("start", ask)
+        self._play_then("soon", lambda: self.notify(text))
 
     def on_ask_finish(self, lesson: data.Lesson) -> None:
         text = (f"Вы подтверждаете, что урок прошёл? "
-                f"{lesson.student}, в {lesson.time}.")
+                f"{lesson.student}, в {lesson.time}. Подтвердить можно "
+                f"на вкладке «Уведомления».")
         # Если это последний урок абонемента — сначала весёлый сигнал и
         # подсказка про подарок, и только потом обычный вопрос.
         sub = self.store.current_subscription(lesson.student)
         last = sub is not None and sub.total > 0 and sub.left == 1
 
-        def ask() -> None:
-            self.bring_forward()
-            announce(self, text, assertive=True)
-            dialog = LessonPayDialog(lesson.student, self,
-                                     amount=lesson.price, question=text)
-            dialog.setWindowTitle("Урок прошёл?")
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                lesson.status = LESSON_CANCELLED
-                self.store.update_lesson(lesson)
-                self.reminders.mark_cancelled(lesson)
-                self.refresh_all()
-                announce(self, f"Урок отменён. {lesson.student}, "
-                               f"в {lesson.time}.", assertive=True)
-                return
-            amount = dialog.amount
+        if not last:
+            self._play_then("finish", lambda: self.notify(text))
+            return
+
+        def promo() -> None:
+            announce(self, LAST_LESSON_TEXT, assertive=True)
+            # Даём диктору проговорить фразу целиком, потом обычный вопрос.
+            QTimer.singleShot(3000, lambda: self._play_then(
+                "finish", lambda: self.notify(text)))
+
+        self._play_then("last", promo)
+
+    # --- уведомления ------------------------------------------------------
+
+    DISMISSED_FILE = "Уведомления.txt"
+
+    def load_dismissed(self) -> set[str]:
+        """Ключи подтверждённых уведомлений, что помним между запусками."""
+        path = self.store.folder / self.DISMISSED_FILE
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            return set()
+        return {line.strip() for line in text.splitlines() if line.strip()}
+
+    def save_dismissed(self) -> None:
+        """Записать подтверждённые ключи. Старые обрезаем, чтобы файл не рос."""
+        keys = sorted(self._dismissed)[-1000:]
+        path = self.store.folder / self.DISMISSED_FILE
+        try:
+            path.write_text("\n".join(keys) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    def _notifications_tab(self) -> None:
+        """Вкладка со всем, что ещё не подтверждено."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        self.notifications_hint = QLabel()
+        self.notifications_hint.setWordWrap(True)
+        lay.addWidget(self.notifications_hint)
+        self.notifications_list = QListWidget()
+        self.notifications_list.setAccessibleName(
+            "Список неподтверждённых уведомлений")
+        lay.addWidget(self.notifications_list, 1)
+        row = QHBoxLayout()
+        self.confirm_button = QPushButton("Подтвердить")
+        self.confirm_button.setAccessibleName(
+            "Подтвердить выбранное уведомление — оно исчезнет из списка")
+        self.confirm_button.clicked.connect(
+            lambda _checked=False: self.confirm_notification())
+        row.addWidget(self.confirm_button)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.notifications_page = page
+        self.tabs.addTab(page, "Уведомления")
+
+    def pending_notifications(self) -> list[tuple[str, str, str, object]]:
+        """Что ждёт подтверждения: ключ, вид, фраза и запись.
+
+        Список собирается из состояния, а не хранится: напоминание до
+        урока, вопрос о конце урока и срок услуги живут, пока это правда.
+        Подтверждённое помним по ключу, поэтому оно не возвращается.
+        """
+        now = datetime.now()
+        today = now.date()
+        result: list[tuple[str, str, str, object]] = []
+        for lesson in self.store.lessons:
+            if lesson.status != LESSON_WAIT:
+                continue
+            stamp = lesson.stamp
+            # Напоминания до урока нужны, пока урок не начался: после
+            # начала вопрос уже о конце урока.
+            if now < stamp:
+                # Одна строка на урок: из напоминаний берём самое свежее,
+                # которое уже сработало. Иначе за сутки до урока в списке
+                # висели бы три строки об одном и том же.
+                latest = None
+                for kind, delta in KINDS:
+                    if stamp - delta <= now:
+                        latest = kind
+                if latest is not None:
+                    key = f"soon:{lesson.uid}:{latest}"
+                    if key not in self._dismissed:
+                        result.append((key, "soon",
+                                       soon_text(lesson, latest), lesson))
+            key = f"finish:{lesson.uid}"
+            started = self.reminders.started_at(lesson)
+            # Урок, начатый в этой сессии, спрашиваем до подтверждения,
+            # сколько бы времени ни прошло. Для старых уроков окно в
+            # шесть часов — иначе вкладка забилась бы давно прошедшими.
+            explicit = started is not None
+            if started is None and stamp <= now:
+                started = stamp
+            if (key not in self._dismissed and started is not None
+                    and started + LESSON_LENGTH <= now
+                    and (explicit or now < started + LATE_WINDOW)):
+                result.append((
+                    key, "finish",
+                    f"Урок прошёл? {lesson.student}, в {lesson.time}.", lesson))
+        window = max(services.DAYS_BEFORE)
+        for payment in self.store.payments:
+            end = services.service_end(payment)
+            if end is None:
+                continue
+            days = (end - today).days
+            key = f"service:{payment.uid}:{end.isoformat()}"
+            if key in self._dismissed or days < 0 or days > window:
+                continue
+            result.append((key, "service",
+                           service_text(payment, end, days), payment))
+        return result
+
+    def refresh_notifications(self) -> None:
+        """Обновить список и число неподтверждённых на ярлыке вкладки."""
+        if not hasattr(self, "notifications_list"):
+            return
+        current = None
+        item = self.notifications_list.currentItem()
+        if item is not None:
+            current = item.data(Qt.ItemDataRole.UserRole)
+        self.notifications_list.clear()
+        pending = self.pending_notifications()
+        for key, kind, text, _record in pending:
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setData(Qt.ItemDataRole.UserRole + 1, kind)
+            self.notifications_list.addItem(item)
+        if current is not None:
+            for row in range(self.notifications_list.count()):
+                if (self.notifications_list.item(row)
+                        .data(Qt.ItemDataRole.UserRole) == current):
+                    self.notifications_list.setCurrentRow(row)
+                    break
+        index = self.tabs.indexOf(self.notifications_page)
+        self.tabs.setTabText(
+            index, "Уведомления" if not pending
+            else f"Уведомления ({len(pending)})")
+        if pending:
+            self.notifications_hint.setText(
+                "Здесь всё, что ещё не подтверждено: напоминания об "
+                "уроках, вопросы о конце урока и сроки услуг. Выбери "
+                "строку и нажми «Подтвердить» — она исчезнет.")
+        else:
+            self.notifications_hint.setText(
+                "Неподтверждённых уведомлений нет.")
+
+    def confirm_notification(self) -> None:
+        """Подтвердить выбранное уведомление: оно уходит из списка."""
+        item = self.notifications_list.currentItem()
+        if item is None:
+            announce(self, "В списке уведомлений ничего не выбрано.",
+                     assertive=True)
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        kind = item.data(Qt.ItemDataRole.UserRole + 1)
+        record = None
+        for pending_key, _kind, _text, pending_record in \
+                self.pending_notifications():
+            if pending_key == key:
+                record = pending_record
+                break
+        if record is None:
+            self.refresh_notifications()
+            return
+        if kind == "finish":
+            lesson = record
             lesson.status = LESSON_DONE
-            lesson.price = amount
             sub = self.store.current_subscription(lesson.student)
             if sub is not None:
                 lesson.subscription = sub.uid
             self.store.update_lesson(lesson)
             if sub is not None:
                 self.store.bump_used(sub)
-            if amount > 0:
-                self.store.add_payment(lesson.student, "Урок", amount,
-                                       date.today())
             self.reminders.mark_finished(lesson)
-            self.refresh_all()
             used, total = self.store.balance(lesson.student)
             tail = f" Уроки {used} из {total}." if total else ""
-            announce(self, f"{lesson.student}, урок проведён.{tail}",
+            speech = f"{lesson.student}, урок проведён.{tail}"
+        elif kind == "soon":
+            lesson = record
+            speech = f"Напоминание подтверждено. {lesson.student}, в {lesson.time}."
+        else:
+            payment = record
+            speech = f"Напоминание об услуге подтверждено. {payment.student}."
+        self._dismissed.add(key)
+        self.save_dismissed()
+        self.refresh_all()
+        announce(self, speech, assertive=True)
+
+    # --- начало урока -----------------------------------------------------
+
+    def start_lesson(self) -> None:
+        """Начать урок выбранного ученика прямо сейчас.
+
+        Урок стартует сам по расписанию; кнопка нужна, если ученик
+        пришёл раньше или чуть позже. От нажатия считаются подсказки
+        времени и вопрос о конце урока. В расписании урок остаётся на
+        своём месте.
+        """
+        student = self.selected_student()
+        if student is None:
+            announce(self, "Сначала выбери ученика в списке.",
                      assertive=True)
-
-        if not last:
-            self._play_then("finish", ask)
             return
-
-        def promo() -> None:
-            self.bring_forward()
-            announce(self, LAST_LESSON_TEXT, assertive=True)
-            # Даём диктору проговорить фразу целиком, потом обычный вопрос.
-            QTimer.singleShot(3000, lambda: self._play_then("finish", ask))
-
-        self._play_then("last", promo)
+        now = datetime.now()
+        waiting = [lesson for lesson in self.store.lessons
+                   if lesson.student == student.name
+                   and lesson.status == LESSON_WAIT
+                   and lesson.day == now.date()]
+        if not waiting:
+            announce(self, f"На сегодня у {student.name} урока в "
+                           f"расписании нет.", assertive=True)
+            return
+        lesson = min(waiting,
+                     key=lambda l: (abs((l.stamp - now).total_seconds()),
+                                    l.stamp))
+        self.reminders.mark_started(lesson, now)
+        # Подсказки времени пойдут от нажатия, а не от расписания.
+        self._cue_anchor = None
+        self._cue_done.clear()
+        self.refresh_notifications()
+        announce(self, f"Сейчас {now:%H:%M}. Урок начат. {student.name}, "
+                       f"по расписанию в {lesson.time}. Через сорок минут "
+                       f"спрошу, прошёл ли урок.", assertive=True)
 
     # --- трей -------------------------------------------------------------
 

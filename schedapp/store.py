@@ -36,7 +36,7 @@ ARCHIVE_DIR = "Архив старой версии"
 # Выгруженные абонементы лежат отдельной папкой внутри `Data`.
 SUBS_DIR = "Абонементы"
 BACKUP_KEEP = 14
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Старые текстовые файлы: из них переносим данные при первом запуске.
 STUDENTS_FILE = "Ученики.txt"
@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     finished INTEGER NOT NULL DEFAULT 0,
     trial INTEGER NOT NULL DEFAULT 0,
     single INTEGER NOT NULL DEFAULT 0,
-    lesson_format TEXT NOT NULL DEFAULT ''
+    lesson_format TEXT NOT NULL DEFAULT '',
+    future INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS lessons (
     uid INTEGER PRIMARY KEY,
@@ -142,6 +143,10 @@ class Subscription:
     # историю он попадает сразу и действующий абонемент не закрывает.
     single: bool = False
     lesson_format: str = ""
+    # Будущий абонемент. Куплен заранее, пока предыдущий ещё не кончился.
+    # Уроки из него не списываются, действующим он не считается, пока
+    # прежний не заполнится. Тогда он сам становится действующим.
+    future: bool = False
 
     @property
     def one_off(self) -> bool:
@@ -341,6 +346,10 @@ class Store:
             statements.append(
                 "ALTER TABLE subscriptions ADD COLUMN lesson_format "
                 "TEXT NOT NULL DEFAULT ''")
+        if "future" not in sub_columns:
+            statements.append(
+                "ALTER TABLE subscriptions ADD COLUMN future "
+                "INTEGER NOT NULL DEFAULT 0")
         if "subscription" not in lesson_columns:
             statements.append(
                 "ALTER TABLE lessons ADD COLUMN subscription "
@@ -463,7 +472,8 @@ class Store:
                 used=_int(row["used"]), price=_int(row["price"]),
                 started=started, finished=bool(row["finished"]),
                 trial=bool(row["trial"]), single=bool(row["single"]),
-                lesson_format=row["lesson_format"] or ""))
+                lesson_format=row["lesson_format"] or "",
+                future=bool(row["future"])))
 
         self.lessons = []
         for row in self._conn.execute("SELECT * FROM lessons ORDER BY uid"):
@@ -606,12 +616,13 @@ class Store:
         self._write("subscriptions",
                     ("uid", "bought", "started", "student", "direction",
                      "total", "used", "price", "finished", "trial",
-                     "single", "lesson_format"),
+                     "single", "lesson_format", "future"),
                     [(s.uid, dates.fmt_date(s.bought),
                       dates.fmt_date(s.begins), s.student,
                       s.direction, s.total, s.used, s.price,
                       1 if s.finished else 0, 1 if s.trial else 0,
-                      1 if s.single else 0, s.lesson_format)
+                      1 if s.single else 0, s.lesson_format,
+                      1 if s.future else 0)
                      for s in self.subscriptions])
         self._refresh_files()
 
@@ -865,8 +876,10 @@ class Store:
 
         `finished=True` — старый, для истории: его уроки вводятся вручную
         кнопкой «Добавить проведённый урок», деньги в журнал не идут.
-        Новый действующий абонемент сам закрывает предыдущий: уроки из
-        старого больше не списываются, он остаётся в истории.
+
+        Если у ученика ещё есть действующий абонемент, новый не закрывает
+        его, а ложится в «Будущие абонементы». Когда в действующем
+        кончатся уроки, он уйдёт в историю, а будущий станет действующим.
 
         `trial=True` — пробный урок: одно занятие вместо абонемента. По
         смыслу это история, поэтому он сразу законченный и действующего
@@ -882,10 +895,21 @@ class Store:
             total, price, finished = 1, 0, True
         elif single:
             total, finished = 1, True
+        future = False
         if not finished:
+            # Абонемент, где уроки уже выбраны, — закрываем: он не может
+            # держать очередь, даже если отметку ещё не поставили.
             for other in self.subscriptions:
-                if other.student == student and not other.finished:
+                if (other.student == student and not other.finished
+                        and not other.future and not other.one_off
+                        and other.total > 0 and other.used >= other.total):
                     other.finished = True
+            active = [s for s in self.subscriptions
+                      if s.student == student and not s.finished
+                      and not s.future and not s.one_off]
+            if active:
+                # Действующий ещё не кончился — новый ждёт своей очереди.
+                future = True
         item = Subscription(
             uid=self._next_uid(self.subscriptions),
             bought=bought_day,
@@ -899,6 +923,7 @@ class Store:
             trial=trial,
             single=single,
             lesson_format=lesson_format if (trial or single) else "",
+            future=future,
         )
         self.subscriptions.append(item)
         self.save_subscriptions()
@@ -918,10 +943,11 @@ class Store:
                 f"В абонементе уже проведено {sub.used} "
                 f"{lessons_word(sub.used)}. Поставь уроков не меньше, "
                 f"или ноль — тогда без ограничения.")
-        if not sub.finished:
+        if not sub.finished and not sub.future:
             for other in self.subscriptions:
                 if (other.uid != sub.uid and other.student == sub.student
-                        and not other.finished):
+                        and not other.finished and not other.future
+                        and not other.one_off):
                     raise ValueError(
                         f"У ученика уже есть действующий абонемент от "
                         f"{dates.fmt_date(other.bought)}. Сначала отметь "
@@ -930,6 +956,7 @@ class Store:
                   and sub.used >= sub.total)
         if closed:
             sub.finished = True
+            self._promote_future(sub.student, save=False)
         self.save_subscriptions()
         return closed
 
@@ -950,12 +977,19 @@ class Store:
         self.save_subscriptions()
 
     def current_subscription(self, student: str) -> Subscription | None:
-        """Действующий абонемент: последний незаконченный."""
+        """Действующий абонемент: последний незаконченный и не будущий."""
         mine = [s for s in self.subscriptions
-                if s.student == student and not s.finished]
+                if s.student == student and not s.finished
+                and not s.future and not s.one_off]
         if not mine:
             return None
         return max(mine, key=lambda s: (s.bought, s.uid))
+
+    def future_subscriptions(self, student: str) -> list[Subscription]:
+        """Будущие абонементы ученика: куплены заранее, ещё не начались."""
+        mine = [s for s in self.subscriptions
+                if s.student == student and s.future and not s.finished]
+        return sorted(mine, key=lambda s: (s.begins, s.bought, s.uid))
 
     def finished_subscriptions(self, student: str) -> list[Subscription]:
         """Законченные абонементы ученика, новые сверху."""
@@ -963,17 +997,48 @@ class Store:
                 if s.student == student and s.finished]
         return sorted(mine, key=lambda s: (s.begins, s.uid), reverse=True)
 
+    def _promote_future(self, student: str, save: bool = True) -> bool:
+        """Разбудить ближайший будущий абонемент, если действующего нет.
+
+        Действующий кончился и ушёл в историю — следующий по очереди
+        (самый ранний по началу) становится действующим. Будущих
+        абонементов у ученика может быть несколько: они ждут по порядку.
+        """
+        active = [s for s in self.subscriptions
+                  if s.student == student and not s.finished
+                  and not s.future and not s.one_off]
+        if active:
+            return False
+        waiting = [s for s in self.subscriptions
+                   if s.student == student and s.future and not s.finished]
+        if not waiting:
+            return False
+        winner = min(waiting, key=lambda s: (s.begins, s.bought, s.uid))
+        winner.future = False
+        if save:
+            self.save_subscriptions()
+        return True
+
     def last_done_day(self, sub: Subscription) -> date | None:
         """Дата последнего проведённого урока в этом абонементе."""
         days = [l.day for l in self.lessons if l.subscription == sub.uid]
         return max(days) if days else None
 
     def _mark_exhausted(self) -> bool:
-        """Абонемент с выбранными уроками — законченный."""
+        """Абонемент с выбранными уроками — законченный.
+
+        Освободившееся место занимает ближайший будущий абонемент.
+        """
         changed = False
+        students: set[str] = set()
         for sub in self.subscriptions:
-            if not sub.finished and sub.total > 0 and sub.used >= sub.total:
+            if (not sub.finished and not sub.future and sub.total > 0
+                    and sub.used >= sub.total):
                 sub.finished = True
+                students.add(sub.student)
+                changed = True
+        for student in students:
+            if self._promote_future(student, save=False):
                 changed = True
         if changed:
             self.save_subscriptions()
@@ -1030,6 +1095,8 @@ class Store:
                     counts.get(lesson.subscription, 0) + 1)
         latest: dict[str, Subscription] = {}
         for sub in self.subscriptions:
+            if sub.future or sub.one_off:
+                continue
             old = latest.get(sub.student)
             if old is None or (sub.bought, sub.uid) > (old.bought, old.uid):
                 latest[sub.student] = sub
@@ -1048,8 +1115,13 @@ class Store:
                 changed = True
             elif (was_full and not full and sub.finished
                   and not sub.one_off
+                  and not sub.future
                   and latest.get(sub.student) is sub):
                 sub.finished = False
+                changed = True
+        # Действующего нет, а будущий ждёт — пора ему начинаться.
+        for student in {s.student for s in self.subscriptions}:
+            if self._promote_future(student, save=False):
                 changed = True
         if changed:
             self.save_subscriptions()
@@ -1112,6 +1184,7 @@ class Store:
             sub.used += 1
         if sub.total > 0 and sub.used >= sub.total:
             sub.finished = True
+            self._promote_future(sub.student, save=False)
         self.save_subscriptions()
 
     def add_done_lesson(self, sub: Subscription, day: date,
@@ -1170,6 +1243,7 @@ class Store:
             sub.used += count
         if sub.total > 0 and sub.used >= sub.total:
             sub.finished = True
+            self._promote_future(sub.student, save=False)
         self.save_subscriptions()
         return added
 
@@ -1206,8 +1280,10 @@ class Store:
         if sub is not None:
             was_full = sub.total > 0 and sub.used >= sub.total
             sub.used = max(0, sub.used - 1)
-            if was_full and not sub.one_off:
-                mine = [s for s in self.subscriptions if s.student == sub.student]
+            if was_full and not sub.one_off and not sub.future:
+                mine = [s for s in self.subscriptions
+                        if s.student == sub.student and not s.future
+                        and not s.one_off]
                 latest = max(mine, key=lambda s: (s.bought, s.uid), default=None)
                 if latest is not None and latest.uid == sub.uid:
                     sub.finished = False
@@ -1250,6 +1326,47 @@ class Store:
         self.payments = [p for p in self.payments if p.uid != payment.uid]
         self.save_payments()
 
+    def earnings_in_month(self, year: int, month: int) -> dict[str, int]:
+        """Из чего сложился заработок месяца.
+
+        Абонементы считаются по дате покупки, а не по строке в журнале:
+        деньги получены при покупке. Автоматическая запись журнала про
+        абонемент не прибавляется — иначе сумма удвоилась бы. Разовые
+        уроки и услуги берутся из журнала оплат, пробные уроки — нет.
+
+        Ключи: active — действующие абонементы, finished — законченные,
+        future — купленные заранее, single — разовые уроки, service —
+        услуги, other — прочие поступления из журнала.
+        """
+        def same_month(day: date) -> bool:
+            return day.year == year and day.month == month
+
+        parts = {"active": 0, "finished": 0, "future": 0,
+                 "single": 0, "service": 0, "other": 0}
+        for sub in self.subscriptions:
+            if not same_month(sub.bought) or sub.trial or sub.single:
+                continue
+            if sub.finished:
+                parts["finished"] += int(sub.price)
+            elif sub.future:
+                parts["future"] += int(sub.price)
+            else:
+                parts["active"] += int(sub.price)
+        for payment in self.payments:
+            if not same_month(payment.day):
+                continue
+            what = payment.what.strip()
+            if what.startswith("Абонемент"):
+                continue  # уже посчитан по самому абонементу
+            if what == "Пробный урок":
+                continue  # пробные уроки не считаем
+            if what in ("Разовый урок", "Урок"):
+                parts["single"] += int(payment.amount)
+            elif what in SERVICES:
+                parts["service"] += int(payment.amount)
+            else:
+                parts["other"] += int(payment.amount)
+        return parts
+
     def earned_in_month(self, year: int, month: int) -> int:
-        return sum(p.amount for p in self.payments
-                   if p.day.year == year and p.day.month == month)
+        return sum(self.earnings_in_month(year, month).values())
