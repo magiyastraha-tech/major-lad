@@ -2781,7 +2781,9 @@ class MainWindow(QMainWindow):
         self._update_mic_button()
         self._set_status("Микрофон включён. Отпустите правый Control, "
                          "чтобы выключить.")
-        announce(self.mic_button, "Микрофон включён")
+        # Диктор здесь молчит: речь перебивает игру. Нажатие слышно
+        # коротким сигналом — по нему понятно, что микрофон пошёл в эфир.
+        sounds.play("ptt_on")
         self._ptt_watch_start()
         return True
 
@@ -2806,7 +2808,8 @@ class MainWindow(QMainWindow):
         self.engine.set_mic_muted(True)
         self._update_mic_button()
         self._set_status("Микрофон выключен.")
-        announce(self.mic_button, "Микрофон выключен")
+        # Отпустили Control — второй короткий сигнал, тоже без диктора.
+        sounds.play("ptt_off")
 
     # -- импорт треков: в обе стороны ---------------------------------------
 
