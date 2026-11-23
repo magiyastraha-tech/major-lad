@@ -28,6 +28,13 @@ DEFAULTS = {
     "server_port": 45800,
     "autoconnect": True,
     "audio": {
+        # Драйвер звука. По умолчанию WASAPI: на ноутбуке со встроенной
+        # картой ничего настраивать не нужно. ASIO выбирают те, у кого есть
+        # внешняя карта и её драйвер.
+        "driver": "wasapi",
+        "asio_device": "",
+        "asio_in_channels": 2,
+        "asio_out_channels": 2,
         "device1": DEFAULT_DEVICE,
         "device2": "",
         "usb": "",
@@ -36,6 +43,7 @@ DEFAULTS = {
         # «stereo» — оба сразу (первый слева, второй справа).
         "mode1": "ch1",
         "mode2": "ch1",
+        "usb_mode": "ch1",
         "midi_enabled": False,
         "midi_port": "",
         "midi_fixed_velocity": False,
