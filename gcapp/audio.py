@@ -288,122 +288,79 @@ class Ring:
             self.cut_frames = 0
 
 
-class DelayLine:
-    """Задержка сигнала, которую можно подтягивать на лету.
+class DelayBuffer:
+    """Точная задержка на целое число отсчётов, без сглаживания.
 
     Нужна, чтобы клик, MIDI и трек уходили собеседнику не раньше голоса:
     голос проходит микрофон и входной буфер и приходит позже, а сигналы,
     рождённые в самом микшере, уходят сразу. Задерживаем ровно их — и в
     потоке собеседника всё совпадает по времени.
 
-    Заполнение входного буфера не постоянно: буфер подрезается на пороге и
-    снова наполняется, а с медленным драйвером ещё и ходит ступеньками.
-    Поэтому одной цифры на всю сессию не хватает — задержку надо подтягивать
-    вслед за буфером. Резко сдвинуть читаемую позицию нельзя: это щелчок и
-    проглоченный кусок. Поэтому задержка едет к цели понемногу, а чтение
-    интерполируется между соседними отсчётами. На звуке шаг такой, что
-    высота меняется на сотые доли процента; в паузах, где щёлкать нечему,
-    можно двигаться быстрее и догнать цель сразу.
+    Задержка берётся заново в каждом блоке по фактическому заполнению
+    входного буфера. Сглаживания нет намеренно: голос в этом же блоке
+    читается из буфера, где лежит ровно столько звука, и клик должен
+    сдвинуться вместе с ним. Плавно подтянутая линия отстаёт от голоса:
+    именно из-за этого клик у собеседника уезжал на десятки миллисекунд.
     """
 
-    # Секунда с запасом на любую настройку.
-    CAPACITY = SAMPLE_RATE
-    # Сдвиг задержки за один отсчёт звука. 1/512 — это 0.2% скорости, около
-    # трёх центов: на слух высота не меняется.
-    SLEW = 1.0 / 512.0
-    # В тишине можно быстрее: там нечего резать на стыке.
-    SLEW_QUIET = 1.0 / 8.0
+    # Три секунды с запасом: ручная компенсация до секунды плюс задержки
+    # устройств и заполнение буфера.
+    CAPACITY = 3 * SAMPLE_RATE
+    RESERVE = 4096  # запас на текущий блок, чтобы не читать затёртое
 
-    def __init__(self) -> None:
-        self._buf = np.zeros(self.CAPACITY, dtype=np.float32)
+    def __init__(self, capacity: int | None = None) -> None:
+        self._buf = np.zeros(capacity or self.CAPACITY, dtype=np.float32)
+        # Сколько всего отсчётов записано: по этой шкале считается, где
+        # лежит звук, записанный delay отсчётов назад.
         self._write = 0
-        self._delay = 0.0
-        self._target = 0
-        self._quiet = True
-        # Прошёл ли через линию хоть какой-то звук. Пока не прошёл, задержку
-        # можно ставить сразу: прыгать нечему.
-        self._voiced = False
 
-    @property
-    def frames(self) -> int:
-        return int(round(self._delay))
-
-    def set_delay(self, frames: int) -> None:
-        """Ставит задержку сразу.
-
-        Так задают её при открытии вывода и при смене буфера или ручной
-        компенсации: настройка должна действовать сейчас, а не подтягиваться
-        полминуты. Плавно задержку двигает только set_target() в звуковом
-        потоке — там резкий сдвиг был бы слышен постоянно.
-        """
-        frames = max(0, min(int(frames), self.CAPACITY - 8))
-        self._target = frames
-        self._delay = float(frames)
-
-    def set_target(self, frames: int) -> None:
-        """Новая цель на лету: к ней подтянемся в process()."""
-        frames = max(0, min(int(frames), self.CAPACITY - 8))
-        self._target = frames
-        if not self._voiced:
-            self._delay = float(frames)
-
-    def process(self, data: np.ndarray) -> np.ndarray:
-        data = np.asarray(data, dtype=np.float32).reshape(-1)
-        n = data.size
+    def write(self, block: np.ndarray) -> None:
+        block = np.asarray(block, dtype=np.float32).reshape(-1)
+        n = block.size
         if n == 0:
-            return data
-        if n > self.CAPACITY // 2:
-            # В звуковом потоке таких блоков не бывает, но если придёт —
-            # режем на части, чтобы не потерять длину и выравнивание.
-            half = self.CAPACITY // 2
-            return np.concatenate([self.process(data[i:i + half])
-                                   for i in range(0, n, half)])
-
-        old = self._delay
-        target = float(self._target)
-        step = (self.SLEW_QUIET if self._quiet else self.SLEW) * n
-        if old < target:
-            new = min(target, old + step)
-        elif old > target:
-            new = max(target, old - step)
-        else:
-            new = old
-
-        start = self._write
-        # Вход пишем первым: при малой задержке читаются и только что
-        # записанные отсчёты текущего блока.
+            return
+        cap = self._buf.size
+        if n >= cap:
+            self._buf[:] = block[-cap:]
+            self._write += n
+            return
+        start = self._write % cap
         end = start + n
-        if end <= self.CAPACITY:
-            self._buf[start:end] = data
+        if end <= cap:
+            self._buf[start:end] = block
         else:
-            first = self.CAPACITY - start
-            self._buf[start:] = data[:first]
-            self._buf[:n - first] = data[first:]
-        self._write = end % self.CAPACITY
-        self._delay = new
+            first = cap - start
+            self._buf[start:] = block[:first]
+            self._buf[:n - first] = block[first:]
+        self._write += n
 
-        if new <= 0.0 and old <= 0.0:
-            self._quiet = float(np.max(np.abs(data))) < 1e-4
-            if not self._quiet:
-                self._voiced = True
-            return data.copy()
+    def read(self, frames: int, delay: int) -> np.ndarray:
+        """Отсчёты, записанные delay отсчётов назад."""
+        out = np.zeros(frames, dtype=np.float32)
+        if frames <= 0:
+            return out
+        cap = self._buf.size
+        limit = cap - max(self.RESERVE, frames)
+        delay = max(0, min(int(delay), max(0, limit)))
+        start = self._write - delay - frames
+        if start >= 0:
+            out[:] = self._take(start, frames)
+            return out
+        # Звука ещё не накопилось — начало блока молчит.
+        skip = -start
+        if skip < frames:
+            out[skip:] = self._take(0, frames - skip)
+        return out
 
-        # Задержка едет по блоку ровно: последний отсчёт блока стоит там же,
-        # где встанет первый отсчёт следующего, — стыка не слышно.
-        ramp = old + (new - old) * (np.arange(n, dtype=np.float64) / n)
-        pos = (start + np.arange(n, dtype=np.float64)
-               - np.maximum(ramp, 1.0)) % self.CAPACITY
-        i0 = pos.astype(np.int64)
-        frac = (pos - i0).astype(np.float32)
-        i1 = (i0 + 1) % self.CAPACITY
-        out = self._buf[i0] * (1.0 - frac) + self._buf[i1] * frac
-        # Быстро двигаемся на следующем блоке, только если этот был тихим:
-        # так старт догоняет цель за доли секунды, а на звуке шаг остаётся
-        # незаметным.
-        level = float(np.max(np.abs(out)))
-        self._quiet = level < 1e-4
-        if not self._quiet:
-            self._voiced = True
+    def _take(self, start: int, n: int) -> np.ndarray:
+        cap = self._buf.size
+        first = start % cap
+        if first + n <= cap:
+            return self._buf[first:first + n].copy()
+        take = cap - first
+        out = np.empty(n, dtype=np.float32)
+        out[:take] = self._buf[first:]
+        out[take:] = self._buf[:n - take]
         return out
 
 
@@ -1065,11 +1022,10 @@ class AudioEngine:
         # собеседник декодирует то, что получил, и его настройка ничего не
         # меняет. 96 хватает для урока, 128–320 — если канал позволяет.
         self.opus_bitrate = 96
-        self._tx_delay = DelayLine()
+        self._tx_delay = DelayBuffer()
         self._tx_delay_auto = 0
-        # Сглаженное заполнение входного буфера. Оно гуляет на размер блока
-        # туда-сюда, а подтягивать задержку за каждым колебанием незачем:
-        # важна средняя задержка голоса.
+        # Заполнение входного буфера в последнем блоке: по нему считается
+        # задержка передачи, пока звук ещё не пошёл.
         self._tx_fill = 0.0
         # Составляющие компенсации последнего расчёта, в миллисекундах:
         # выход, вход, буфер и итог. Раз в минуту уходят в журнал, чтобы
@@ -1563,53 +1519,37 @@ class AudioEngine:
         return int(round(total))
 
     def _apply_tx_delay(self) -> int:
-        """Пересчитывает задержку и перестраивает линию задержки."""
+        """Пересчитывает авто-компенсацию для показа и журнала.
+
+        Сама задержка выставляется в каждом блоке по фактическому буферу,
+        поэтому здесь только цифра для сообщения и сверки с ручной.
+        """
         auto = self._measure_tx_delay()
         self._tx_delay_auto = auto
-        value = auto if self.tx_delay_ms <= 0 else self.tx_delay_ms
-        self._tx_delay.set_delay(int(round(value * SAMPLE_RATE / 1000.0)))
-        return value
+        return auto if self.tx_delay_ms <= 0 else self.tx_delay_ms
 
     def _tx_target(self, fill: int) -> float:
-        """Куда подтягивать задержку передачи — по фактическому буферу.
+        """Задержка передачи на этот блок, в отсчётах.
 
-        Буфер живёт по своему расписанию: его подрезают на пороге, он снова
-        наполняется, а медленный драйвер ещё и отдаёт звук пачками. Поэтому
-        расчётная середина буфера не совпадает с тем, на сколько голос
-        отстаёт на самом деле, и клик у собеседника уезжает на десятки
-        миллисекунд. Берём то, что в буфере лежит, и сглаживаем: важен
-        средний уровень, а не колебание на размер блока.
+        Голос, записанный вместе с кликом, попадёт в отправляемый поток
+        позже ровно на задержку вывода (пока музыкант услышит клик и
+        сыграет), задержку входа и то, что уже лежит во входном буфере.
+        Все три числа известны здесь и сейчас, поэтому клик, MIDI и трек
+        сдвигаются на эту сумму точно, без плавного подтягивания: голос в
+        этом же блоке читается из буфера, где лежит ровно `fill` отсчётов,
+        и любое отставание клика — это и есть рассинхрон.
         """
         out_lat = self._out_latency()
         # Ту же задержку входа, что и при старте, но уже по отметкам
         # драйвера, если они успели набраться.
         in_lat = self._in_latency()
+        self._tx_fill = float(fill)
         if self.tx_delay_ms > 0:
-            self._tx_parts = (out_lat * 1000.0, in_lat * 1000.0,
-                              fill * 1000.0 / SAMPLE_RATE, self.tx_delay_ms)
-            return self.tx_delay_ms * SAMPLE_RATE / 1000.0
-        if fill <= 0:
-            return float(self._tx_delay.frames)
-        snap = False
-        if self._tx_fill <= 0.0:
-            self._tx_fill = float(fill)
+            total = float(self.tx_delay_ms) * SAMPLE_RATE / 1000.0
         else:
-            delta = float(fill) - self._tx_fill
-            if delta <= -0.015 * SAMPLE_RATE:
-                # Входной буфер подрезали или драйвер выбрал пачку — голос
-                # разом прыгнул вперёд на полтора десятка миллисекунд и
-                # больше. Плавно тянуть за ним клик полминуты нельзя: все
-                # эти секунды клик идёт мимо хлопков. Переставляем линию
-                # задержки сразу, тем же блоком, что и голос.
-                self._tx_fill = float(fill)
-                snap = True
-            else:
-                self._tx_fill += delta * 0.05
-        total = self._tx_fill + (in_lat + out_lat) * SAMPLE_RATE
-        if snap:
-            self._tx_delay.set_delay(int(round(total)))
+            total = float(fill) + (in_lat + out_lat) * SAMPLE_RATE
         self._tx_parts = (out_lat * 1000.0, in_lat * 1000.0,
-                          self._tx_fill * 1000.0 / SAMPLE_RATE,
+                          fill * 1000.0 / SAMPLE_RATE,
                           int(round(total * 1000.0 / SAMPLE_RATE)))
         return total
 
@@ -1777,15 +1717,19 @@ class AudioEngine:
         if track_peer is not None:
             gen[:track_peer.size] += track_peer
         # Заполнение входных буферов смотрим до чтения: это ровно та
-        # задержка, на которую голос отстаёт от клика. По ней и подтягиваем
-        # линию задержки — иначе расчётная цифра расходится с буфером на
-        # десятки миллисекунд, и метроном у собеседника не совпадает.
+        # задержка, на которую голос отстаёт от клика. По ней и считаем
+        # сдвиг — иначе расчётная цифра расходится с буфером на десятки
+        # миллисекунд, и метроном у собеседника не совпадает.
         fill = 0
         for source in self.sources.values():
             fill = max(fill, source.fill())
-        self._tx_delay.set_target(int(round(self._tx_target(fill))))
+        delay = self._tx_target(fill)
         self._log_tx_parts(frames)
-        mix_l = self._tx_delay.process(gen)
+        # Пишем то, что родилось в микшере, и читаем ровно из прошлого:
+        # у собеседника клик, MIDI и трек встанут вплотную к голосу этого
+        # же блока. Задержка целая, без интерполяции: сдвиг точный.
+        self._tx_delay.write(gen)
+        mix_l = self._tx_delay.read(frames, int(round(delay)))
         mix_r = mix_l.copy()
         stereo_out = False
         for source in self.sources.values():
