@@ -655,15 +655,19 @@ class SettingsDialog(QDialog):
 
     def _fill_device_combo(self, combo: QComboBox, first_label: str,
                            values: list[str], keep: str = "",
-                           default_label: str = "") -> None:
+                           default_label: str = "",
+                           reset: bool = False) -> None:
         """Перезаполняет список устройств, сохраняя выбранное.
 
         Выбранного устройства может не оказаться в новом списке — например,
         когда оно спрятано фильтром драйверов. Молча сбросить выбор нельзя:
         человек нажмёт «Сохранить» и потеряет устройство. Поэтому оставляем
-        его отдельным пунктом.
+        его отдельным пунктом. reset=True — список пересобран под другой
+        драйвер, и старое имя к нему уже не относится.
         """
-        if not keep:
+        if reset:
+            keep = ""
+        elif not keep:
             keep = str(combo.currentData() or "")
         combo.blockSignals(True)
         combo.clear()
@@ -681,15 +685,105 @@ class SettingsDialog(QDialog):
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
 
-    def _refresh_device_lists(self, show_all: bool) -> None:
-        """Перезаполняет списки при переключении «Показывать устаревшие»."""
+    def _refresh_device_lists(self, show_all: bool,
+                              reset: bool = False) -> None:
+        """Перезаполняет списки устройств под выбранный драйвер.
+
+        Для ASIO в списках стоит не отдельный микрофон, а звуковая карта
+        целиком: драйвер один на карту, вход и выход у неё общие.
+        """
         self.cfg["audio"]["show_all_drivers"] = bool(show_all)
-        inputs = audio.list_input_devices(show_all)
+        driver = self._driver_value()
+        if driver == "asio":
+            inputs = audio.asio_devices("input")
+            outputs = audio.asio_devices("output")
+        else:
+            inputs = audio.list_input_devices(show_all)
+            outputs = audio.list_output_devices(show_all)
         for combo in (self.dev1_combo, self.dev2_combo, self.usb_combo):
             self._fill_device_combo(combo, "Не выбрано", inputs,
-                                    default_label=DEFAULT_MIC_LABEL)
+                                    default_label=DEFAULT_MIC_LABEL,
+                                    reset=reset)
         self._fill_device_combo(self.out_combo, "Системное по умолчанию",
-                                audio.list_output_devices(show_all))
+                                outputs, reset=reset)
+        self._refresh_mode_combos()
+
+    def _refresh_mode_combos(self) -> None:
+        """Пересобирает режимы каналов: у ASIO их столько, сколько даёт карта."""
+        driver = self._driver_value()
+        channels = 0
+        if driver == "asio":
+            info = audio.asio_device_info(
+                str(self.asio_combo.currentData() or ""))
+            channels = info[0] if info else 0
+        for combo in (self.mode1_combo, self.mode2_combo, self.usb_mode_combo):
+            current = str(combo.currentData() or "ch1")
+            combo.blockSignals(True)
+            combo.clear()
+            for key, title in audio.device_modes(driver, "", channels):
+                combo.addItem(title, key)
+            index = combo.findData(current)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.blockSignals(False)
+
+    def _driver_value(self) -> str:
+        return str(self.driver_combo.currentData() or "wasapi")
+
+    def _driver_changed(self, *_args, reset: bool = True) -> None:
+        """Показывает поля ASIO и перезаполняет списки под новый драйвер.
+
+        reset выключается при первом открытии настроек: там сохранённые
+        устройства надо оставить на месте, а не стирать вместе с именами
+        чужих драйверов.
+        """
+        asio = self._driver_value() == "asio"
+        for widget in (getattr(self, "asio_card_label", None),
+                       getattr(self, "asio_combo", None),
+                       getattr(self, "asio_in_label", None),
+                       getattr(self, "asio_in_spin", None),
+                       getattr(self, "asio_out_label", None),
+                       getattr(self, "asio_out_spin", None),
+                       getattr(self, "asio_hint", None)):
+            if widget is not None:
+                widget.setVisible(asio)
+        if hasattr(self, "all_drivers_box"):
+            # «Устаревшие драйверы» — только про WASAPI: у ASIO список
+            # свой, решать там нечего.
+            self.all_drivers_box.setEnabled(not asio)
+        if asio:
+            names = audio.asio_devices("input") or audio.asio_devices("output")
+            keep = (self.asio_combo.currentData()
+                    or str(self.cfg["audio"].get("asio_device", "")))
+            self.asio_combo.blockSignals(True)
+            self.asio_combo.clear()
+            for name in names:
+                self.asio_combo.addItem(name, name)
+            index = self.asio_combo.findData(keep)
+            self.asio_combo.setCurrentIndex(index if index >= 0 else 0)
+            self.asio_combo.blockSignals(False)
+            self._asio_card_changed()
+        if hasattr(self, "out_combo"):
+            self._refresh_device_lists(
+                bool(self.cfg["audio"].get("show_all_drivers", False)),
+                reset=reset)
+        if asio:
+            # Карта одна на всё: подставляем её в первый вход и выход,
+            # чтобы человек не искал её ещё в двух вкладках.
+            card = self.asio_combo.currentData()
+            for combo in (self.dev1_combo, self.out_combo):
+                if not combo.currentData():
+                    index = combo.findData(card)
+                    if index >= 0:
+                        combo.setCurrentIndex(index)
+
+    def _asio_card_changed(self, *_args) -> None:
+        """Подгоняет счётчики каналов под выбранную карту ASIO."""
+        info = audio.asio_device_info(str(self.asio_combo.currentData() or ""))
+        if info:
+            self.asio_in_spin.setMaximum(max(1, info[0]))
+            self.asio_out_spin.setMaximum(max(1, info[1]))
+        if hasattr(self, "mode1_combo"):
+            self._refresh_mode_combos()
 
     def _page_inputs(self) -> QWidget:
         page = QWidget()
@@ -701,6 +795,64 @@ class SettingsDialog(QDialog):
 
         show_all = bool(self.cfg["audio"].get("show_all_drivers", False))
         inputs = audio.list_input_devices(show_all)
+
+        driver_page = QWidget()
+        driver_form = QFormLayout(driver_page)
+        self.driver_combo = QComboBox()
+        self.driver_combo.setAccessibleName("Драйвер звука")
+        self.driver_combo.setAccessibleDescription(
+            "WASAPI — обычные драйверы Windows: карта работает не только в "
+            "этой программе. ASIO — драйвер звуковой карты с низкой "
+            "задержкой: пока программа запущена, карту видят только она.")
+        for key, title in audio.list_audio_drivers():
+            self.driver_combo.addItem(title, key)
+        index = self.driver_combo.findData(
+            str(self.cfg["audio"].get("driver", "wasapi")))
+        self.driver_combo.setCurrentIndex(index if index >= 0 else 0)
+        driver_form.addRow(label_for("Драйвер", self.driver_combo),
+                           self.driver_combo)
+
+        self.asio_combo = QComboBox()
+        self.asio_combo.setAccessibleName("Звуковая карта ASIO")
+        self.asio_combo.setAccessibleDescription(
+            "Карта, которую программа забирает через ASIO. Пока идёт урок, "
+            "другие программы её не видят.")
+        self.asio_card_label = label_for("Звуковая карта",
+                                         self.asio_combo)
+        driver_form.addRow(self.asio_card_label, self.asio_combo)
+
+        self.asio_in_spin = QSpinBox()
+        self.asio_in_spin.setRange(1, 32)
+        self.asio_in_spin.setValue(max(1, int(
+            self.cfg["audio"].get("asio_in_channels", 2) or 2)))
+        self.asio_in_spin.setAccessibleName("Сколько входных каналов открыть")
+        self.asio_in_spin.setAccessibleDescription(
+            "Сколько входов звуковой карты программа забирает. Обычно "
+            "хватает двух: стереопара.")
+        self.asio_in_label = label_for("Входных каналов", self.asio_in_spin)
+        driver_form.addRow(self.asio_in_label, self.asio_in_spin)
+
+        self.asio_out_spin = QSpinBox()
+        self.asio_out_spin.setRange(1, 32)
+        self.asio_out_spin.setValue(max(1, int(
+            self.cfg["audio"].get("asio_out_channels", 2) or 2)))
+        self.asio_out_spin.setAccessibleName("Сколько выходных каналов открыть")
+        self.asio_out_spin.setAccessibleDescription(
+            "Сколько выходов звуковой карты программа забирает: в них идут "
+            "наушники, метроном и минусовка.")
+        self.asio_out_label = label_for("Выходных каналов", self.asio_out_spin)
+        driver_form.addRow(self.asio_out_label, self.asio_out_spin)
+
+        asio_hint = QLabel(
+            "ASIO занимает карту целиком: другие программы во время урока "
+            "звук через неё не получат. Какие именно каналы брать, "
+            "выбирается во вкладках устройств.")
+        asio_hint.setWordWrap(True)
+        asio_hint.setAccessibleName("Подсказка про ASIO")
+        driver_form.addRow(asio_hint)
+        self.asio_hint = asio_hint
+
+        tabs.addTab(driver_page, "Драйвер")
 
         self.dev1_combo = self._device_combo(
             self.cfg["audio"].get("device1", ""), "Аудиоустройство 1", inputs)
@@ -753,7 +905,13 @@ class SettingsDialog(QDialog):
 
         self.usb_combo = self._device_combo(
             self.cfg["audio"].get("usb", ""), "USB-устройство", inputs)
-        tabs.addTab(self._device_tab(self.usb_combo), "USB-устройство")
+        self.usb_mode_combo = self._mode_combo(
+            self.cfg["audio"].get("usb_mode", "ch1"), "Режим канала USB")
+        tabs.addTab(self._device_tab(self.usb_combo, self.usb_mode_combo),
+                    "USB-устройство")
+
+        self.driver_combo.currentIndexChanged.connect(self._driver_changed)
+        self.asio_combo.currentIndexChanged.connect(self._asio_card_changed)
 
         layout.addWidget(tabs)
 
@@ -867,6 +1025,10 @@ class SettingsDialog(QDialog):
         )
         hint.setWordWrap(True)
         form.addRow(hint)
+        # Настройки открыты: применяем сохранённый драйвер — поля ASIO
+        # показываем или прячем, списки устройств собираем под него.
+        # reset=False, иначе сотрём только что выбранные устройства.
+        self._driver_changed(reset=False)
         return page
 
     def _page_video(self) -> QWidget:
@@ -1189,11 +1351,16 @@ class SettingsDialog(QDialog):
         player_cfg["stretch"] = str(self.stretch_combo.currentData()
                                     or effects.DEFAULT_ALGO)
 
+        cfg["audio"]["driver"] = self._driver_value()
+        cfg["audio"]["asio_device"] = str(self.asio_combo.currentData() or "")
+        cfg["audio"]["asio_in_channels"] = int(self.asio_in_spin.value())
+        cfg["audio"]["asio_out_channels"] = int(self.asio_out_spin.value())
         cfg["audio"]["device1"] = self.dev1_combo.currentData() or ""
         cfg["audio"]["device2"] = self.dev2_combo.currentData() or ""
         cfg["audio"]["usb"] = self.usb_combo.currentData() or ""
         cfg["audio"]["mode1"] = self.mode1_combo.currentData() or "ch1"
         cfg["audio"]["mode2"] = self.mode2_combo.currentData() or "ch1"
+        cfg["audio"]["usb_mode"] = self.usb_mode_combo.currentData() or "ch1"
         cfg["audio"]["output"] = self.out_combo.currentData() or ""
         cfg["audio"]["midi_enabled"] = self.midi_box.isChecked()
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
@@ -2297,7 +2464,7 @@ class MainWindow(QMainWindow):
         modes = {
             "in1": cfg_audio.get("mode1", "ch1"),
             "in2": cfg_audio.get("mode2", "ch1"),
-            "usb": "ch1",
+            "usb": cfg_audio.get("usb_mode", "ch1"),
         }
         is_server = self.is_teacher
         server_addr = None
@@ -2315,6 +2482,10 @@ class MainWindow(QMainWindow):
             midi_port=cfg_audio.get("midi_port", ""),
             midi_fixed_velocity=bool(
                 cfg_audio.get("midi_fixed_velocity", False)),
+            driver=str(cfg_audio.get("driver", "wasapi")),
+            asio_device=str(cfg_audio.get("asio_device", "")),
+            asio_in=int(cfg_audio.get("asio_in_channels", 2) or 2),
+            asio_out=int(cfg_audio.get("asio_out_channels", 2) or 2),
         )
         self._set_status(message)
         if ok:
@@ -4072,7 +4243,8 @@ class MainWindow(QMainWindow):
         self._update_player_buttons()
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.
         device_keys = ("device1", "device2", "usb", "output",
-                       "mode1", "mode2")
+                       "mode1", "mode2", "usb_mode", "driver",
+                       "asio_device", "asio_in_channels", "asio_out_channels")
         devices_changed = any(audio_before.get(key) != self.cfg["audio"].get(key)
                               for key in device_keys)
         if self.engine.running and devices_changed:
@@ -4090,11 +4262,16 @@ class MainWindow(QMainWindow):
         # присылает отчёт о проблеме.
         audio = self.cfg.get("audio", {})
         runlog.write(
-            "Настройки сохранены: буфер {b}, шаг перемотки {s} с, "
+            "Настройки сохранены: драйвер {drv}, карта ASIO {card} "
+            "({ain} вх. / {aout} вых.), буфер {b}, шаг перемотки {s} с, "
             "растяжение {a}, задержка компенсации {d} мс, устройства "
             "{dev1} / {dev2} / "
-            "{out}, режим входа {m1} / {m2}, громкость метронома {m}, "
-            "трека {p}.".format(
+            "{out}, режим входа {m1} / {m2} / {mu}, громкость метронома "
+            "{m}, трека {p}.".format(
+                drv=audio.get("driver", "wasapi"),
+                card=audio.get("asio_device", ""),
+                ain=int(audio.get("asio_in_channels", 0) or 0),
+                aout=int(audio.get("asio_out_channels", 0) or 0),
                 b=audio.get("buffer", "normal"),
                 s=(self.cfg.get("player", {}) or {}).get("skip", 5),
                 a=self._stretch_algo(),
@@ -4104,6 +4281,7 @@ class MainWindow(QMainWindow):
                 out=audio.get("output", ""),
                 m1=audio.get("mode1", ""),
                 m2=audio.get("mode2", ""),
+                mu=audio.get("usb_mode", "ch1"),
                 m=(audio.get("volumes", {}) or {}).get("metronome", ""),
                 p=(audio.get("volumes", {}) or {}).get("player", "")))
         message = "Настройки сохранены."
