@@ -113,6 +113,170 @@ def soft_limit(x: np.ndarray) -> np.ndarray:
         np.float32, copy=False)
 
 
+LOWCUT_HZ = 150.0
+# 513 отсчётов — задержка входа около 5 мс при 48 кГц. Короче окно не
+# успевает отсечь ровно 150 Гц: при 129 отсчётах колено растягивается до
+# 350 Гц и вместе с гулом уходит тело гитары. Длиннее можно, но задержка
+# растёт, а ниже 150–200 Гц разница уже не слышна.
+_LOWCUT_TAPS = 513
+# Шаг управления компрессором: 1 мс. Огибающая на каждом отсчёте не нужна,
+# а на 1 мс её хватает, чтобы не слышать ступенек усиления.
+_CTRL = 48
+
+
+def _lowcut_taps(cutoff: float = LOWCUT_HZ, taps: int = _LOWCUT_TAPS,
+                 rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Импульсная характеристика ФВЧ: окно Хэмминга по sinc, без scipy.
+
+    Считается один раз при создании обработки: фильтр неизменный.
+    """
+    n = np.arange(taps, dtype=np.float64) - (taps - 1) / 2.0
+    lp = np.sinc(2.0 * cutoff / rate * n)
+    lp *= np.hamming(taps)
+    lp /= np.sum(lp)
+    # ФВЧ = всё минус ФНЧ: вычитаем низкочастотную часть из сигнала.
+    hp = -lp
+    hp[(taps - 1) // 2] += 1.0
+    return hp.astype(np.float32)
+
+
+class InputFx:
+    """Обработка первого входа: мониторинг, срез низа и компрессор.
+
+    Мониторинг решается в микшере — нужен доступ к выходу. Срез и
+    компрессор живут здесь: им нужны история фильтра и огибающая, которые
+    нельзя держать в локальных переменных обратного вызова.
+    """
+
+    def __init__(self) -> None:
+        self.monitor = False
+        self.lowcut = False
+        self.compressor = 0
+        self._taps = _lowcut_taps()
+        self._hist_l = np.zeros(self._taps.size - 1, dtype=np.float32)
+        self._hist_r = np.zeros(self._taps.size - 1, dtype=np.float32)
+        self._env = 0.0
+        self._gain = 1.0
+
+    @property
+    def active(self) -> bool:
+        """Вход надо обрабатывать: включён фильтр, компрессор или ещё
+        догорает добавка усиления после выключения компрессора."""
+        return self.lowcut or self.compressor > 0 or abs(self._gain - 1.0) > 1e-4
+
+    def set(self, monitor=None, lowcut=None, compressor=None) -> None:
+        """Меняет настройки; None означает «не трогать»."""
+        if monitor is not None:
+            self.monitor = bool(monitor)
+        if lowcut is not None:
+            lowcut = bool(lowcut)
+            if lowcut and not self.lowcut:
+                # Включили срез: старая история фильтра уже не относится
+                # к тому, что будет дальше, и дала бы щелчок.
+                self.reset()
+            self.lowcut = lowcut
+        if compressor is not None:
+            self.compressor = max(0, min(100, int(compressor)))
+
+    def reset(self) -> None:
+        """Чистое состояние фильтра и компрессора."""
+        self._hist_l[:] = 0.0
+        self._hist_r[:] = 0.0
+        self._env = 0.0
+        self._gain = 1.0
+
+    def _highpass(self, x: np.ndarray,
+                  hist: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        block = np.concatenate((hist, x))
+        out = np.convolve(block, self._taps, mode="valid")
+        return out.astype(np.float32, copy=False), block[-(self._taps.size - 1):]
+
+    def process(self, left: np.ndarray, right: np.ndarray,
+                stereo: bool) -> tuple[np.ndarray, np.ndarray]:
+        """Возвращает обработанный вход; без обработки — тот же сигнал."""
+        if self.lowcut:
+            left, self._hist_l = self._highpass(left, self._hist_l)
+            if stereo:
+                right, self._hist_r = self._highpass(right, self._hist_r)
+            else:
+                right = left
+        if self.compressor > 0:
+            left, right = self._compress(left, right, stereo)
+        elif abs(self._gain - 1.0) > 1e-4:
+            # Компрессор только что выключили — за один блок (10 мс)
+            # возвращаем усиление к единице, чтобы не щёлкнуло.
+            left, right = self._fade_to_unity(left, right, stereo)
+        return left, right
+
+    def _fade_to_unity(self, left: np.ndarray, right: np.ndarray,
+                       stereo: bool) -> tuple[np.ndarray, np.ndarray]:
+        curve = np.linspace(self._gain, 1.0, left.size, dtype=np.float32)
+        self._gain = 1.0
+        left = (left * curve).astype(np.float32, copy=False)
+        if stereo:
+            right = (right * curve).astype(np.float32, copy=False)
+        else:
+            right = left
+        return left, right
+
+    def _compress(self, left: np.ndarray, right: np.ndarray,
+                  stereo: bool) -> tuple[np.ndarray, np.ndarray]:
+        """Оптический компрессор с одной ручкой.
+
+        Ручка 0–100 задаёт сразу глубину: порог опускается, отношение
+        растёт, а добавка усиления подтягивает тихое. Поэтому «тише стало
+        громче», а громкие места не выпирают. Каналы поджимаются одной
+        огибающей — стерео-картинка не разъезжается.
+        """
+        knob = self.compressor / 100.0
+        thresh = -10.0 - 24.0 * knob          # от −10 до −34 дБ
+        ratio = 1.0 + 5.0 * knob              # от 1:1 до 6:1
+        # Добавка возвращает громкость тому, что было на пороге: тихое
+        # подтягивается на всю глубину, а громкое остаётся примерно на
+        # месте, вместо того чтобы стать тише вместе с ручкой. Выше 24 дБ
+        # не поднимаем — иначе на полной ручке в микрофон полез бы шум.
+        makeup = min(24.0, -thresh * (1.0 - 1.0 / ratio))
+        attack = math.exp(-0.001 / 0.012)     # атака 12 мс
+        release = math.exp(-0.001 / 0.180)    # спад 180 мс
+        knee = 6.0
+        n = left.size
+        env = self._env
+        gains: list[float] = []
+        for start in range(0, n, _CTRL):
+            stop = min(n, start + _CTRL)
+            peak = float(np.max(np.abs(left[start:stop])))
+            if stereo:
+                peak = max(peak, float(np.max(np.abs(right[start:stop]))))
+            coef = attack if peak > env else release
+            env = coef * env + (1.0 - coef) * peak
+            level = 20.0 * math.log10(env) if env > 1e-9 else -180.0
+            over = level - thresh
+            if over <= -knee / 2.0:
+                reduction = 0.0
+            elif over >= knee / 2.0:
+                reduction = over * (1.0 - 1.0 / ratio)
+            else:
+                x = over + knee / 2.0
+                reduction = (1.0 - 1.0 / ratio) * x * x / (2.0 * knee)
+            gains.append(10.0 ** ((makeup - reduction) / 20.0))
+        self._env = env
+        g = np.asarray(gains, dtype=np.float32)
+        # Усиление меняется плавно: от прошлого значения в начале блока
+        # через середины миллисекундных отрезков. Ступеньки на стыке были
+        # бы слышны как шорох.
+        pos = np.arange(g.size, dtype=np.float64) * _CTRL + _CTRL / 2.0
+        xs = np.concatenate(([pos[0] - _CTRL], pos))
+        gs = np.concatenate(([self._gain], g))
+        curve = np.interp(np.arange(n), xs, gs).astype(np.float32)
+        self._gain = float(g[-1])
+        left = (left * curve).astype(np.float32, copy=False)
+        if stereo:
+            right = (right * curve).astype(np.float32, copy=False)
+        else:
+            right = left
+        return left, right
+
+
 def set_buffer_preset(name: str) -> str:
     """Переключает набор буферов. Возвращает применённое имя."""
     global STUDENT_KEEP, STUDENT_MAX, INPUT_KEEP, INPUT_MAX
@@ -1159,6 +1323,15 @@ def _prewarm_hostapi(indices) -> None:
 # ---------------------------------------------------------------------------
 
 class AudioEngine:
+    # Счётчики, которые журнал печатает разницей за отрезок. Ошибки в
+    # списке тоже: «ошибок отправки 0» за минуту честнее накопленного
+    # итога с подключения.
+    _STAT_FIELDS = (
+        "_rx_packets", "_rx_lost", "_rx_ooo",
+        "_tx_packets", "_tx_dropped", "_tx_nopeer", "_tx_clip",
+        "_tx_errors", "_cb_errors",
+    )
+
     def __init__(self, log=None, on_video=None):
         self.log = log or (lambda *a: None)
         self.on_video = on_video
@@ -1261,6 +1434,12 @@ class AudioEngine:
         self._tx_dropped = 0
         self._tx_nopeer = 0
         self._tx_clip = 0
+        # Значения счётчиков при прошлой записи в журнал. Журнал печатает
+        # разницу, а не накопленный итог: подпись «за N с» относится к
+        # отрезку с прошлой записи. Сами счётчики не обнуляем — по ним
+        # решается, как часто писать про ошибки.
+        self._stat_snap: dict[str, int] = {
+            name: 0 for name in self._STAT_FIELDS}
         # Чья сторона играет минус и метроном. «local» — моя, «peer» —
         # собеседника: тогда его поток уже содержит дорожку и клик, а свой
         # плеер и метроном молчат, чтобы не было рассинхрона.
@@ -1296,6 +1475,10 @@ class AudioEngine:
         # ждать, когда клавиатуру включат уже после запуска программы.
         self._midi_enabled = False
         self._midi_port = ""
+        # Обработка первого входа: мониторинг, срез низа и компрессор.
+        # Состояние переживает перезапуск звука — фильтр и огибающая
+        # подхватывают поток с того места, где остановились.
+        self.input_fx = InputFx()
         # Выбор звука, динамики, педали и огибающей: настройки синтезатора.
         self._midi_opts: dict = {}
         self._midi_absent = ""
@@ -1307,11 +1490,15 @@ class AudioEngine:
               modes=None, output: str = "", midi_enabled: bool = False,
               midi_port: str = "", midi_options=None,
               driver: str = "", asio_device: str = "",
-              asio_in: int = 0, asio_out: int = 0
+              asio_in: int = 0, asio_out: int = 0, input_fx=None
               ) -> tuple[bool, str]:
         self.stop()
         if sd is None:
             return False, "Не установлен модуль sounddevice — звук недоступен."
+        # Обработку входа ставим до открытия потока: первый же блок уже
+        # должен звучать правильно. Настройка живёт в движке, поэтому
+        # возврат после «звук встал» подхватывает её автоматически.
+        self.set_input_fx(**dict(input_fx or {}))
 
         self._is_server = bool(is_server)
         self._server_addr = server_addr
@@ -1325,7 +1512,8 @@ class AudioEngine:
             devices=dict(devices or {}), modes=dict(modes or {}),
             output=output, midi_enabled=midi_enabled, midi_port=midi_port,
             midi_options=dict(midi_options or {}), driver=driver,
-            asio_device=asio_device, asio_in=asio_in, asio_out=asio_out)
+            asio_device=asio_device, asio_in=asio_in, asio_out=asio_out,
+            input_fx=dict(input_fx or {}))
         self._running = True
 
         try:
@@ -1855,6 +2043,16 @@ class AudioEngine:
         """Микрофон выключен: входы не попадают в поток собеседнику."""
         self.mic_muted = bool(muted)
 
+    def set_input_fx(self, monitor=None, lowcut=None,
+                     compressor=None) -> None:
+        """Мониторинг, срез низа и компрессор первого входа.
+
+        Действует без перезапуска звука: микшер читает мониторинг на
+        каждом блоке, а фильтр и компрессор живут в состоянии InputFx.
+        """
+        self.input_fx.set(monitor=monitor, lowcut=lowcut,
+                          compressor=compressor)
+
     def set_buffer_preset(self, name: str) -> str:
         """Набор буферов: low, normal или stable."""
         self.buffer_preset = set_buffer_preset(name)
@@ -2123,18 +2321,6 @@ class AudioEngine:
         if track_local is not None:
             local_l[:track_local.size] += track_local
             local_r[:track_local.size] += track_local
-        # Мягкий лимитер, а не жёсткий срез: громкий аккорд или хор
-        # поджимается плавно и не превращается в цифровой хрип.
-        local_l = soft_limit(local_l)
-        local_r = soft_limit(local_r)
-        np.clip(local_l, -1.0, 1.0, out=local_l)
-        np.clip(local_r, -1.0, 1.0, out=local_r)
-        if self._out_channels > 1:
-            outdata[:, 0] = local_l
-            outdata[:, 1] = local_r
-        else:
-            # Моно-выход: сводим каналы, чтобы никто не потерялся.
-            outdata[:, 0] = 0.5 * (local_l + local_r)
 
         # Собеседнику: входы, MIDI и метроном — всё, что он должен слышать.
         # Входы читаем всегда, даже при выключенном микрофоне: иначе буфер
@@ -2188,15 +2374,43 @@ class AudioEngine:
         mix_l = self._tx_delay.read_ramp(frames, pos if prev is None else prev, pos)
         mix_r = mix_l.copy()
         stereo_out = False
-        for source in self.sources.values():
+        fx = self.input_fx
+        for key, source in self.sources.items():
             left, right = source.read(frames)
             if source.stereo:
                 stereo_out = True
+            first = key == "in1"
+            # Срез и компрессор действуют на первый вход целиком: и в
+            # наушники, и собеседнику уходит уже обработанный звук.
+            if first and fx.active:
+                left, right = fx.process(left, right, source.stereo)
             if self.mic_muted:
                 continue
             if source.volume > 0:
                 mix_l += left * source.volume
                 mix_r += right * source.volume
+            if first and fx.monitor:
+                # Мониторинг: свой вход сразу в наушники. Громкость — свой
+                # регулятор этого входа, отдельно от громкости собеседника.
+                gain = self.volumes.get("in1", 1.0)
+                if gain > 0:
+                    local_l += left * gain
+                    local_r += right * gain
+
+        # Своя сторона собирается последней: к собеседнику, клику, MIDI и
+        # треку теперь добавлен ещё и мониторинг входа.
+        # Мягкий лимитер, а не жёсткий срез: громкий аккорд или хор
+        # поджимается плавно и не превращается в цифровой хрип.
+        local_l = soft_limit(local_l)
+        local_r = soft_limit(local_r)
+        np.clip(local_l, -1.0, 1.0, out=local_l)
+        np.clip(local_r, -1.0, 1.0, out=local_r)
+        if self._out_channels > 1:
+            outdata[:, 0] = local_l
+            outdata[:, 1] = local_r
+        else:
+            # Моно-выход: сводим каналы, чтобы никто не потерялся.
+            outdata[:, 0] = 0.5 * (local_l + local_r)
 
         # Перегруз считаем до лимитера: именно эти блоки раньше срезались
         # жёстко и хрипели. Теперь их поджимает soft_limit, но число
@@ -2432,6 +2646,22 @@ class AudioEngine:
             if source.ring_r is not None:
                 source.ring_r.reset_stats()
             self._source_frames[source.key] = source.frames_in
+        self._stat_snap = {
+            name: int(getattr(self, name, 0)) for name in self._STAT_FIELDS}
+
+    def _take_stat_deltas(self) -> dict[str, int]:
+        """Разница счётчиков с прошлой записи в журнал.
+
+        Сами счётчики остаются накопительными: по числу ошибок решается,
+        как часто писать про них, и обнуление превратило бы каждую ошибку
+        в «первую».
+        """
+        out: dict[str, int] = {}
+        for name in self._STAT_FIELDS:
+            value = int(getattr(self, name, 0))
+            out[name] = max(0, value - self._stat_snap.get(name, 0))
+            self._stat_snap[name] = value
+        return out
 
     def _stats_text(self, seconds: float, final: bool = False) -> str:
         rings = [self.student, self.student_r]
@@ -2484,24 +2714,26 @@ class AudioEngine:
         for source in self.sources.values():
             status_ovf += source.status_overflows
             source.status_overflows = 0
+        # Всё, что ниже, — за отрезок с прошлой записи, а не с запуска.
+        st = self._take_stat_deltas()
         parts = [
-            f"принято {self._rx_packets} пакетов",
-            f"потеряно {self._rx_lost}",
-            f"не по порядку {self._rx_ooo}",
+            f"принято {st['_rx_packets']} пакетов",
+            f"потеряно {st['_rx_lost']}",
+            f"не по порядку {st['_rx_ooo']}",
             f"пустых буферов {gaps_ms:.0f} мс "
             f"(собеседник {peer_gap_ms:.0f}, микрофон {mic_gap_ms:.0f})",
             f"выброшено {over_ms:.0f} мс",
             f"запас приёма {recv_ms} мс",
             f"уровень входа {peak:.2f}",
             f"перегруз входа {in_clip}",
-            f"отправлено {self._tx_packets}",
-            f"не ушло {self._tx_nopeer + self._tx_dropped}",
-            f"ошибок отправки {self._tx_errors}",
-            f"перегруз отправки {self._tx_clip}",
+            f"отправлено {st['_tx_packets']}",
+            f"не ушло {st['_tx_nopeer'] + st['_tx_dropped']}",
+            f"ошибок отправки {st['_tx_errors']}",
+            f"перегруз отправки {st['_tx_clip']}",
             f"выведено {realtime:.0f}% реального времени",
             f"отказов вывода {out_under}",
             f"переполнений драйвера {status_ovf}",
-            f"сбоев потока {self._cb_errors}",
+            f"сбоев потока {st['_cb_errors']}",
         ]
         return f"{head} за {seconds:.0f} с: " + ", ".join(parts) + "."
 
@@ -2690,7 +2922,6 @@ class AudioEngine:
         send_q = self._send_q
         hello_at = 0.0
         caps_at = 0.0
-        caps_sent = 0
         # Когда собеседник появился и когда мы уже сказали в журнал, каким
         # форматом идёт звук. Без этой строки по журналу не понять, почему
         # один компьютер сжимает звук, а второй шлёт его целиком.
@@ -2716,23 +2947,21 @@ class AudioEngine:
                     except OSError:
                         pass
             # Как только связь есть, сообщаем, что умеем: стерео и, если
-            # библиотека нашлась, Opus. Отправляем свои возможности всегда,
-            # пока собеседник не подтвердил свои: раньше условие замолкало,
-            # как только приходили его возможности, и он мог так и не
-            # узнать про наше сжатие. Пять повторов на случай потери пакета,
-            # и до двенадцати, если подтверждения всё нет.
+            # библиотека нашлась, Opus. Объявляем не считанное число раз, а
+            # всё время, пока собеседник на связи: если он перезапустил
+            # звук (например, сохранил настройки устройств), он забывает
+            # услышанные возможности, и без повторного объявления звук
+            # навсегда остаётся несжатым — до перезапуска программы.
+            # Пакет весит пять байт, раз в секунду его не жалко.
             if self._peer is not None and now - caps_at > 1.0:
                 if peer_at == 0.0:
                     peer_at = now
-                limit = 5 if self._peer_caps else 12
-                if caps_sent < limit:
-                    caps_at = now
-                    caps_sent += 1
-                    try:
-                        sock.sendto(
-                            MAGIC_CAPS + self._caps_flags(), self._peer)
-                    except OSError:
-                        pass
+                caps_at = now
+                try:
+                    sock.sendto(
+                        MAGIC_CAPS + self._caps_flags(), self._peer)
+                except OSError:
+                    pass
             # Через несколько секунд после установления связи пишем в
             # журнал, каким форматом реально идёт звук.
             if (self._peer is not None and not mode_logged and peer_at > 0.0

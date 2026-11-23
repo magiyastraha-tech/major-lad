@@ -459,6 +459,22 @@ class ShortcutDialog(QDialog):
         return shortcuts.normalize(self.edit.combo())
 
 
+def _mode_title(key: str) -> str:
+    """Название режима канала, которого сейчас нет в списке драйвера.
+
+    Драйвер на миг может показать карту с меньшим числом каналов, и
+    сохранённый режим в список не попадает. Но выбор человека от этого не
+    пропадает: режим остаётся отдельным пунктом — «какой выбрал, такой и
+    будет», пока его не поменяют.
+    """
+    key = str(key or "")
+    if key == "stereo":
+        return "Стерео, канал 1 слева, канал 2 справа"
+    if key.startswith("ch") and key[2:].isdigit():
+        return f"Моно, канал {key[2:]}"
+    return key
+
+
 class SettingsDialog(QDialog):
     """Настройки. Открывается по Control+P, дерево на четыре раздела."""
 
@@ -753,6 +769,11 @@ class SettingsDialog(QDialog):
             for key, title in audio.device_modes(driver, "", channels):
                 combo.addItem(title, key)
             index = combo.findData(current)
+            if index < 0 and current:
+                # Карта на миг показала меньше каналов — сохранённый режим
+                # всё равно остаётся выбранным, а не сбрасывается на первый.
+                combo.addItem(_mode_title(current), current)
+                index = combo.count() - 1
             combo.setCurrentIndex(index if index >= 0 else 0)
             combo.blockSignals(False)
 
@@ -888,7 +909,8 @@ class SettingsDialog(QDialog):
             self.cfg["audio"].get("device1", ""), "Аудиоустройство 1", inputs)
         self.mode1_combo = self._mode_combo(
             self.cfg["audio"].get("mode1", "ch1"), "Режим канала 1")
-        tabs.addTab(self._device_tab(self.dev1_combo, self.mode1_combo),
+        tabs.addTab(self._device_tab(self.dev1_combo, self.mode1_combo,
+                                     with_fx=True),
                     "Аудиоустройство 1")
 
         self.dev2_combo = self._device_combo(
@@ -1046,6 +1068,12 @@ class SettingsDialog(QDialog):
         combo.addItem("Моно, канал 2", "ch2")
         combo.addItem("Стерео, канал 1 слева, канал 2 справа", "stereo")
         index = combo.findData(current)
+        if index < 0 and current:
+            # Сохранённый режим, которого нет в списке (например, «канал 5»
+            # у карты, которая сейчас показывает только два канала), —
+            # отдельным пунктом, чтобы выбор не сбросился на первый.
+            combo.addItem(_mode_title(current), current)
+            index = combo.count() - 1
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.setAccessibleDescription(
             "Стерео берёт оба входа звуковой карты сразу: первый идёт в левое "
@@ -1053,13 +1081,48 @@ class SettingsDialog(QDialog):
         return combo
 
     def _device_tab(self, combo: QComboBox,
-                    mode_combo: QComboBox | None = None) -> QWidget:
+                    mode_combo: QComboBox | None = None,
+                    with_fx: bool = False) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
         combo_label = label_for("Устройство", combo)
         form.addRow(combo_label, combo)
         if mode_combo is not None:
             form.addRow(label_for("Режим", mode_combo), mode_combo)
+        if with_fx:
+            audio_cfg = self.cfg["audio"]
+            self.monitor1_box = QCheckBox("Слышать себя")
+            self.monitor1_box.setChecked(
+                bool(audio_cfg.get("monitor1", False)))
+            self.monitor1_box.setAccessibleName("Слышать себя")
+            self.monitor1_box.setAccessibleDescription(
+                "Звук первого входа идёт и в наушники, и ученику. Громкость "
+                "в наушниках — регулятором «Аудиоустройство 1» на главном "
+                "экране.")
+            form.addRow(self.monitor1_box)
+
+            self.lowcut_box = QCheckBox("Срез низких частот 150 Гц")
+            self.lowcut_box.setChecked(bool(audio_cfg.get("lowcut", False)))
+            self.lowcut_box.setAccessibleName("Срез низких частот 150 Гц")
+            self.lowcut_box.setAccessibleDescription(
+                "Убирает всё ниже 150 Гц: гул комнаты, стук по корпусу и "
+                "рокот. Голос и гитара становятся чище. Голос звучит почти "
+                "так же, а гудение уходит.")
+            form.addRow(self.lowcut_box)
+
+            self.compressor_spin = QSpinBox()
+            self.compressor_spin.setRange(0, 100)
+            self.compressor_spin.setSingleStep(10)
+            self.compressor_spin.setSuffix(" %")
+            self.compressor_spin.setValue(
+                max(0, min(100, int(audio_cfg.get("compressor", 0) or 0))))
+            self.compressor_spin.setAccessibleName("Компрессор")
+            self.compressor_spin.setAccessibleDescription(
+                "Выравнивает громкость: громкие места приглушаются, тихие "
+                "становятся слышнее. Один регулятор: чем больше, тем ровнее "
+                "и громче тихое. 0 — выключен.")
+            form.addRow(label_for("Компрессор", self.compressor_spin),
+                        self.compressor_spin)
         return page
 
     def _page_outputs(self) -> QWidget:
@@ -1466,6 +1529,9 @@ class SettingsDialog(QDialog):
         cfg["audio"]["mode1"] = self.mode1_combo.currentData() or "ch1"
         cfg["audio"]["mode2"] = self.mode2_combo.currentData() or "ch1"
         cfg["audio"]["usb_mode"] = self.usb_mode_combo.currentData() or "ch1"
+        cfg["audio"]["monitor1"] = self.monitor1_box.isChecked()
+        cfg["audio"]["lowcut"] = self.lowcut_box.isChecked()
+        cfg["audio"]["compressor"] = int(self.compressor_spin.value())
         cfg["audio"]["output"] = self.out_combo.currentData() or ""
         cfg["audio"]["midi_enabled"] = self.midi_box.isChecked()
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
@@ -2609,6 +2675,11 @@ class MainWindow(QMainWindow):
             host = self.cfg.get("server_ip", "").strip()
             if host:
                 server_addr = (host, audio.UDP_PORT)
+        input_fx = {
+            "monitor": bool(cfg_audio.get("monitor1", False)),
+            "lowcut": bool(cfg_audio.get("lowcut", False)),
+            "compressor": int(cfg_audio.get("compressor", 0) or 0),
+        }
         ok, message = self.engine.start(
             is_server=is_server,
             server_addr=server_addr,
@@ -2622,6 +2693,7 @@ class MainWindow(QMainWindow):
             asio_device=str(cfg_audio.get("asio_device", "")),
             asio_in=int(cfg_audio.get("asio_in_channels", 2) or 2),
             asio_out=int(cfg_audio.get("asio_out_channels", 2) or 2),
+            input_fx=input_fx,
         )
         self._set_status(message)
         if ok:
@@ -3791,15 +3863,31 @@ class MainWindow(QMainWindow):
         peer = self.volume_mode == "peer"
         active = {
             # Свою сторону собеседник не регулирует, а его сторону —
-            # свои входы: поэтому наборы разные.
+            # свои входы: поэтому наборы разные. Первый вход виден в обоих
+            # режимах: в «Моей громкости» он задаёт громкость
+            # самопрослушивания (насколько громко себя слышно в наушниках),
+            # в «Громкости ученика» — насколько громко его слышит ученик.
             "student": not peer,
-            "in1": peer and bool(str(audio_cfg.get("device1") or "").strip()),
+            "in1": bool(str(audio_cfg.get("device1") or "").strip()),
             "in2": peer and bool(str(audio_cfg.get("device2") or "").strip()),
             "usb": peer and bool(str(audio_cfg.get("usb") or "").strip()),
             "midi": bool(audio_cfg.get("midi_enabled")),
             "metronome": bool(self.cfg.get("metronome", {}).get("enabled")),
             "player": bool(self._tracks_available),
         }
+        # Первый вход в «Моей громкости» звучит только при включённом
+        # самопрослушивании: подсказываем это диктору, чтобы регулятор не
+        # выглядел немым.
+        slider = self.sliders.get("in1")
+        if slider is not None:
+            if peer:
+                slider.setAccessibleDescription(
+                    "Насколько громко первый вход слышит собеседник.")
+            else:
+                slider.setAccessibleDescription(
+                    "Громкость самопрослушивания: насколько громко вы "
+                    "слышите себя в наушниках, если включено «Слышать "
+                    "себя».")
         appeared: list[str] = []
         for key, row in self.slider_rows.items():
             visible = active.get(key, True)
@@ -4378,6 +4466,13 @@ class MainWindow(QMainWindow):
         # Битрейт применяется к следующему кодировщику, поток не рвём.
         self.engine.set_opus_bitrate(
             int(self.cfg["audio"].get("opus_bitrate", 96) or 96))
+        # Обработка первого входа (мониторинг, срез низа, компрессор)
+        # включается без перезапуска звука: фильтр и компрессор живут в
+        # состоянии потока, мониторинг читается на каждом блоке.
+        self.engine.set_input_fx(
+            monitor=bool(self.cfg["audio"].get("monitor1", False)),
+            lowcut=bool(self.cfg["audio"].get("lowcut", False)),
+            compressor=int(self.cfg["audio"].get("compressor", 0) or 0))
         # Новый шаг перемотки из настроек — на кнопках плеера.
         self._update_player_buttons()
         # Смена аудиоустройств применяется сразу: поток переоткрывается сам.
@@ -4405,7 +4500,8 @@ class MainWindow(QMainWindow):
             "({ain} вх. / {aout} вых.), буфер {b}, шаг перемотки {s} с, "
             "растяжение {a}, задержка компенсации {d} мс, устройства "
             "{dev1} / {dev2} / "
-            "{out}, режим входа {m1} / {m2} / {mu}, громкость метронома "
+            "{out}, режим входа {m1} / {m2} / {mu}, вход 1: мониторинг "
+            "{mon}, срез низа {lc}, компрессор {comp}%, громкость метронома "
             "{m}, трека {p}.".format(
                 drv=audio.get("driver", "wasapi"),
                 card=audio.get("asio_device", ""),
@@ -4421,6 +4517,9 @@ class MainWindow(QMainWindow):
                 m1=audio.get("mode1", ""),
                 m2=audio.get("mode2", ""),
                 mu=audio.get("usb_mode", "ch1"),
+                mon="вкл" if audio.get("monitor1") else "выкл",
+                lc="вкл" if audio.get("lowcut") else "выкл",
+                comp=int(audio.get("compressor", 0) or 0),
                 m=(audio.get("volumes", {}) or {}).get("metronome", ""),
                 p=(audio.get("volumes", {}) or {}).get("player", "")))
         message = "Настройки сохранены."

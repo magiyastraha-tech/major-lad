@@ -21,7 +21,7 @@ DEFAULT_DEVICE = "__default__"
 DEFAULTS = {
     # Версия схемы настроек: по ней load() понимает, какие старые
     # умолчания пора привести к новым.
-    "settings_version": 6,
+    "settings_version": 7,
     "role": "",
     "name": "",
     "server_ip": "",
@@ -44,6 +44,12 @@ DEFAULTS = {
         "mode1": "ch1",
         "mode2": "ch1",
         "usb_mode": "ch1",
+        # Обработка первого входа: слышать себя в наушниках (мониторинг),
+        # срез всего ниже 150 Гц и сила оптического компрессора в процентах
+        # (0 — выключен).
+        "monitor1": False,
+        "lowcut": False,
+        "compressor": 0,
         "midi_enabled": False,
         "midi_port": "",
         # Звук синтезатора: sine (синус), triangle, square или sampler —
@@ -299,6 +305,11 @@ def load() -> dict:
             audio_cfg["midi_dynamics"] = (
                 "fixed" if audio_cfg.pop("midi_fixed_velocity") else "velocity")
         cfg["settings_version"] = 6
+    # 0.5.6: у первого входа появились мониторинг, срез низа и компрессор.
+    # Данные не переносим — новые ключи приходят из DEFAULTS; версию
+    # помечаем, чтобы будущие миграции не делались повторно.
+    if int(cfg.get("settings_version", 1) or 1) < 7:
+        cfg["settings_version"] = 7
     return cfg
 
 
