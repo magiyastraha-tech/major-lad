@@ -554,6 +554,36 @@ class SettingsDialog(QDialog):
                      "MIDI-устройства не найдены. Проверь, что клавиатура "
                      "включена и подключена, и нажми «Обновить» ещё раз.")
 
+    def _midi_options(self) -> dict:
+        """Выбор синтезатора из настроек — под ключи файла настроек."""
+        return {
+            "midi_wave": str(self.midi_wave_combo.currentData() or "sine"),
+            "midi_dynamics": str(
+                self.midi_dynamics_combo.currentData() or "velocity"),
+            "midi_pedal": bool(self.midi_pedal_combo.currentData()),
+            "midi_attack_ms": int(self.midi_attack_spin.value()),
+            "midi_decay_ms": int(self.midi_decay_spin.value()),
+            "midi_sustain": int(self.midi_sustain_spin.value()),
+            "midi_release_ms": int(self.midi_release_spin.value()),
+        }
+
+    def _open_sampler_folder(self) -> None:
+        """Открывает Data\\Sampler в проводнике: туда кладут файлы семплов."""
+        try:
+            from .midi_synth import sampler_dir
+
+            folder = sampler_dir()
+        except Exception as exc:
+            QMessageBox.warning(self, "Семплер",
+                                f"Не удалось открыть папку семплов: {exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            QMessageBox.information(
+                self, "Семплер",
+                f"Папка семплов: {folder}\n\n"
+                f"Положи туда файлы 001.wav … 127.wav: номер файла — "
+                f"номер ноты.")
+
     def _page_general(self) -> QWidget:
         page = QWidget()
         page.setAccessibleName("Общее")
@@ -896,11 +926,86 @@ class SettingsDialog(QDialog):
         self.midi_combo.setCurrentIndex(index if index >= 0 else 0)
         midi_form.addRow(label_for("Порт", self.midi_combo), midi_row)
 
-        self.midi_fixed_box = QCheckBox("Всегда полная громкость нот")
-        self.midi_fixed_box.setChecked(
-            bool(self.cfg["audio"].get("midi_fixed_velocity", False)))
-        self.midi_fixed_box.setAccessibleName("Всегда полная громкость нот")
-        midi_form.addRow(self.midi_fixed_box)
+        audio_cfg = self.cfg["audio"]
+        self.midi_wave_combo = QComboBox()
+        self.midi_wave_combo.setAccessibleName("Звук синтезатора")
+        for label, key in (("Синус", "sine"), ("Треугольник", "triangle"),
+                           ("Квадрат", "square"), ("Семплер", "sampler")):
+            self.midi_wave_combo.addItem(label, key)
+        wave = str(audio_cfg.get("midi_wave", "sine"))
+        wave_index = self.midi_wave_combo.findData(wave)
+        self.midi_wave_combo.setCurrentIndex(wave_index if wave_index >= 0 else 0)
+        midi_form.addRow(label_for("Звук", self.midi_wave_combo),
+                         self.midi_wave_combo)
+
+        sampler_row = QWidget()
+        sampler_layout = QHBoxLayout(sampler_row)
+        sampler_layout.setContentsMargins(0, 0, 0, 0)
+        sampler_hint = QLabel("Файлы 001.wav … 127.wav в папке Data\\Sampler. "
+                              "Номер файла — номер ноты. Нет файла — нота молчит.")
+        sampler_hint.setWordWrap(True)
+        sampler_hint.setAccessibleName(sampler_hint.text())
+        sampler_layout.addWidget(sampler_hint, 1)
+        sampler_open = QPushButton("Открыть папку")
+        sampler_open.setAccessibleName("Открыть папку семплов")
+        sampler_open.clicked.connect(self._open_sampler_folder)
+        sampler_layout.addWidget(sampler_open)
+        midi_form.addRow(sampler_row)
+
+        self.midi_dynamics_combo = QComboBox()
+        self.midi_dynamics_combo.setAccessibleName("Громкость нот")
+        self.midi_dynamics_combo.addItem("Без динамики", "fixed")
+        self.midi_dynamics_combo.addItem("С динамикой", "velocity")
+        dynamics = str(audio_cfg.get("midi_dynamics", "velocity"))
+        dyn_index = self.midi_dynamics_combo.findData(dynamics)
+        self.midi_dynamics_combo.setCurrentIndex(
+            dyn_index if dyn_index >= 0 else 1)
+        midi_form.addRow(label_for("Громкость нот", self.midi_dynamics_combo),
+                         self.midi_dynamics_combo)
+
+        self.midi_pedal_combo = QComboBox()
+        self.midi_pedal_combo.setAccessibleName("Педаль")
+        self.midi_pedal_combo.addItem("Педаль не нажата", False)
+        self.midi_pedal_combo.addItem("Педаль нажата", True)
+        self.midi_pedal_combo.setCurrentIndex(
+            1 if bool(audio_cfg.get("midi_pedal", False)) else 0)
+        midi_form.addRow(label_for("Педаль", self.midi_pedal_combo),
+                         self.midi_pedal_combo)
+
+        self.midi_attack_spin = QSpinBox()
+        self.midi_attack_spin.setRange(0, 5000)
+        self.midi_attack_spin.setSingleStep(10)
+        self.midi_attack_spin.setSuffix(" мс")
+        self.midi_attack_spin.setValue(int(audio_cfg.get("midi_attack_ms", 6)))
+        self.midi_attack_spin.setAccessibleName("Атака")
+        midi_form.addRow(label_for("Атака", self.midi_attack_spin),
+                         self.midi_attack_spin)
+
+        self.midi_decay_spin = QSpinBox()
+        self.midi_decay_spin.setRange(0, 5000)
+        self.midi_decay_spin.setSingleStep(10)
+        self.midi_decay_spin.setSuffix(" мс")
+        self.midi_decay_spin.setValue(int(audio_cfg.get("midi_decay_ms", 0)))
+        self.midi_decay_spin.setAccessibleName("Декай")
+        midi_form.addRow(label_for("Декай", self.midi_decay_spin),
+                         self.midi_decay_spin)
+
+        self.midi_sustain_spin = QSpinBox()
+        self.midi_sustain_spin.setRange(0, 100)
+        self.midi_sustain_spin.setSuffix(" %")
+        self.midi_sustain_spin.setValue(int(audio_cfg.get("midi_sustain", 100)))
+        self.midi_sustain_spin.setAccessibleName("Сустейн")
+        midi_form.addRow(label_for("Сустейн", self.midi_sustain_spin),
+                         self.midi_sustain_spin)
+
+        self.midi_release_spin = QSpinBox()
+        self.midi_release_spin.setRange(0, 5000)
+        self.midi_release_spin.setSingleStep(10)
+        self.midi_release_spin.setSuffix(" мс")
+        self.midi_release_spin.setValue(int(audio_cfg.get("midi_release_ms", 45)))
+        self.midi_release_spin.setAccessibleName("Релиз")
+        midi_form.addRow(label_for("Релиз", self.midi_release_spin),
+                         self.midi_release_spin)
         tabs.addTab(midi_page, "MIDI-устройства")
 
         self.usb_combo = self._device_combo(
@@ -1364,7 +1469,7 @@ class SettingsDialog(QDialog):
         cfg["audio"]["output"] = self.out_combo.currentData() or ""
         cfg["audio"]["midi_enabled"] = self.midi_box.isChecked()
         cfg["audio"]["midi_port"] = self.midi_combo.currentData() or ""
-        cfg["audio"]["midi_fixed_velocity"] = self.midi_fixed_box.isChecked()
+        cfg["audio"].update(self._midi_options())
         cfg["audio"]["show_all_drivers"] = self.all_drivers_box.isChecked()
         cfg["audio"]["buffer"] = str(self.buffer_combo.currentData() or "normal")
         cfg["audio"]["opus_bitrate"] = int(
@@ -1392,6 +1497,29 @@ def _midi_ports() -> list[str]:
         return list_midi_ports()
     except Exception:
         return []
+
+
+def _engine_midi_options(audio_cfg: dict) -> dict:
+    """Настройки синтезатора из файла настроек — аргументы configure().
+
+    Один переводчик на запуск звука и на сохранение: иначе ключи файла
+    и имена параметров синтезатора разошлись бы при первой правке.
+    """
+    def number(key, default):
+        try:
+            return float(audio_cfg.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    return {
+        "wave": str(audio_cfg.get("midi_wave", "sine")),
+        "dynamics": str(audio_cfg.get("midi_dynamics", "velocity")),
+        "pedal": bool(audio_cfg.get("midi_pedal", False)),
+        "attack_ms": number("midi_attack_ms", 6),
+        "decay_ms": number("midi_decay_ms", 0),
+        "sustain": number("midi_sustain", 100),
+        "release_ms": number("midi_release_ms", 45),
+    }
 
 
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
@@ -1559,6 +1687,15 @@ class MainWindow(QMainWindow):
         self.cfg = cfg
         self.is_teacher = cfg.get("role") == "teacher"
         self.engine = audio.AudioEngine(log=self._log_threadsafe)
+        # Папка семплов создаётся сразу при запуске: файлы 001.wav …
+        # 127.wav кладут туда заранее, и папка должна быть на месте раньше,
+        # чем в настройках выберут «Семплер».
+        try:
+            from .midi_synth import sampler_dir
+
+            sampler_dir()
+        except Exception:
+            pass
         self.reassembler = FrameReassembler(on_frame=self.sig_video.emit,
                                             log=self._log_threadsafe)
         self.engine.on_video = self.reassembler.feed
@@ -2480,8 +2617,7 @@ class MainWindow(QMainWindow):
             output=cfg_audio.get("output", ""),
             midi_enabled=bool(cfg_audio.get("midi_enabled", False)),
             midi_port=cfg_audio.get("midi_port", ""),
-            midi_fixed_velocity=bool(
-                cfg_audio.get("midi_fixed_velocity", False)),
+            midi_options=_engine_midi_options(cfg_audio),
             driver=str(cfg_audio.get("driver", "wasapi")),
             asio_device=str(cfg_audio.get("asio_device", "")),
             asio_in=int(cfg_audio.get("asio_in_channels", 2) or 2),
@@ -4258,7 +4394,7 @@ class MainWindow(QMainWindow):
             self.engine.set_midi(
                 bool(self.cfg["audio"].get("midi_enabled")),
                 self.cfg["audio"].get("midi_port", ""),
-                bool(self.cfg["audio"].get("midi_fixed_velocity", False)))
+                _engine_midi_options(self.cfg["audio"]))
         appeared = self._refresh_volume_visibility()
         # Пишем, с чем именно сохранились настройки: по этому логу видно,
         # какой шаг перемотки и размер буфера выбраны, когда владелец

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import queue
 import re
@@ -52,7 +53,7 @@ from .config import DEFAULT_DEVICE
 from .media import Player
 from .metronome import Metronome
 from .midi_synth import (MidiInput, Synth, list_midi_ports, pick_port,
-                         port_key)
+                         port_key, sampler_dir)
 
 SAMPLE_RATE = 48000
 BLOCK = 480          # 10 мс — единица буферов и пакетов
@@ -381,6 +382,43 @@ class DelayBuffer:
         out[:take] = self._buf[first:]
         out[take:] = self._buf[:n - take]
         return out
+
+    def _window(self, start: int, n: int) -> np.ndarray:
+        """n отсчётов с произвольной отметки; до начала записи — тишина."""
+        out = np.zeros(n, dtype=np.float32)
+        if start >= 0:
+            out[:] = self._take(start, n)
+            return out
+        skip = -start
+        if skip < n:
+            out[skip:] = self._take(0, n - skip)
+        return out
+
+    def read_ramp(self, frames: int, delay0: float, delay1: float) -> np.ndarray:
+        """Блок, у которого задержка плавно едет от delay0 к delay1.
+
+        Целое чтение с задержкой, меняющейся от блока к блоку, режет сигнал
+        на стыке: разница задержек — это выброшенный или повторённый кусок.
+        Здесь задержка едет внутри блока, а шаг чтения отличается от
+        единицы на доли процента — тот же приём, что у вариспида. На слух
+        это незаметно, зато стыков и щелчков нет совсем.
+        """
+        if frames <= 0:
+            return np.zeros(max(0, frames), dtype=np.float32)
+        limit = self._buf.size - max(self.RESERVE, frames + 4)
+        d0 = min(max(0.0, float(delay0)), float(max(0, limit)))
+        d1 = min(max(0.0, float(delay1)), float(max(0, limit)))
+        whole = int(math.floor(d0))
+        base = self._write - frames - whole - 1
+        n = frames + 3 + int(math.ceil(abs(d1 - d0)))
+        window = self._window(base, n)
+        off = whole + 1 - d0
+        slope = 1.0 - (d1 - d0) / float(frames)
+        idx = off + np.arange(frames, dtype=np.float64) * slope
+        i0 = idx.astype(np.int32)
+        frac = (idx - i0).astype(np.float32)
+        return (window[i0] * (1.0 - frac) + window[i0 + 1] * frac).astype(
+            np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1240,6 +1278,12 @@ class AudioEngine:
         # Заполнение входного буфера в последнем блоке: по нему считается
         # задержка передачи, пока звук ещё не пошёл.
         self._tx_fill = 0.0
+        # Текущая задержка чтения передающей копии, в отсчётах (дробная) и
+        # сглаженная цель, к которой она едет. Нужны, чтобы задержка
+        # менялась плавно: заполнение микрофонного буфера на не-ASIO
+        # драйверах гуляет на целый блок от вызова к вызову.
+        self._tx_pos: float | None = None
+        self._tx_smooth = 0.0
         # Составляющие компенсации последнего расчёта, в миллисекундах:
         # выход, вход, буфер и итог. Раз в минуту уходят в журнал, чтобы
         # расхождение можно было проверить по числам, а не на слух.
@@ -1252,7 +1296,8 @@ class AudioEngine:
         # ждать, когда клавиатуру включат уже после запуска программы.
         self._midi_enabled = False
         self._midi_port = ""
-        self._midi_fixed = False
+        # Выбор звука, динамики, педали и огибающей: настройки синтезатора.
+        self._midi_opts: dict = {}
         self._midi_absent = ""
         self._midi_last_try = 0.0
 
@@ -1260,7 +1305,7 @@ class AudioEngine:
 
     def start(self, is_server: bool, server_addr=None, devices=None,
               modes=None, output: str = "", midi_enabled: bool = False,
-              midi_port: str = "", midi_fixed_velocity: bool = False,
+              midi_port: str = "", midi_options=None,
               driver: str = "", asio_device: str = "",
               asio_in: int = 0, asio_out: int = 0
               ) -> tuple[bool, str]:
@@ -1279,7 +1324,7 @@ class AudioEngine:
             is_server=is_server, server_addr=server_addr,
             devices=dict(devices or {}), modes=dict(modes or {}),
             output=output, midi_enabled=midi_enabled, midi_port=midi_port,
-            midi_fixed_velocity=midi_fixed_velocity, driver=driver,
+            midi_options=dict(midi_options or {}), driver=driver,
             asio_device=asio_device, asio_in=asio_in, asio_out=asio_out)
         self._running = True
 
@@ -1353,6 +1398,8 @@ class AudioEngine:
         self._recv_note_t = 0.0
         self._peer_live = False
         self._peer_wait = 0.0
+        self._tx_pos = None
+        self._tx_smooth = 0.0
         self._peer_gap = False
         self._peer_last = [0.0, 0.0]
         self._peer_fade = [0, 0]
@@ -1442,7 +1489,7 @@ class AudioEngine:
                         f"не совпадает с игрой, поставь «Автоматически».")
 
         if midi_enabled:
-            self.set_midi(True, midi_port, midi_fixed_velocity)
+            self.set_midi(True, midi_port, midi_options)
 
         if latency is not None:
             return True, f"Звук запущен. Задержка вывода {latency * 1000:.0f} мс."
@@ -1641,15 +1688,16 @@ class AudioEngine:
                     pass
 
     def set_midi(self, enabled: bool, port: str = "",
-                 fixed_velocity: bool = False) -> None:
+                 options=None) -> None:
         """Включает или выключает MIDI-вход на работающем движке.
 
+        options — выбор звука, динамики, педали и огибающей из настроек.
         Нужно, чтобы клавиатура начинала играть сразу после сохранения
         настроек, без закрытия кабинета.
         """
         self._midi_enabled = bool(enabled)
         self._midi_port = port or ""
-        self._midi_fixed = bool(fixed_velocity)
+        self._midi_opts = dict(options or {})
         self._midi_absent = ""
         if self.midi is not None:
             self.midi.close()
@@ -1670,7 +1718,12 @@ class AudioEngine:
             return False
         if self.synth is None:
             self.synth = Synth(SAMPLE_RATE)
-        self.synth.fixed_velocity = self._midi_fixed
+        # Только известные синтезатору ключи: лишний ключ из старого файла
+        # настроек не должен ронять открытие MIDI.
+        opts = {k: v for k, v in self._midi_opts.items()
+                if k in ("wave", "dynamics", "pedal", "attack_ms",
+                         "decay_ms", "sustain", "release_ms")}
+        self.synth.configure(sampler_dir=str(sampler_dir()), **opts)
         midi = MidiInput(self.synth, self.log)
         if not midi.open(name):
             self.log("MIDI-устройство не открыто.")
@@ -1774,6 +1827,8 @@ class AudioEngine:
         self._peer_caps = False
         self._peer_live = False
         self._peer_wait = 0.0
+        self._tx_pos = None
+        self._tx_smooth = 0.0
         self._peer_gap = False
         self._peer_last = [0.0, 0.0]
         self._peer_fade = [0, 0]
@@ -2038,7 +2093,13 @@ class AudioEngine:
         # не остаться без звука совсем.
         if not self._peer_live:
             self._peer_wait += frames / SAMPLE_RATE
-            if self.student.level >= target or self._peer_wait >= 1.5:
+            # Пустое кольцо, пока ученик не подключился, — это не провал
+            # приёма. Раньше предохранитель на 1,5 с включал чтение на
+            # пустом кольце, запас приёма раздувался до предела ещё до
+            # подключения, а потом минутами полз обратно. Ждём либо
+            # наполнения, либо хоть какого-то звука.
+            if self.student.level >= target or (
+                    self.student.level > 0 and self._peer_wait >= 1.5):
                 self._peer_live = True
             else:
                 self.student.trim(keep, maximum)
@@ -2095,13 +2156,36 @@ class AudioEngine:
         fill = 0
         for source in self.sources.values():
             fill = max(fill, source.fill())
-        delay = self._tx_target(fill)
+        target = self._tx_target(fill)
+        # Задержка меняется плавно и дробно. Целое чтение с задержкой,
+        # которая скачет на блок, режет сигнал: на WASAPI микрофонный буфер
+        # наполняется блоками по 5 мс, а вычитывается блоками по 10 мс,
+        # поэтому заполнение гуляет на ±240 отсчётов от вызова к вызову.
+        # Для голоса это неважно (он идёт мимо задержки), а клик, MIDI и
+        # трек склеивались из кусков — на слух треск и хрип. На ASIO вход и
+        # выход в одном вызове, заполнение не дрожит, поэтому там было чисто.
+        prev = self._tx_pos
+        if prev is None:
+            # Первый блок или перезапуск звука: сразу встаём на место.
+            pos = target
+            self._tx_smooth = target
+        else:
+            # Цель сглаживаем медленно: дрожание заполнения — шум, а не
+            # настоящее изменение задержки, и в компенсацию ему нельзя.
+            self._tx_smooth += (target - self._tx_smooth) * 0.02
+            step = self._tx_smooth - prev
+            limit = max(2.0, frames / 64.0)
+            if step > limit:
+                step = limit
+            elif step < -limit:
+                step = -limit
+            pos = prev + step
+        self._tx_pos = pos
         self._log_tx_parts(frames)
-        # Пишем то, что родилось в микшере, и читаем ровно из прошлого:
-        # у собеседника клик, MIDI и трек встанут вплотную к голосу этого
-        # же блока. Задержка целая, без интерполяции: сдвиг точный.
         self._tx_delay.write(gen)
-        mix_l = self._tx_delay.read(frames, int(round(delay)))
+        # Задержка едет внутри блока, а не прыгает на стыке: чтение с шагом
+        # чуть меньше или больше единицы — вариспид на доли процента.
+        mix_l = self._tx_delay.read_ramp(frames, pos if prev is None else prev, pos)
         mix_r = mix_l.copy()
         stereo_out = False
         for source in self.sources.values():

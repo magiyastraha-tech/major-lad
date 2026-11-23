@@ -21,7 +21,7 @@ DEFAULT_DEVICE = "__default__"
 DEFAULTS = {
     # Версия схемы настроек: по ней load() понимает, какие старые
     # умолчания пора привести к новым.
-    "settings_version": 5,
+    "settings_version": 6,
     "role": "",
     "name": "",
     "server_ip": "",
@@ -46,7 +46,19 @@ DEFAULTS = {
         "usb_mode": "ch1",
         "midi_enabled": False,
         "midi_port": "",
-        "midi_fixed_velocity": False,
+        # Звук синтезатора: sine (синус), triangle, square или sampler —
+        # wav-файлы из Data/Sampler, номер файла равен номеру ноты.
+        "midi_wave": "sine",
+        # fixed — нота всегда полной громкости, velocity — от силы нажатия.
+        "midi_dynamics": "velocity",
+        # True — «педаль нажата»: ноты звучат и после отпускания клавиши.
+        "midi_pedal": False,
+        # Огибающая: атака и декай в миллисекундах, сустейн в процентах,
+        # релиз в миллисекундах.
+        "midi_attack_ms": 6,
+        "midi_decay_ms": 0,
+        "midi_sustain": 100,
+        "midi_release_ms": 45,
         # Показывать в списках все драйверы, а не только WASAPI.
         "show_all_drivers": False,
         "volumes": {
@@ -275,6 +287,18 @@ def load() -> dict:
     if int(cfg.get("settings_version", 1) or 1) < 5:
         cfg.setdefault("audio", {})["tx_delay_ms"] = 0
         cfg["settings_version"] = 5
+    # 0.6: у синтезатора появились выбор звука, динамика, педаль и
+    # огибающая. Прежний флажок «всегда полная громкость» переезжает в
+    # выбор динамики, чтобы человеку не пришлось настраивать заново.
+    if int(cfg.get("settings_version", 1) or 1) < 6:
+        audio_cfg = cfg.setdefault("audio", {})
+        # Ключ из старых настроек доживает до сюда только если он был в
+        # файле: в новых умолчаниях его уже нет. Свежая установка его не
+        # имеет и получает «с динамикой» из DEFAULTS.
+        if "midi_fixed_velocity" in audio_cfg:
+            audio_cfg["midi_dynamics"] = (
+                "fixed" if audio_cfg.pop("midi_fixed_velocity") else "velocity")
+        cfg["settings_version"] = 6
     return cfg
 
 
