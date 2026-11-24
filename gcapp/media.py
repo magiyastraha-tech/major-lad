@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from .config import data_dir
+from .history import safe_name
 
 SAMPLE_RATE = 48000
 # Длиннее этого трек не открываем: весь файл держится в памяти ради
@@ -33,43 +34,101 @@ def media_dir() -> Path:
     return path
 
 
-def list_tracks() -> list[Path]:
+def student_dir(student: str) -> Path:
+    """Личная папка ученика внутри Media: Data/Media/<имя ученика>.
+
+    Так же, как история переписки: общая папка Media видна всем ученикам,
+    а у каждого есть своя — треки из неё получает только этот ученик.
+    """
+    path = media_dir() / safe_name(student)
     try:
-        files = [p for p in media_dir().iterdir()
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def student_folders() -> list[str]:
+    """Имена личных папок, которые уже есть в Media."""
+    try:
+        names = [p.name for p in media_dir().iterdir() if p.is_dir()]
+    except OSError:
+        return []
+    return sorted(names, key=str.lower)
+
+
+def _tracks_in(base: Path) -> list[Path]:
+    try:
+        files = [p for p in base.iterdir()
                  if p.is_file() and p.suffix.lower() in SUPPORTED]
     except OSError:
         return []
     return sorted(files, key=lambda p: p.name.lower())
 
 
-def add_track(source: str | Path) -> Path:
-    """Копирует файл в Media. Одноимённый файл не затирается."""
+def list_tracks(folder: str = "") -> list[Path]:
+    """Треки в общей папке Media или в личной папке ученика."""
+    return _tracks_in(student_dir(folder) if folder else media_dir())
+
+
+def list_all() -> list[tuple[Path, str]]:
+    """Все треки преподавателя: путь и чья это папка.
+
+    Пустая строка — общий трек, его видят все ученики. Иначе — имя
+    ученика, которому принадлежит личный трек.
+    """
+    items: list[tuple[Path, str]] = [(p, "") for p in list_tracks()]
+    for folder in student_folders():
+        items.extend((p, folder) for p in list_tracks(folder))
+    return items
+
+
+def tracks_for(student: str) -> list[Path]:
+    """Что видит конкретный ученик: общие треки и свои личные.
+
+    Чужие личные папки сюда не попадают — ни в списке, ни по запросу.
+    """
+    return list_tracks() + list_tracks(safe_name(student))
+
+
+def add_track(source: str | Path, folder: str = "") -> Path:
+    """Копирует файл в Media. Одноимённый файл не затирается.
+
+    folder — имя ученика: файл ляжет в его личную папку и другим
+    ученикам виден не будет. Без папки — общий трек.
+    """
     source = Path(source)
-    target = media_dir() / source.name
+    base = student_dir(folder) if folder else media_dir()
+    target = base / source.name
     if target.exists() and target.resolve() != source.resolve():
         stem, suffix = target.stem, target.suffix
         i = 1
         while target.exists():
-            target = media_dir() / f"{stem} ({i}){suffix}"
+            target = base / f"{stem} ({i}){suffix}"
             i += 1
     if target.resolve() != source.resolve():
         shutil.copy2(source, target)
     return target
 
 
-def import_track(name: str, data: bytes) -> Path:
-    """Сохраняет трек, пришедший от собеседника, в свою папку Media."""
+def import_track(name: str, data: bytes, folder: str = "") -> Path:
+    """Сохраняет трек, пришедший от собеседника, в свою папку Media.
+
+    folder — куда класть: трек, присланный учеником, у преподавателя
+    сохраняется в папку этого ученика, а не в общую.
+    """
     name = Path(str(name or "")).name
     if not name:
         name = "трек.mp3"
     if Path(name).suffix.lower() not in SUPPORTED:
         name += ".mp3"
-    target = media_dir() / name
+    base = student_dir(folder) if folder else media_dir()
+    target = base / name
     if target.exists():
         stem, suffix = target.stem, target.suffix
         i = 1
         while target.exists():
-            target = media_dir() / f"{stem} ({i}){suffix}"
+            target = base / f"{stem} ({i}){suffix}"
             i += 1
     target.write_bytes(data)
     return target

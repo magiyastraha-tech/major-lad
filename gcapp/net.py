@@ -500,10 +500,11 @@ class _Session:
                     break
                 if msg.get("media"):
                     # Ответ на запрос преподавателя: трек из папки Media
-                    # ученика кладём в свою Media, а не в принятые файлы.
+                    # ученика кладём в личную папку этого ученика, а не в
+                    # общую Media: другим ученикам он виден не будет.
                     try:
                         path = media.import_track(str(msg.get("name") or ""),
-                                                  data)
+                                                  data, folder=self.name)
                     except OSError as exc:
                         self.server.on_status(
                             f"Не удалось сохранить трек: {exc}")
@@ -528,9 +529,10 @@ class _Session:
                     self.server.on_media_list(list(msg.get("tracks") or []))
                 else:
                     # Ученик просит список треков из папки Media
-                    # преподавателя.
+                    # преподавателя. Отдаём общие треки и его личные:
+                    # чужую личную папку он не видит.
                     tracks = []
-                    for p in media.list_tracks():
+                    for p in media.tracks_for(self.name):
                         try:
                             tracks.append({"name": p.name,
                                            "size": p.stat().st_size})
@@ -541,8 +543,8 @@ class _Session:
                 # Ученик выбрал трек — отдаём его файлом, чтобы он лёг
                 # в его собственную папку Media.
                 name = str(msg.get("name") or "")
-                path = next((p for p in media.list_tracks() if p.name == name),
-                            None)
+                path = next((p for p in media.tracks_for(self.name)
+                             if p.name == name), None)
                 if path is None:
                     self.send_json({"type": "media_error",
                                     "text": "Трек не найден."})

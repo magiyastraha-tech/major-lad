@@ -3281,13 +3281,17 @@ class MainWindow(QMainWindow):
 
     def _refresh_tracks(self, select: str | None = None) -> list[str]:
         """Перечитывает папку Media и прячет кнопки, если треков нет."""
-        tracks = media.list_tracks()
+        items = media.list_all()
+        tracks = [path for path, _ in items]
         wanted = select or self._selected_track() or str(
             (self.cfg.get("player") or {}).get("last", ""))
         self.track_combo.blockSignals(True)
         self.track_combo.clear()
-        for path in tracks:
-            self.track_combo.addItem(path.name, str(path))
+        for path, folder in items:
+            # Личный трек подписан именем ученика: иначе два «гамма.mp3»
+            # из разных папок звучали бы для диктора одинаково.
+            label = f"{folder}: {path.name}" if folder else path.name
+            self.track_combo.addItem(label, str(path))
         index = self.track_combo.findData(wanted)
         if index < 0 and tracks:
             index = 0
@@ -3319,17 +3323,37 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
         self._update_player_buttons()
 
+    def _ask_media_folder(self) -> str | None:
+        """Спрашивает, кому виден добавляемый трек. None — отменили."""
+        common = "Всем ученикам — общая папка"
+        options = [common] + media.student_folders() + ["Новый ученик…"]
+        choice, ok = QInputDialog.getItem(
+            self, "Кому виден трек", "Трек увидят:", options, 0, False)
+        if not ok or not choice:
+            return None
+        if choice == common:
+            return ""
+        if choice == options[-1]:
+            name, ok = QInputDialog.getText(
+                self, "Новый ученик", "Имя ученика:")
+            name = str(name or "").strip()
+            return name or None
+        return choice
+
     def _add_track(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Добавить трек", str(media.media_dir()),
             "Аудио (*.mp3 *.wav *.flac *.ogg)")
         if not paths:
             return
+        folder = self._ask_media_folder()
+        if folder is None:
+            return
         added: list[Path] = []
         errors: list[str] = []
         for path in paths:
             try:
-                added.append(media.add_track(path))
+                added.append(media.add_track(path, folder))
             except Exception as exc:
                 errors.append(f"{Path(path).name}: {exc}")
         if not added:
@@ -3337,9 +3361,10 @@ class MainWindow(QMainWindow):
             return
         appeared = self._refresh_tracks(select=str(added[-1]))
         last = added[-1].name
+        who = (f"в личной папке ученика {folder}" if folder
+               else "в общей папке Data\\Media")
         if len(added) == 1:
-            text = (f"Трек добавлен: {last}. "
-                    "Он лежит в папке Data\\Media рядом с программой.")
+            text = f"Трек добавлен: {last}, {who}."
         else:
             text = f"Добавлено треков: {len(added)}. Выбран последний: {last}."
         if "player" in appeared:
@@ -4006,15 +4031,19 @@ class MainWindow(QMainWindow):
             return
         announce(self.chat_list, f"Скачивание файла {name} началось.")
         self._set_status(f"Скачиваю файл: {name}.")
+        # Файл из переписки с учеником кладём в его личную папку Media:
+        # остальным ученикам он виден не будет.
+        folder = self._history_student_name() if self.is_teacher else ""
         try:
-            target = media.add_track(path)
+            target = media.add_track(path, folder)
         except OSError as exc:
             text = f"Не удалось скачать файл {name}: {exc}"
             self._set_status(text)
             announce(self.chat_list, text)
             return
         self._refresh_tracks(select=str(target))
-        text = f"Файл скачан в папку Media: {target.name}."
+        text = (f"Файл скачан в папку Media ученика {folder}: {target.name}."
+                if folder else f"Файл скачан в папку Media: {target.name}.")
         self._set_status(text)
         announce(self.chat_list, text)
 
