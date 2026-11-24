@@ -84,11 +84,12 @@ def list_all() -> list[tuple[Path, str]]:
 
 
 def tracks_for(student: str) -> list[Path]:
-    """Что видит конкретный ученик: общие треки и свои личные.
+    """Что видит конкретный ученик: только треки из его личной папки.
 
-    Чужие личные папки сюда не попадают — ни в списке, ни по запросу.
+    Корень Media — папка преподавателя, ученикам он не показывается;
+    чужие личные папки тоже. Ни в списке, ни по прямому запросу.
     """
-    return list_tracks() + list_tracks(safe_name(student))
+    return list_tracks(safe_name(student))
 
 
 def add_track(source: str | Path, folder: str = "") -> Path:

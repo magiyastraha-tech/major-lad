@@ -463,6 +463,11 @@ class _Session:
             if self._closed:
                 return
 
+        # Личная папка Media создаётся сама, как только ученик вошёл в
+        # кабинет: преподавателю не надо заводить её руками, а трек,
+        # добавленный «в папку ученика», сразу ляжет куда нужно.
+        media.student_dir(self.name)
+
         self._chat_loop()
 
     def _chat_loop(self) -> None:
@@ -529,8 +534,8 @@ class _Session:
                     self.server.on_media_list(list(msg.get("tracks") or []))
                 else:
                     # Ученик просит список треков из папки Media
-                    # преподавателя. Отдаём общие треки и его личные:
-                    # чужую личную папку он не видит.
+                    # преподавателя. Отдаём только его личную папку:
+                    # ни корень Media, ни чужие папки он не видит.
                     tracks = []
                     for p in media.tracks_for(self.name):
                         try:

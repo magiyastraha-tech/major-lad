@@ -3323,12 +3323,46 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
         self._update_player_buttons()
 
+    def _student_names(self) -> list[str]:
+        """Ученики, которых преподаватель уже видел на уроках.
+
+        Имена собираются из трёх мест: личные папки Media, настройки
+        громкости и история переписки. Так в «Добавить трек» есть из
+        кого выбрать, даже если папка ещё не создавалась.
+        """
+        names: dict[str, str] = {}
+        for name in media.student_folders():
+            names.setdefault(name.lower(), name)
+        try:
+            for path in students.settings_dir().glob("*.json"):
+                names.setdefault(path.stem.lower(), path.stem)
+        except OSError:
+            pass
+        try:
+            for path in history.history_dir().glob("*.txt"):
+                names.setdefault(path.stem.lower(), path.stem)
+        except OSError:
+            pass
+        return sorted(names.values(), key=str.lower)
+
     def _ask_media_folder(self) -> str | None:
         """Спрашивает, кому виден добавляемый трек. None — отменили."""
-        common = "Всем ученикам — общая папка"
-        options = [common] + media.student_folders() + ["Новый ученик…"]
+        common = "Только мне — корень Media"
+        names = self._student_names()
+        active = self._history_student_name()
+        if active and active.lower() not in {n.lower() for n in names}:
+            names.insert(0, active)
+        options = [common] + names + ["Новый ученик…"]
+        # На уроке список открывается на том, кто сейчас в кабинете:
+        # чаще всего трек адресован именно ему.
+        start = 0
+        if active:
+            for i, name in enumerate(options):
+                if name.lower() == active.lower():
+                    start = i
+                    break
         choice, ok = QInputDialog.getItem(
-            self, "Кому виден трек", "Трек увидят:", options, 0, False)
+            self, "Кому виден трек", "Трек увидят:", options, start, False)
         if not ok or not choice:
             return None
         if choice == common:
@@ -3362,7 +3396,7 @@ class MainWindow(QMainWindow):
         appeared = self._refresh_tracks(select=str(added[-1]))
         last = added[-1].name
         who = (f"в личной папке ученика {folder}" if folder
-               else "в общей папке Data\\Media")
+               else "в корне Media — ученикам он не виден")
         if len(added) == 1:
             text = f"Трек добавлен: {last}, {who}."
         else:
