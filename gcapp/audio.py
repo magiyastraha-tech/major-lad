@@ -1411,7 +1411,14 @@ class AudioEngine:
         self._peer = None
         self._server_addr = None
         self._is_server = False
-        self._send_q: queue.Queue = queue.Queue(maxsize=4)
+        # Очередь держит готовые кадры звука по 10 мс, восемь штук — запас
+        # на 80 мс. Кладутся они целыми кадрами (см. _out_callback_inner),
+        # поэтому частота общения с очередью — сто раз в секунду при любом
+        # размере блока драйвера.
+        self._send_q: queue.Queue = queue.Queue(maxsize=8)
+        # Накопитель неполного кадра: мелкие блоки карты складываются здесь.
+        self._tx_pend = bytearray()
+        self._tx_pend_stereo = False
         self._seq = 0
         self._running = False
         # Поколение запуска. Каждый поток запоминает своё и выходит, как
@@ -1514,7 +1521,8 @@ class AudioEngine:
         # Новое поколение потоков и свежая очередь: старые потоки выйдут
         # сами, а их неотправленные пакеты не попадут в новый поток.
         self._generation += 1
-        self._send_q = queue.Queue(maxsize=4)
+        self._send_q = queue.Queue(maxsize=8)
+        self._tx_pend = bytearray()
         self._start_args = dict(
             is_server=is_server, server_addr=server_addr,
             devices=dict(devices or {}), modes=dict(modes or {}),
@@ -2054,6 +2062,7 @@ class AudioEngine:
                 self._send_q.get_nowait()
             except queue.Empty:
                 break
+        self._tx_pend.clear()
 
     # -- громкость ----------------------------------------------------------
 
@@ -2466,10 +2475,28 @@ class AudioEngine:
             mix = 0.5 * (mix_l + mix_r)
             pcm = (np.clip(mix, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
             packet_data = (False, pcm)
-        try:
-            self._send_q.put_nowait(packet_data)
-        except queue.Full:
-            self._tx_dropped += 1
+        # Копим целый кадр здесь, у карты, а не в потоке отправки. На блоке
+        # 32 отсчёта карта зовёт этот колбэк до 1500 раз в секунду; клади в
+        # очередь каждый такой кусочек — и поток отправки сто пятьдесят раз
+        # в секунду спорит за неё, а когда на миг отстаёт, лишние куски
+        # выбрасываются. Себе это не слышно (мониторинг идёт через карту),
+        # а собеседник слышит прерывания. Теперь в очередь уходят целые
+        # кадры по 10 мс — сто штук в секунду, как на любом другом блоке.
+        stereo, pcm = packet_data
+        if self._tx_pend_stereo != stereo:
+            # Стерео и моно не смешиваются: недособранный кадр другого
+            # формата — это потеря не больше 10 мс при переключении.
+            self._tx_pend = bytearray()
+            self._tx_pend_stereo = stereo
+        self._tx_pend.extend(pcm)
+        unit = BLOCK * (4 if stereo else 2)
+        while len(self._tx_pend) >= unit:
+            chunk = bytes(self._tx_pend[:unit])
+            del self._tx_pend[:unit]
+            try:
+                self._send_q.put_nowait((stereo, chunk))
+            except queue.Full:
+                self._tx_dropped += 1
         # Запас приёма подстраивается по факту: провал буфера — добавляем,
         # десять секунд чисто — потихоньку отпускаем.
         self._adapt_recv(frames)
