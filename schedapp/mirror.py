@@ -10,7 +10,8 @@
 
 - `Students` — по файлу на ученика, имя файла — имя ученика;
 - `Проведённые уроки.txt` — прошедшие уроки, новые сверху;
-- `расписание.txt` — уроки на месяц вперёд от сегодняшнего дня.
+- `расписание.txt` — уроки на месяц вперёд от сегодняшнего дня;
+- `Исключения.txt` — дни и часы, когда уроков нет.
 """
 from __future__ import annotations
 
@@ -22,10 +23,12 @@ from . import dates
 STUDENTS_DIR = "Students"
 DONE_FILE = "Проведённые уроки.txt"
 SCHEDULE_FILE = "расписание.txt"
+BLOCKS_FILE = "Исключения.txt"
 
 STUDENT_HEADER = "Мажорный лад Расписание. Данные ученика."
 DONE_HEADER = "Проведённые уроки. Новые сверху."
 SCHEDULE_HEADER = "Расписание уроков."
+BLOCKS_HEADER = "Исключения: дни и часы, когда уроков нет."
 NOTE = "Файл собран программой. Правки здесь не сохраняются — меняй данные в программе."
 
 DONE_STATUS = "проведён"
@@ -244,6 +247,27 @@ def _schedule_lines(store, today: date) -> list[str]:
     return lines
 
 
+# --- исключения ----------------------------------------------------------
+
+
+def _blocks_lines(store, today: date) -> list[str]:
+    lines = [BLOCKS_HEADER, NOTE, ""]
+    blocks = store.blocks_between(today, date.max)
+    if not blocks:
+        lines.append("Исключений нет: записаться можно на любой день.")
+        return lines
+    for block in blocks:
+        when = dates.human_date(block.day)
+        if block.all_day:
+            when += ": весь день без уроков"
+        else:
+            when += f": с {block.start} до {block.end}"
+        if block.note:
+            when += f". Причина: {block.note}"
+        lines.append(when + ".")
+    return lines
+
+
 # --- наружу --------------------------------------------------------------
 
 
@@ -251,6 +275,8 @@ def refresh(store, today: date | None = None) -> None:
     """Пересобрать все читаемые файлы. Ошибки ввода-вывода — на совести
     вызывающего: база важнее, её сбой прерывать нельзя."""
     folder = Path(store.folder)
+    today = today or date.today()
     _student_files(store)
     _write(folder / DONE_FILE, _done_lines(store))
-    _write(folder / SCHEDULE_FILE, _schedule_lines(store, today or date.today()))
+    _write(folder / SCHEDULE_FILE, _schedule_lines(store, today))
+    _write(folder / BLOCKS_FILE, _blocks_lines(store, today))

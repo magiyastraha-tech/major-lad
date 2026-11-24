@@ -36,7 +36,7 @@ ARCHIVE_DIR = "Архив старой версии"
 # Выгруженные абонементы лежат отдельной папкой внутри `Data`.
 SUBS_DIR = "Абонементы"
 BACKUP_KEEP = 14
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Старые текстовые файлы: из них переносим данные при первом запуске.
 STUDENTS_FILE = "Ученики.txt"
@@ -99,6 +99,13 @@ CREATE TABLE IF NOT EXISTS payments (
     student TEXT NOT NULL,
     what TEXT NOT NULL DEFAULT '',
     amount INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS blocks (
+    uid INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    time_from TEXT NOT NULL DEFAULT '',
+    time_to TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -195,6 +202,25 @@ class Payment:
     amount: int
 
 
+@dataclass
+class Block:
+    """Исключение: день или часы, когда уроков нет.
+
+    Пустые `start` и `end` — закрыт весь день. Причина (`note`) нужна
+    только преподавателю: ученику программа скажет просто, что это время
+    занято.
+    """
+    uid: int
+    day: date
+    start: str = ""
+    end: str = ""
+    note: str = ""
+
+    @property
+    def all_day(self) -> bool:
+        return not self.start or not self.end
+
+
 def _read_rows(path: Path) -> list[list[str]]:
     """Строки старого текстового файла, разбитые на поля.
 
@@ -226,6 +252,12 @@ def _int(text, default: int = 0) -> int:
 def money(amount: int) -> str:
     """«1 200» — так диктору и глазам проще, чем «1200»."""
     return f"{int(amount):,}".replace(",", " ")
+
+
+def minutes(time: str) -> int:
+    """«13:30» → 810. Пустая строка или мусор — 0."""
+    hour, minute = dates.parse_time(time) or (0, 0)
+    return hour * 60 + minute
 
 
 def plural(count: int, one: str, few: str, many: str) -> str:
@@ -288,6 +320,7 @@ class Store:
         self.subscriptions: list[Subscription] = []
         self.lessons: list[Lesson] = []
         self.payments: list[Payment] = []
+        self.blocks: list[Block] = []
 
         self._db_path = self.folder / DB_FILE
         migrated = not self._db_path.exists()
@@ -365,6 +398,15 @@ class Store:
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
                 (str(SCHEMA_VERSION),))
+
+    def ensure_schema(self) -> None:
+        """Создать недостающие таблицы в уже открытой базе.
+
+        Нужна после взятия копии из облака: там база может быть от
+        прежней версии, без новых таблиц, — а `load()` читает их все.
+        """
+        with self._conn:
+            self._conn.executescript(_SCHEMA)
 
     def _refresh_files(self) -> None:
         """Пересобрать читаемые файлы рядом с базой.
@@ -498,6 +540,15 @@ class Store:
             self.payments.append(Payment(
                 uid=row["uid"], day=day, student=row["student"],
                 what=row["what"], amount=_int(row["amount"])))
+
+        self.blocks = []
+        for row in self._conn.execute("SELECT * FROM blocks ORDER BY uid"):
+            day = dates.parse_date(row["day"])
+            if day is None:
+                continue
+            self.blocks.append(Block(
+                uid=row["uid"], day=day, start=row["time_from"],
+                end=row["time_to"], note=row["note"]))
 
     # --- перенос старых txt ----------------------------------------------
 
@@ -641,6 +692,12 @@ class Store:
                       p.amount) for p in self.payments])
         self._refresh_files()
 
+    def save_blocks(self) -> None:
+        self._write("blocks", ("uid", "day", "time_from", "time_to", "note"),
+                    [(b.uid, dates.fmt_date(b.day), b.start, b.end, b.note)
+                     for b in self.blocks])
+        self._refresh_files()
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -697,6 +754,17 @@ class Store:
         for payment in sorted(self.payments, key=lambda p: (p.day, p.uid)):
             lines.append(f"{dates.fmt_date(payment.day)}, {payment.student}, "
                          f"{payment.what}, {money(payment.amount)} рублей.")
+        lines.append("")
+        lines.append(f"Исключения: {len(self.blocks)}.")
+        for block in sorted(self.blocks, key=lambda b: (b.day, b.start)):
+            when = dates.fmt_date(block.day)
+            if block.all_day:
+                when += ", весь день"
+            else:
+                when += f", с {block.start} до {block.end}"
+            if block.note:
+                when += f", причина: {block.note}"
+            lines.append(when + ".")
         lines.append("")
         today = date.today()
         month = dates.MONTHS_NOM[today.month - 1]
@@ -1325,6 +1393,61 @@ class Store:
         """Убрать оплату из журнала совсем."""
         self.payments = [p for p in self.payments if p.uid != payment.uid]
         self.save_payments()
+
+    # --- исключения ------------------------------------------------------
+
+    def add_block(self, day: date, start: str = "", end: str = "",
+                  note: str = "") -> Block:
+        """Закрыть день целиком или промежуток «с … до …»."""
+        block = Block(uid=self._next_uid(self.blocks), day=day,
+                      start=start, end=end, note=note)
+        self.blocks.append(block)
+        self.save_blocks()
+        return block
+
+    def delete_block(self, block: Block) -> None:
+        """Убрать исключение: запись снова открыта."""
+        self.blocks = [b for b in self.blocks if b.uid != block.uid]
+        self.save_blocks()
+
+    def blocks_between(self, start: date, end: date) -> list[Block]:
+        """Исключения за период, по порядку дней и часов."""
+        return sorted((b for b in self.blocks if start <= b.day <= end),
+                      key=lambda b: (b.day, b.start))
+
+    def overlapping_block(self, day: date, start: str = "",
+                          end: str = "") -> Block | None:
+        """Уже стоящее исключение, которое накроет это.
+
+        Для целого дня — любое исключение на этот день (и на весь день,
+        и на часы: ставить «весь день» поверх них бессмысленно, но
+        безвредно, поэтому запрещаем только когда день уже закрыт
+        целиком). Для промежутка — то, что пересекается с ним по часам.
+        """
+        for block in self.blocks:
+            if block.day != day:
+                continue
+            if block.all_day:
+                return block
+            if not start or not end:
+                continue
+            if minutes(start) < minutes(block.end) and \
+                    minutes(block.start) < minutes(end):
+                return block
+        return None
+
+    def is_blocked(self, day: date, time: str = "") -> Block | None:
+        """Закрыт ли этот день или час — пригодится боту записи."""
+        for block in self.blocks:
+            if block.day != day:
+                continue
+            if block.all_day:
+                return block
+            if not time:
+                continue
+            if minutes(block.start) <= minutes(time) < minutes(block.end):
+                return block
+        return None
 
     def earnings_in_month(self, year: int, month: int) -> dict[str, int]:
         """Из чего сложился заработок месяца.

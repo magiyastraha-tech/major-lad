@@ -1172,6 +1172,89 @@ class LessonEditDialog(QDialog):
         self.accept()
 
 
+class BlockDialog(QDialog):
+    """Исключение: целый день без уроков или промежуток «с … до …».
+
+    Причина необязательна и остаётся у преподавателя: ученику программа
+    скажет только то, что это время занято.
+    """
+
+    def __init__(self, whole_day: bool, parent=None):
+        super().__init__(parent)
+        self.whole_day = whole_day
+        self.day: date = date.today()
+        self.start = ""
+        self.end = ""
+        self.note = ""
+        self.setWindowTitle("Добавить день" if whole_day else "Добавить время")
+        self.setMinimumWidth(460)
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.day_edit = make_date_edit("Дата исключения")
+        form.addRow("Дата", self.day_edit)
+        if whole_day:
+            hint = QLabel("Весь этот день уроков не будет.")
+            hint.setWordWrap(True)
+            lay.addWidget(hint)
+        else:
+            self.from_hour, self.from_minute = self._time_row(
+                form, "С какого времени", "Час начала", "Минуты начала",
+                12, 0)
+            self.to_hour, self.to_minute = self._time_row(
+                form, "До какого времени", "Час окончания",
+                "Минуты окончания", 16, 0)
+        self.note_edit = QLineEdit()
+        self.note_edit.setAccessibleName(
+            "Причина для себя. Ученик её не увидит")
+        form.addRow("Причина (необязательно)", self.note_edit)
+        lay.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Добавить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _time_row(self, form: QFormLayout, title: str, hour_name: str,
+                  minute_name: str, hour: int, minute: int
+                  ) -> tuple[QSpinBox, QSpinBox]:
+        """Часы и минуты одной строкой — как в форме урока."""
+        row = QHBoxLayout()
+        hour_edit = QSpinBox()
+        hour_edit.setRange(0, 23)
+        hour_edit.setValue(hour)
+        hour_edit.setAccessibleName(hour_name)
+        row.addWidget(hour_edit)
+        row.addWidget(QLabel("часов"))
+        minute_edit = QSpinBox()
+        minute_edit.setRange(0, 59)
+        minute_edit.setSingleStep(5)
+        minute_edit.setValue(minute)
+        minute_edit.setAccessibleName(minute_name)
+        row.addWidget(minute_edit)
+        row.addWidget(QLabel("минут"))
+        form.addRow(title, row)
+        return hour_edit, minute_edit
+
+    def _save(self) -> None:
+        self.day = picked_date(self.day_edit)
+        self.note = self.note_edit.text().strip()
+        if not self.whole_day:
+            self.start = dates.fmt_time(self.from_hour.value(),
+                                        self.from_minute.value())
+            self.end = dates.fmt_time(self.to_hour.value(),
+                                      self.to_minute.value())
+            if data.minutes(self.end) <= data.minutes(self.start):
+                announce(self, "Конец должен быть позже начала.",
+                         assertive=True)
+                return
+        self.accept()
+
+
 class StudentCard(QDialog):
     """Карточка ученика: действующий абонемент и законченные в двух вкладках."""
 
@@ -2364,6 +2447,9 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         self.tabs.addTab(page, "Расписание")
 
+        # --- вкладка исключений: когда уроков нет вовсе
+        self._blocks_tab()
+
         # --- вкладка уведомлений: всё, что ещё не подтверждено
         self._notifications_tab()
 
@@ -3464,6 +3550,7 @@ class MainWindow(QMainWindow):
     def refresh_all(self) -> None:
         self.refresh_students()
         self.refresh_schedule()
+        self.refresh_blocks()
         self.refresh_subscriptions()
         self.refresh_services()
         self.refresh_notifications()
@@ -3560,6 +3647,13 @@ class MainWindow(QMainWindow):
             "удалить услугу. Двойной щелчок открывает карточку ученика. "
             "За три дня и за день до конца аренды гитары или гарантии на "
             "настройку программа напомнит об этом вслух.")
+        self.blocks_hint.setText(
+            "Дни и часы, когда уроков нет: уехал, заболел, день рождения. "
+            "«Добавить день» закрывает день целиком, «Добавить время» — "
+            "промежуток, например с 12:00 до 16:00. Записаться на это "
+            "время будет нельзя, а причину ученик не увидит. Кнопка "
+            "«Удалить исключение» убирает выбранную запись из списка. "
+            "Стрелки вверх и вниз — переход по списку.")
         card_keys = norm_keys(self.bindings.get("card", ""))
         self.card_button.setText(
             f"Карточка ученика ({card_keys})" if card_keys
@@ -3977,6 +4071,112 @@ class MainWindow(QMainWindow):
             path.write_text("\n".join(keys) + "\n", encoding="utf-8")
         except OSError:
             pass
+
+    # --- исключения ------------------------------------------------------
+
+    def _blocks_tab(self) -> None:
+        """Вкладка исключений: дни и часы, когда уроков нет."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        self.blocks_hint = QLabel()
+        self.blocks_hint.setWordWrap(True)
+        lay.addWidget(self.blocks_hint)
+        self.blocks_list = QListWidget()
+        self.blocks_list.setAccessibleName(
+            "Исключения: дни и часы, когда уроков нет")
+        lay.addWidget(self.blocks_list, 1)
+
+        row = QHBoxLayout()
+        self.block_day_button = QPushButton("Добавить день")
+        self.block_day_button.setAccessibleName(
+            "Добавить день, в который уроков не будет")
+        self.block_day_button.clicked.connect(
+            lambda _checked=False: self.add_block_day())
+        row.addWidget(self.block_day_button)
+        self.block_time_button = QPushButton("Добавить время")
+        self.block_time_button.setAccessibleName(
+            "Добавить промежуток времени, в который уроков не будет")
+        self.block_time_button.clicked.connect(
+            lambda _checked=False: self.add_block_time())
+        row.addWidget(self.block_time_button)
+        self.block_remove_button = QPushButton("Удалить исключение")
+        self.block_remove_button.setAccessibleName(
+            "Удалить выбранное исключение — записаться снова станет можно")
+        self.block_remove_button.clicked.connect(
+            lambda _checked=False: self.remove_block())
+        row.addWidget(self.block_remove_button)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.blocks_page = page
+        self.tabs.addTab(page, "Исключения")
+
+    def block_line(self, block: data.Block) -> str:
+        text = dates.human_date(block.day)
+        if block.all_day:
+            text += " — весь день без уроков"
+        else:
+            text += f", с {block.start} до {block.end}"
+        if block.note:
+            text += f". Причина: {block.note}"
+        return text + "."
+
+    def refresh_blocks(self) -> None:
+        """Список исключений: с сегодняшнего дня и дальше."""
+        self.blocks_list.clear()
+        for block in self.store.blocks_between(date.today(), date.max):
+            item = QListWidgetItem(self.block_line(block))
+            item.setData(Qt.ItemDataRole.UserRole, block.uid)
+            self.blocks_list.addItem(item)
+
+    def selected_block(self) -> data.Block | None:
+        item = self.blocks_list.currentItem()
+        if item is None:
+            return None
+        uid = item.data(Qt.ItemDataRole.UserRole)
+        for block in self.store.blocks:
+            if block.uid == uid:
+                return block
+        return None
+
+    def add_block_day(self) -> None:
+        dialog = BlockDialog(whole_day=True, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self.store.overlapping_block(dialog.day) is not None:
+            announce(self, "На этот день исключение уже стоит.",
+                     assertive=True)
+            return
+        block = self.store.add_block(dialog.day, note=dialog.note)
+        self.refresh_blocks()
+        announce(self, f"День закрыт: {dates.human_date(block.day)}. "
+                       "Записаться на него нельзя.")
+
+    def add_block_time(self) -> None:
+        dialog = BlockDialog(whole_day=False, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self.store.overlapping_block(dialog.day, dialog.start,
+                                        dialog.end) is not None:
+            announce(self, "Это время уже закрыто исключением.",
+                     assertive=True)
+            return
+        block = self.store.add_block(dialog.day, dialog.start, dialog.end,
+                                     dialog.note)
+        self.refresh_blocks()
+        announce(self, f"Закрыто {dates.human_date(block.day)}, с "
+                       f"{block.start} до {block.end}. Записаться на это "
+                       "время нельзя.")
+
+    def remove_block(self) -> None:
+        block = self.selected_block()
+        if block is None:
+            announce(self, "Сначала выбери исключение в списке.",
+                     assertive=True)
+            return
+        self.store.delete_block(block)
+        self.refresh_blocks()
+        announce(self, "Исключение убрано: записаться снова можно.")
 
     def _notifications_tab(self) -> None:
         """Вкладка со всем, что ещё не подтверждено."""

@@ -275,6 +275,13 @@ def restore(store, folder: Path) -> str:
     finally:
         source.close()
 
+    # Копия могла быть сделана прежней версией, без новых таблиц.
+    # Дочитываем схему до `load()`: он читает все таблицы разом.
+    try:
+        store.ensure_schema()
+    except sqlite3.Error as error:
+        raise SyncError(f"Копия от прежней версии не подошла: {error}") from error
+
     store.load()
     store.recount_used()
     store._refresh_files()
