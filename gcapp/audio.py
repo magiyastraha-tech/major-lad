@@ -1217,6 +1217,11 @@ def device_name(index: int) -> str:
         return str(index)
 
 
+def _ms_text(value: float | None) -> str:
+    """Задержка в миллисекундах для журнала. None — «неизвестна»."""
+    return f"{value * 1000:.0f} мс" if value is not None else "неизвестна"
+
+
 def _stream_latency(stream, direction: str = "out") -> float | None:
     """Задержка потока в секундах. У дуплексного потока она приходит парой.
 
@@ -1407,6 +1412,10 @@ class AudioEngine:
         # на сколько музыкант слышит клик позже, чем тот родился.
         self._out_index = -1
         self._out_measured: float | None = None
+        # Какой блок карта отдаёт на самом деле: у ASIO размер буфера
+        # выбирает драйвер, а наш запрос — только пожелание.
+        self._cb_want = 0
+        self._cb_frames: int | None = None
         self._sock: socket.socket | None = None
         self._peer = None
         self._server_addr = None
@@ -1829,57 +1838,81 @@ class AudioEngine:
             extra = None
         _prewarm_hostapi([index])
         error: Exception | None = None
-        # Размер блока — просьба к драйверу: у ASIO он принадлежит карте,
-        # и Focusrite ставит ближайший допустимый (32 может стать 48).
-        # Сначала пробуем выбранный, потом «как даст драйвер».
-        sizes: list[int] = []
+        # Размер буфера ASIO задаётся не blocksize, а желаемой задержкой:
+        # PortAudio выбирает буфер карты из suggestedLatency, а blocksize
+        # только задаёт размер порции в обратном вызове. «Низкая» задержка
+        # считается от частоты устройства по умолчанию (обычно 44,1 кГц),
+        # а мы открываем на 48 кГц — карте доставался буфер на четверть
+        # больше, и он рос при каждом открытии (в журнале 23 → 31 мс).
+        # Просим ровно свой блок в секундах: тогда буфер карты совпадает
+        # с блоком. «По драйверу» — нулевая просьба: карта берёт свой
+        # привычный размер, без пересчёта частоты и без роста.
+        sizes: list[tuple[int, float]] = []
         for value in (int(block or 0), 0):
-            if value not in sizes:
-                sizes.append(value)
-        for size in sizes:
-            for latency_mode in ("low", None):
-                stream = None
-                try:
-                    stream = sd.Stream(
-                        device=index,
-                        channels=(left, right),
-                        samplerate=SAMPLE_RATE,
-                        blocksize=size,
-                        dtype="float32",
-                        latency=latency_mode,
-                        extra_settings=extra,
-                        callback=self._duplex_callback,
-                    )
-                    stream.start()
-                    self._out = stream
-                    self._duplex = stream
-                    self._out_channels = right
-                    self._out_index = index
-                    self._out_measured = None
-                    self._asio_in_channels = left
-                    self._asio_out_channels = right
-                    self._last_cb = time.monotonic()
-                    out_latency = _stream_latency(stream, "out")
-                    detail = (f", задержка {out_latency * 1000:.0f} мс"
-                              if out_latency is not None else "")
-                    where = f"блок {size}" if size else "блок по драйверу"
-                    self.log(f"ASIO открыт: {device_name(index)}, "
-                             f"вход {left} кан., выход {right} кан., "
-                             f"{where}{detail}")
-                    return True, ""
-                except Exception as exc:
-                    error = exc
-                    self.log(f"ASIO «{device_name(index)}» не открылся: {exc}")
-                    if stream is not None:
-                        try:
-                            stream.close()
-                        except Exception:
-                            pass
+            if all(value != want for want, _ in sizes):
+                sizes.append((value, value / SAMPLE_RATE if value else 0.0))
+        for size, suggested in sizes:
+            stream = None
+            try:
+                stream = sd.Stream(
+                    device=index,
+                    channels=(left, right),
+                    samplerate=SAMPLE_RATE,
+                    blocksize=size,
+                    dtype="float32",
+                    latency=suggested,
+                    extra_settings=extra,
+                    callback=self._duplex_callback,
+                )
+                self._cb_want = size
+                self._cb_frames = None
+                stream.start()
+                self._out = stream
+                self._duplex = stream
+                self._out_channels = right
+                self._out_index = index
+                self._out_measured = None
+                self._asio_in_channels = left
+                self._asio_out_channels = right
+                self._last_cb = time.monotonic()
+                where = f"блок {size}" if size else "блок по драйверу"
+                self.log(
+                    f"ASIO открыт: {device_name(index)}, "
+                    f"вход {left} кан., выход {right} кан., {where}, "
+                    f"задержка входа {_ms_text(_stream_latency(stream, 'in'))}, "
+                    f"выхода {_ms_text(_stream_latency(stream, 'out'))}")
+                return True, ""
+            except Exception as exc:
+                error = exc
+                self.log(f"ASIO «{device_name(index)}» не открылся: {exc}")
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
         return False, str(error)
 
     def _duplex_callback(self, indata, outdata, frames, time_info,
                          status) -> None:
         """Обратный вызов дуплексного ASIO-потока: вход и выход сразу."""
+        # Один раз за открытие пишем, каким блоком карта работает на самом
+        # деле: у ASIO наш blocksize — только просьба, и разница с ним
+        # объясняет задержку без всяких догадок.
+        if self._cb_frames is None:
+            self._cb_frames = frames
+            try:
+                if self._cb_want and frames != self._cb_want:
+                    self.log(f"Карта работает блоком {frames} отсчётов "
+                             f"вместо запрошенных {self._cb_want}")
+                else:
+                    self.log(f"Карта отдаёт блок {frames} отсчётов")
+                if frames > 256:
+                    self.log("Блок больше 256 отсчётов — это больше "
+                             "пяти миллисекунд одной только буферизации. "
+                             "Выберите в «Буфере драйвера» 32–96: "
+                             "если захрустит, шаг вверх.")
+            except Exception:
+                pass
         try:
             if status and getattr(status, "output_underflow", False):
                 self._out_underflow += 1
