@@ -1028,19 +1028,32 @@ class MainActivity : AppCompatActivity() {
      */
     private fun viewId(name: String): Int = resources.getIdentifier(name, "id", packageName)
 
+    /**
+     * Адрес телефона в вайфае. Берём именно Wi-Fi: у VPN, мобильной сети и
+     * виртуальных интерфейсов адрес свой, и ученик по нему до телефона не
+     * достучится. Если Wi-Fi не нашёлся — любой подходящий адрес, кроме
+     * заведомо чужих сетей.
+     */
     private fun ownWifiAddress(): String? {
+        var fallback: String? = null
         try {
             for (iface in NetworkInterface.getNetworkInterfaces()) {
                 if (!iface.isUp || iface.isLoopback) continue
+                val name = iface.name.lowercase()
+                if (name.startsWith("tun") || name.startsWith("ppp") ||
+                    name.startsWith("rmnet") || name.startsWith("clat")
+                ) continue
                 for (addr in iface.inetAddresses) {
-                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                    if (addr !is Inet4Address || addr.isLoopbackAddress) continue
+                    if (name.startsWith("wlan") || name.startsWith("wifi")) {
                         return addr.hostAddress
                     }
+                    if (fallback == null) fallback = addr.hostAddress
                 }
             }
         } catch (_: Exception) {
         }
-        return null
+        return fallback
     }
 
     // ---- список сообщений ----
