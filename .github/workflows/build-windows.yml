@@ -30,6 +30,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Проверки расчёта заработка. Живут в проекте, а не в голове:
+      # если подсчёт денег сломался, сборка падает и обновление не выходит.
+      - name: Check earnings
+        run: python tests/test_earnings.py
+
       # Opus собираем здесь же: готовых DLL для Windows никто не раздаёт.
       # Если сборка не удалась — программа всё равно соберётся и будет
       # слать звук без сжатия.
