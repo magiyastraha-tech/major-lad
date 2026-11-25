@@ -9,32 +9,47 @@
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:divider="#22222a"
+        android:divider="#1e1e26"
         android:dividerHeight="1dp"
-        android:padding="8dp" />
+        android:padding="6dp"
+        android:stackFromBottom="false"
+        android:transcriptMode="normal" />
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:gravity="bottom"
         android:orientation="horizontal"
         android:padding="8dp">
+
+        <Button
+            android:id="@+id/btnAttach"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:layout_marginEnd="6dp"
+            android:background="@drawable/bg_pic_off"
+            android:contentDescription="Прикрепить файл"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:text="📎"
+            android:textSize="22sp" />
 
         <EditText
             android:id="@+id/chatInput"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginEnd="8dp"
+            android:layout_marginEnd="6dp"
             android:layout_weight="1"
             android:hint="Сообщение"
             android:imeOptions="actionSend"
             android:importantForAutofill="no"
             android:inputType="textCapSentences|textMultiLine"
-            android:maxLines="3" />
+            android:maxLines="4" />
 
         <Button
             android:id="@+id/btnSend"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_height="52dp"
             android:text="Отправить" />
     </LinearLayout>
 

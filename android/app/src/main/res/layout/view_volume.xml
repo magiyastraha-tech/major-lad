@@ -1,61 +1,167 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="20dp">
+    android:fillViewport="true">
 
-    <TextView
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="Звук преподавателя"
-        android:textColor="#e6e6ef"
-        android:textSize="18sp" />
+        android:orientation="vertical"
+        android:padding="16dp">
 
-    <TextView
-        android:id="@+id/labelPlay"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="100%"
-        android:textColor="#b9b9c6" />
+        <Button
+            android:id="@+id/btnVolMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:minHeight="56dp"
+            android:text="Моя громкость"
+            android:textSize="17sp" />
 
-    <SeekBar
-        android:id="@+id/seekPlay"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:max="100"
-        android:progress="100" />
+        <LinearLayout
+            android:id="@+id/volLocal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="28dp"
-        android:text="Чувствительность микрофона"
-        android:textColor="#e6e6ef"
-        android:textSize="18sp" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="Звук собеседника"
+                android:textColor="#e6e6ef"
+                android:textSize="17sp" />
 
-    <TextView
-        android:id="@+id/labelMic"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="100%"
-        android:textColor="#b9b9c6" />
+            <TextView
+                android:id="@+id/labelPeer"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="90 процентов"
+                android:textColor="#b9b9c6" />
 
-    <SeekBar
-        android:id="@+id/seekMic"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:max="200"
-        android:progress="100" />
+            <SeekBar
+                android:id="@+id/seekPeer"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:contentDescription="Звук собеседника"
+                android:max="100"
+                android:progress="90" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="28dp"
-        android:text="Если преподаватель слышит вас тихо — поднимите чувствительность. Если слишком громко и с шумом — опустите."
-        android:textColor="#8f8f9c" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="Громкость трека"
+                android:textColor="#e6e6ef"
+                android:textSize="17sp" />
 
-</LinearLayout>
+            <TextView
+                android:id="@+id/labelTrack"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="80 процентов"
+                android:textColor="#b9b9c6" />
+
+            <SeekBar
+                android:id="@+id/seekTrackVol"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:contentDescription="Громкость трека"
+                android:max="100"
+                android:progress="80" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="Громкость метронома"
+                android:textColor="#e6e6ef"
+                android:textSize="17sp" />
+
+            <TextView
+                android:id="@+id/labelMetro"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="70 процентов"
+                android:textColor="#b9b9c6" />
+
+            <SeekBar
+                android:id="@+id/seekMetroVol"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:contentDescription="Громкость метронома"
+                android:max="100"
+                android:progress="70" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/volPeer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="Мой микрофон для собеседника"
+                android:textColor="#e6e6ef"
+                android:textSize="17sp" />
+
+            <TextView
+                android:id="@+id/labelOutMic"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="100 процентов"
+                android:textColor="#b9b9c6" />
+
+            <SeekBar
+                android:id="@+id/seekOutMic"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:contentDescription="Мой микрофон для собеседника"
+                android:max="200"
+                android:progress="100" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="Метроном для собеседника"
+                android:textColor="#e6e6ef"
+                android:textSize="17sp" />
+
+            <TextView
+                android:id="@+id/labelOutMetro"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="70 процентов"
+                android:textColor="#b9b9c6" />
+
+            <SeekBar
+                android:id="@+id/seekOutMetro"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:contentDescription="Метроном для собеседника"
+                android:max="100"
+                android:progress="70" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="Здесь настраивается то, что слышит собеседник. Громкость его динамиков меняет он сам."
+                android:textColor="#8f8f9c"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Если собеседник слышит вас тихо — поднимите громкость микрофона. Если слишком громко и с шумом — опустите."
+            android:textColor="#8f8f9c"
+            android:textSize="15sp" />
+    </LinearLayout>
+</ScrollView>

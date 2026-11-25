@@ -4,250 +4,283 @@ import android.graphics.Bitmap
 import android.os.Handler
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.InputStream
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.UUID
 
 /**
- * Клиент ученика: те же сообщения и то же кадрирование, что у программы
- * на компьютере — четыре байта длины и JSON в UTF-8.
+ * Ученик подключается к преподавателю: обмен сообщениями, файлами,
+ * видео и метрономом.
  */
 class NetClient(
     private val handler: Handler,
     private val myName: String,
+    private val host: String,
+    private val port: Int,
     private val onStatus: (String) -> Unit,
-    private val onChat: (String, String) -> Unit,
-    private val onHistory: (List<Triple<String, String, String>>) -> Unit,
+    private val onChat: (ChatMsg) -> Unit,
+    private val onHistory: (List<ChatMsg>) -> Unit,
     private val onJoined: (String) -> Unit,
     private val onEnded: (String) -> Unit,
     private val onVideoState: (Boolean) -> Unit,
     private val onFrame: (Bitmap) -> Unit,
+    private val onFile: (name: String, path: String, media: Boolean) -> Unit,
+    private val onMediaList: (List<Pair<String, Long>>) -> Unit,
+    private val onMediaError: (String) -> Unit,
+    private val onMetro: (on: Boolean, bpm: Int, beats: Int, hello: Boolean) -> Unit,
+    private val saveFile: (name: String, data: ByteArray, media: Boolean) -> String,
+    private val mediaTracks: () -> List<Pair<String, Long>>,
+    private val mediaBytes: (String) -> ByteArray?,
 ) {
-    companion object {
-        private const val APP_PORT = 45800
-    }
+    private var socket: Socket? = null
+    private var input: DataInputStream? = null
+    private var out: OutputStream? = null
+    private val outLock = Any()
+    private val sentIds = java.util.Collections.synchronizedSet(HashSet<String>())
 
     @Volatile private var running = false
-    @Volatile var connected = false
-        private set
 
-    private var sock: Socket? = null
-    private var input: InputStream? = null
-    private var output: OutputStream? = null
-    private val writeLock = Any()
-    private var host = ""
+    @Volatile var audio: AudioEngine? = null
 
-    var audio: AudioEngine? = null
-        private set
-
-    fun connect(address: String) {
-        disconnect()
-        host = address
+    fun connect() {
+        if (running) return
         running = true
-        Thread({ run() }, "majorlad-net").start()
+        Thread({
+            try {
+                val s = Socket()
+                s.tcpNoDelay = true
+                s.connect(InetSocketAddress(host, port), 6000)
+                socket = s
+                input = DataInputStream(BufferedInputStream(s.getInputStream()))
+                out = BufferedOutputStream(s.getOutputStream())
+                post { onStatus("Связь установлена, ждём преподавателя") }
+                sendJson(mapOf("type" to "hello", "name" to myName))
+                readLoop()
+                if (running) post { onEnded("lost") }
+            } catch (_: Exception) {
+                if (running) post { onEnded("lost") }
+            } finally {
+                close()
+            }
+        }, "net-client").apply {
+            isDaemon = true
+            start()
+        }
     }
 
-    fun disconnect() {
+    fun close() {
         running = false
-        connected = false
-        audio?.stop()
-        audio = null
         try {
-            sock?.close()
+            socket?.close()
         } catch (_: Exception) {
         }
-        sock = null
+        socket = null
+        out = null
         input = null
-        output = null
+        stopAudio()
     }
 
-    fun sendChat(text: String): Boolean {
-        return try {
-            post { onChat(myName, text) }
-            sendJson(mapOf(
-                "type" to "chat",
-                "id" to UUID.randomUUID().toString().substring(0, 8),
-                "from" to myName,
-                "text" to text))
-            true
-        } catch (e: Exception) {
-            post { onStatus("Нет связи — сообщение не отправлено.") }
-            false
+    fun sendChat(text: String): ChatMsg? {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return null
+        val id = Proto.newId()
+        val msg = ChatMsg(id, myName, trimmed, System.currentTimeMillis(), true)
+        sentIds.add(id)
+        post { onChat(msg) }
+        sendJson(mapOf("type" to "chat", "id" to id, "from" to myName, "text" to trimmed))
+        return msg
+    }
+
+    fun sendFile(name: String, data: ByteArray) {
+        val o = out
+        if (o == null) {
+            post { onStatus("Нет связи — файл не отправлен") }
+            return
         }
-    }
-
-    // -- соединение ----------------------------------------------------------
-
-    private fun run() {
         try {
-            val socket = Socket()
-            socket.connect(InetSocketAddress(host, APP_PORT), 6000)
-            socket.tcpNoDelay = true
-            sock = socket
-            input = socket.getInputStream()
-            output = socket.getOutputStream()
-
-            sendJson(mapOf("type" to "hello", "name" to myName))
-            val answer = recvJson() ?: return
-            when (answer.optString("type")) {
-                "rejected" -> {
-                    post { onStatus("Преподаватель не пустил в кабинет.") }
-                    post { onEnded("rejected") }
-                    finish()
-                    return
-                }
-                "waiting", "busy" -> {
-                    post { onStatus("Ждём, пока преподаватель впустит в кабинет…") }
-                }
-                else -> {
-                    connected = true
-                    startAudio()
-                    post { onJoined(answer.optString("teacher", "Преподаватель")) }
-                    requestHistory()
-                }
-            }
-            readLoop()
-        } catch (e: Exception) {
-            if (running) {
-                post { onStatus("Не удалось подключиться: ${e.message}") }
-                post { onEnded("network") }
-            }
-            finish()
+            Proto.send(o, outLock,
+                mapOf("type" to "file_start", "name" to name, "size" to data.size, "media" to false),
+                data)
+        } catch (_: Exception) {
+            post { onStatus("Файл не отправлен") }
         }
+    }
+
+    fun requestMediaList() {
+        sendJson(mapOf("type" to "media_list_req"))
+    }
+
+    fun requestMedia(name: String) {
+        sendJson(mapOf("type" to "media_get_req", "name" to name))
+    }
+
+    private fun sendMediaList() {
+        val arr = JSONArray()
+        for (t in mediaTracks()) {
+            arr.put(JSONObject().put("name", t.first).put("size", t.second))
+        }
+        sendJson(mapOf("type" to "media_list", "tracks" to arr))
+    }
+
+    private fun sendTrack(name: String) {
+        val data = if (name.isEmpty()) null else mediaBytes(name)
+        val o = out
+        if (data == null || o == null) {
+            sendJson(mapOf("type" to "media_error", "text" to "Трек не найден"))
+            return
+        }
+        try {
+            Proto.send(o, outLock,
+                mapOf("type" to "file_start", "name" to name,
+                    "size" to data.size, "media" to true),
+                data)
+        } catch (_: Exception) {
+        }
+    }
+
+    fun sendVideoState(on: Boolean) {
+        sendJson(mapOf("type" to "video", "on" to on))
+    }
+
+    fun sendMetro(on: Boolean, bpm: Int, beats: Int, hello: Boolean = false) {
+        sendJson(mapOf(
+            "type" to "metro",
+            "on" to on,
+            "bpm" to bpm,
+            "beats" to beats,
+            "hello" to hello))
+    }
+
+    private fun sendJson(obj: Map<String, Any?>) {
+        val o = out ?: return
+        try {
+            Proto.send(o, outLock, obj)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun post(body: () -> Unit) {
+        handler.post(body)
+    }
+
+    private fun startAudio() {
+        if (audio != null) return
+        val engine = AudioEngine(host,
+            { bmp -> post { onFrame(bmp) } },
+            { text -> post { onStatus(text) } })
+        engine.start()
+        audio = engine
+    }
+
+    private fun stopAudio() {
+        val engine = audio ?: return
+        audio = null
+        engine.stop()
     }
 
     private fun readLoop() {
         while (running) {
-            val msg = recvJson() ?: return
-            when (msg.optString("type")) {
-                "ready" -> {
-                    connected = true
-                    startAudio()
-                    post { onJoined("Преподаватель") }
+            val obj = try {
+                Proto.recv(input ?: return)
+            } catch (_: Exception) {
+                return
+            } ?: return
+            when (obj.optString("type")) {
+                "rejected" -> {
+                    post { onEnded("rejected") }
+                    return
                 }
+                "waiting" -> post { onStatus("Преподаватель занят — ждём") }
+                "joined" -> {
+                    val teacher = obj.optString("teacher", "Преподаватель")
+                    post { onJoined(teacher) }
+                    startAudio()
+                }
+                "ready" -> post { onStatus("Преподаватель освободился, можно говорить") }
                 "ended" -> {
-                    val reason = msg.optString("reason", "lost")
+                    val reason = obj.optString("reason", "closed")
                     post { onEnded(reason) }
-                    finish()
                     return
                 }
                 "chat" -> {
-                    val from = msg.optString("from", "Преподаватель")
-                    val text = msg.optString("text", "")
-                    if (text.isNotEmpty()) post { onChat(from, text) }
+                    val id = obj.optString("id")
+                    if (id.isNotEmpty() && sentIds.contains(id)) continue
+                    val from = obj.optString("from", "")
+                    if (from == myName && sentIds.isNotEmpty()) continue
+                    val text = obj.optString("text", "")
+                    if (text.isEmpty()) continue
+                    val time = Proto.parseIso(obj.optString("time", "")).let {
+                        if (it > 0) it else System.currentTimeMillis()
+                    }
+                    post { onChat(ChatMsg(id, from, text, time, false)) }
                 }
                 "chat_history" -> {
-                    val list = ArrayList<Triple<String, String, String>>()
-                    val arr: JSONArray = msg.optJSONArray("messages") ?: JSONArray()
-                    for (i in 0 until arr.length()) {
-                        val m = arr.optJSONObject(i) ?: continue
-                        list.add(Triple(
-                            m.optString("from", "Преподаватель"),
-                            m.optString("text", ""),
-                            m.optString("id", "")))
+                    val list = ArrayList<ChatMsg>()
+                    val arr = obj.optJSONArray("messages")
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val m = arr.optJSONObject(i) ?: continue
+                            val text = m.optString("text", "")
+                            if (text.isEmpty()) continue
+                            val from = m.optString("from", "")
+                            val time = Proto.parseIso(m.optString("time", "")).let {
+                                if (it > 0) it else System.currentTimeMillis()
+                            }
+                            list.add(ChatMsg(
+                                m.optString("id", Proto.newId()),
+                                from, text, time, from == myName))
+                        }
                     }
                     post { onHistory(list) }
                 }
+                "file_start" -> {
+                    val name = obj.optString("name", "файл")
+                    val size = obj.optInt("size", 0)
+                    val media = obj.optBoolean("media", false)
+                    if (size <= 0 || size > 200 * 1024 * 1024) continue
+                    val data = Proto.readExact(input ?: return, size) ?: return
+                    val path = saveFile(name, data, media)
+                    post { onFile(name, path, media) }
+                }
+                "media_list" -> {
+                    if (!obj.has("tracks")) {
+                        // Просьба прислать список — отвечаем своими треками.
+                        sendMediaList()
+                    } else {
+                        val tracks = ArrayList<Pair<String, Long>>()
+                        val arr = obj.optJSONArray("tracks")
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val t = arr.optJSONObject(i) ?: continue
+                                val name = t.optString("name", "")
+                                if (name.isNotEmpty()) tracks.add(Pair(name, t.optLong("size", 0L)))
+                            }
+                        }
+                        post { onMediaList(tracks) }
+                    }
+                }
+                "media_list_req" -> sendMediaList()
+                "media_get_req" -> sendTrack(obj.optString("name", ""))
+                "media_get" -> sendTrack(obj.optString("name", ""))
+                "media_error" -> {
+                    val text = obj.optString("text", "Трек недоступен")
+                    post { onMediaError(text) }
+                }
                 "video" -> {
-                    val on = msg.optBoolean("on", false)
+                    val on = obj.optBoolean("on", false)
                     post { onVideoState(on) }
                 }
-                "file_start" -> {
-                    // Файл, присланный преподавателем: тело идёт сразу
-                    // после сообщения. Пропускаем его целиком, иначе канал
-                    // разъедется и дальше пойдёт мусор.
-                    val size = msg.optInt("size", 0)
-                    if (size > 0) {
-                        var left = size
-                        val buf = ByteArray(64 * 1024)
-                        while (left > 0) {
-                            val n = readInto(buf, minOf(left, buf.size))
-                            if (n <= 0) return
-                            left -= n
-                        }
-                    }
+                "metro" -> {
+                    val on = obj.optBoolean("on", false)
+                    val bpm = obj.optInt("bpm", 90)
+                    val beats = obj.optInt("beats", 4)
+                    val hello = obj.optBoolean("hello", false)
+                    post { onMetro(on, bpm, beats, hello) }
                 }
             }
         }
-    }
-
-    private fun startAudio() {
-        if (audio != null || host.isEmpty()) return
-        val engine = AudioEngine(host, { bmp -> post { onFrame(bmp) } },
-            { text -> post { onStatus(text) } })
-        audio = engine
-        engine.start()
-    }
-
-    private fun requestHistory() {
-        try {
-            sendJson(mapOf("type" to "chat_history_req", "before" to "",
-                "limit" to 50))
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun finish() {
-        connected = false
-        audio?.stop()
-        audio = null
-        try {
-            sock?.close()
-        } catch (_: Exception) {
-        }
-    }
-
-    // -- кадры ---------------------------------------------------------------
-
-    private fun sendJson(obj: Map<String, Any>) {
-        val out = output ?: throw java.io.IOException("нет соединения")
-        val data = JSONObject(obj).toString().toByteArray(Charsets.UTF_8)
-        val head = byteArrayOf(
-            ((data.size shr 24) and 0xff).toByte(),
-            ((data.size shr 16) and 0xff).toByte(),
-            ((data.size shr 8) and 0xff).toByte(),
-            (data.size and 0xff).toByte())
-        synchronized(writeLock) {
-            out.write(head)
-            out.write(data)
-            out.flush()
-        }
-    }
-
-    private fun recvJson(): JSONObject? {
-        if (!running) return null
-        val head = recvExact(4) ?: return null
-        val size = ((head[0].toInt() and 0xff) shl 24) or
-            ((head[1].toInt() and 0xff) shl 16) or
-            ((head[2].toInt() and 0xff) shl 8) or
-            (head[3].toInt() and 0xff)
-        if (size < 0 || size > 64 * 1024 * 1024) {
-            throw java.io.IOException("слишком большое сообщение")
-        }
-        val body = recvExact(size) ?: return null
-        return JSONObject(String(body, Charsets.UTF_8))
-    }
-
-    private fun recvExact(n: Int): ByteArray? {
-        val inp = input ?: return null
-        val out = ByteArray(n)
-        var offset = 0
-        while (offset < n) {
-            val read = readInto(out, n - offset, offset)
-            if (read <= 0) return null
-            offset += read
-        }
-        return out
-    }
-
-    private fun readInto(buf: ByteArray, count: Int, offset: Int = 0): Int {
-        val inp = input ?: return -1
-        return inp.read(buf, offset, count)
-    }
-
-    private fun post(block: () -> Unit) {
-        handler.post(block)
     }
 }

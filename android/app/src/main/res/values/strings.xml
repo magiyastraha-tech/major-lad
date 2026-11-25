@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Мажорный лад</string>
+    <!-- Имя приложения задаётся в build.gradle.kts для каждой версии
+         отдельно: «Мажорный лад Преподаватель» и «Мажорный лад Ученик». -->
 </resources>

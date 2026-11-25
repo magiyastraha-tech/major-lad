@@ -19,6 +19,16 @@ class TrackPlayer(private val ctx: Context) {
     var playing = false
         private set
 
+    /** Громкость трека, 0..1. */
+    @Volatile var volume = 0.8f
+        set(value) {
+            field = value.coerceIn(0f, 1f)
+            try {
+                player?.setVolume(field, field)
+            } catch (_: Exception) {
+            }
+        }
+
     private val extensions = setOf("mp3", "wav", "ogg", "flac", "m4a", "aac", "opus")
 
     fun scan(): Int {
@@ -29,7 +39,10 @@ class TrackPlayer(private val ctx: Context) {
         dirs.add(File(music, "MajorLad"))
         dirs.add(music)
         val external = ctx.getExternalFilesDir(null)
-        if (external != null) dirs.add(File(external, "Music"))
+        if (external != null) {
+            dirs.add(File(external, "Music/Мажорный лад"))
+            dirs.add(File(external, "Music"))
+        }
 
         val found = ArrayList<File>()
         for (dir in dirs) {
@@ -60,6 +73,39 @@ class TrackPlayer(private val ctx: Context) {
     fun currentFile(): File? = tracks.getOrNull(index)
 
     fun currentName(): String = currentFile()?.name ?: ""
+
+    fun select(position: Int): Boolean {
+        if (tracks.isEmpty()) return false
+        val target = position.coerceIn(0, tracks.size - 1)
+        if (target == index) return false
+        index = target
+        release()
+        return true
+    }
+
+    /** Кладёт присланный трек в папку «Мажорный лад» и делает его текущим. */
+    fun addFile(name: String, data: ByteArray): Boolean {
+        val file = FileSaver.saveToMusic(ctx, name, data) ?: return false
+        scan()
+        val pos = tracks.indexOfFirst { it.absolutePath == file.absolutePath }
+        if (pos >= 0) {
+            select(pos)
+            return true
+        }
+        return false
+    }
+
+    fun deleteCurrent(): Boolean {
+        val file = currentFile() ?: return false
+        release()
+        val ok = try {
+            file.delete()
+        } catch (_: Exception) {
+            false
+        }
+        scan()
+        return ok
+    }
 
     fun hasTracks(): Boolean = tracks.isNotEmpty()
 
@@ -161,6 +207,7 @@ class TrackPlayer(private val ctx: Context) {
             p.setOnCompletionListener {
                 next(auto = true)
             }
+            p.setVolume(volume, volume)
             player = p
             p
         } catch (e: Exception) {

@@ -24,18 +24,25 @@ jobs:
         with:
           gradle-version: "8.7"
 
-      - name: Build debug APK
+      - name: Build both flavors
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: gradle assembleTeacherDebug assembleStudentDebug --no-daemon --stacktrace
 
-      - name: Collect APK
+      - name: Collect APKs
         run: |
           mkdir -p out
-          cp android/app/build/outputs/apk/debug/*.apk out/MajorLad-Android.apk
+          cp android/app/build/outputs/apk/teacher/debug/*.apk out/MajorLad-Teacher.apk
+          cp android/app/build/outputs/apk/student/debug/*.apk out/MajorLad-Student.apk
           ls -l out
 
-      - name: Upload artifact
+      - name: Upload teacher APK
         uses: actions/upload-artifact@v4
         with:
-          name: major-lad-android
-          path: out/MajorLad-Android.apk
+          name: major-lad-android-teacher
+          path: out/MajorLad-Teacher.apk
+
+      - name: Upload student APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: major-lad-android-student
+          path: out/MajorLad-Student.apk

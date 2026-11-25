@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Версия для ученика: перемотка и играть — картинками.
+     ⏪ назад, ▶ играть / ⏹ стоп, ⏩ вперёд. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnAdd"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:text="Добавить" />
+
+        <Button
+            android:id="@+id/btnImport"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:text="Импорт" />
+
+        <Button
+            android:id="@+id/btnDelete"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Удалить" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/trackName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:ellipsize="middle"
+        android:singleLine="true"
+        android:text="Трек не выбран"
+        android:textColor="#e6e6ef"
+        android:textSize="17sp" />
+
+    <ListView
+        android:id="@+id/trackList"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1"
+        android:divider="#1e1e26"
+        android:dividerHeight="1dp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnBack"
+            android:layout_width="0dp"
+            android:layout_height="80dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_pic_off"
+            android:contentDescription="Перемотка назад"
+            android:minWidth="0dp"
+            android:text="⏪"
+            android:textColor="#ffffff"
+            android:textSize="26sp" />
+
+        <Button
+            android:id="@+id/btnPlay"
+            android:layout_width="0dp"
+            android:layout_height="80dp"
+            android:layout_marginStart="8dp"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_pic_off"
+            android:contentDescription="Играть"
+            android:minWidth="0dp"
+            android:text="▶"
+            android:textColor="#ffffff"
+            android:textSize="26sp" />
+
+        <Button
+            android:id="@+id/btnForward"
+            android:layout_width="0dp"
+            android:layout_height="80dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_pic_off"
+            android:contentDescription="Перемотка вперёд"
+            android:minWidth="0dp"
+            android:text="⏩"
+            android:textColor="#ffffff"
+            android:textSize="26sp" />
+    </LinearLayout>
+
+    <SeekBar
+        android:id="@+id/seekTrack"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:contentDescription="Позиция трека"
+        android:max="1000"
+        android:progress="0" />
+
+    <TextView
+        android:id="@+id/trackStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Треков пока нет. Нажмите «Добавить»."
+        android:textColor="#8f8f9c"
+        android:textSize="15sp" />
+
+</LinearLayout>
