@@ -1407,9 +1407,27 @@ class Store:
         return None
 
     def update_payment(self, payment: Payment) -> None:
-        """Сохранить правку оплаты: поля уже изменены на месте."""
-        if any(p.uid == payment.uid for p in self.payments):
-            self.save_payments()
+        """Сохранить правку оплаты: поля уже изменены на месте.
+
+        Строка, заведённая вместе с абонементом или разовым уроком, здесь
+        главная: поправили сумму в журнале — она же становится стоимостью
+        абонемента, чтобы карточка и заработок называли то, что человек
+        действительно получил, а не прежнюю цену.
+        """
+        if not any(p.uid == payment.uid for p in self.payments):
+            return
+        pair_of, dups = self._sub_pairs()
+        sub_uid = pair_of.get(payment.uid)
+        if sub_uid is not None and payment.uid not in dups:
+            for sub in self.subscriptions:
+                if sub.uid != sub_uid:
+                    continue
+                price = int(payment.amount)
+                if int(sub.price) != price:
+                    sub.price = price
+                    self.save_subscriptions()
+                break
+        self.save_payments()
 
     def delete_payment(self, payment: Payment) -> None:
         """Убрать оплату из журнала совсем."""
@@ -1538,21 +1556,20 @@ class Store:
             return "single"
         return ""
 
-    def _paired_payments(self) -> set[int]:
-        """Записи журнала, заведённые вместе с абонементом или уроком.
+    def _sub_pairs(self) -> tuple[dict[int, int], set[int]]:
+        """Парные строки журнала: uid строки → uid абонемента или урока.
 
         Пара ищется по ученику и виду записи: сперва того же дня покупки,
         потом ближайшего к нему — дату покупки могли поправить, а строка
-        журнала осталась старой. Без этого заработок то задваивался, то
-        терял деньги. Повтор уже найденной строки (тот же ученик, день,
-        подпись и сумма) тоже считается парным: старые дубли от прежних
-        версий не должны прибавляться второй раз.
+        журнала осталась старой. Второй результат — uid повторов уже
+        найденной строки (тот же ученик, день, подпись и сумма): старые
+        дубли от прежних версий не должны прибавляться второй раз.
         """
-        taken: dict[int, Payment] = {}
+        pair_of: dict[int, int] = {}
         used: set[int] = set()
         for exact in (True, False):
             for sub in self.subscriptions:
-                if sub.uid in taken:
+                if sub.uid in pair_of.values():
                     continue
                 want = "single" if sub.single else "sub"
                 best = None
@@ -1569,30 +1586,36 @@ class Store:
                     if best is None or gap < abs((best.day - sub.bought).days):
                         best = payment
                 if best is not None:
-                    taken[sub.uid] = best
+                    pair_of[best.uid] = sub.uid
                     used.add(best.uid)
+        rows = {payment.uid: payment for payment in self.payments}
+        dups: set[int] = set()
         for payment in self.payments:
             if payment.uid in used:
                 continue
-            for other in taken.values():
+            for uid in pair_of:
+                other = rows.get(uid)
+                if other is None:
+                    continue
                 if (payment.student == other.student
                         and payment.day == other.day
                         and payment.what.strip() == other.what.strip()
                         and int(payment.amount) == int(other.amount)):
-                    used.add(payment.uid)
+                    dups.add(payment.uid)
                     break
-        return used
+        return pair_of, dups
 
     def earnings_in_month(self, year: int, month: int) -> dict[str, int]:
         """Из чего сложился заработок месяца.
 
-        Абонементы и разовые уроки считаются по самой записи абонемента:
-        деньги получены при покупке, и в заработок идёт ровно та сумма,
-        что стоит в абонементе или в разовом уроке, — её человек и правит
-        в окне. Запись журнала оплат, заведённая вместе с ними, второй раз
-        не прибавляется, даже если её дата разошлась с датой покупки.
-        Пробные уроки не считаются вовсе. Если абонемент удалён, а запись
-        журнала осталась, деньги не теряются: такая запись идёт в
+        Считаем по журналу оплат: там ровно то, что человек получил, и
+        сумму строки он может поправить прямо в журнале. Строка,
+        заведённая вместе с абонементом или разовым уроком, прибавляется
+        по своей сумме и не задваивается ценой самого абонемента — даже
+        если цена в окне абонемента осталась прежней. Абонемент без строки
+        в журнале (старые данные) считается по своей цене в месяц покупки.
+        Пробные уроки не считаются вовсе. Если абонемент удалён, а строка
+        журнала осталась, деньги не теряются: такая строка идёт в
         законченные. Услуги и прочие поступления берутся из журнала оплат.
 
         Ключи: active — действующие абонементы, finished — законченные,
@@ -1602,10 +1625,43 @@ class Store:
         def same_month(day: date) -> bool:
             return day.year == year and day.month == month
 
+        pair_of, dups = self._sub_pairs()
+        by_uid = {sub.uid: sub for sub in self.subscriptions}
+        paired_subs = set(pair_of.values())
         parts = {"active": 0, "finished": 0, "future": 0,
                  "single": 0, "service": 0, "other": 0}
+        for payment in self.payments:
+            if payment.uid in dups or not same_month(payment.day):
+                continue
+            what = payment.what.strip()
+            if what == "Пробный урок":
+                continue  # пробные уроки не считаем
+            amount = int(payment.amount)
+            sub = by_uid.get(pair_of.get(payment.uid, -1))
+            if sub is not None:
+                if sub.trial:
+                    continue
+                if sub.single:
+                    parts["single"] += amount
+                elif sub.finished:
+                    parts["finished"] += amount
+                elif sub.future:
+                    parts["future"] += amount
+                else:
+                    parts["active"] += amount
+            elif what.startswith("Абонемент"):
+                # Абонемента уже нет, а деньги были — поступления не теряем.
+                parts["finished"] += amount
+            elif what in ("Разовый урок", "Урок"):
+                parts["single"] += amount
+            elif what in SERVICES:
+                parts["service"] += amount
+            else:
+                parts["other"] += amount
         for sub in self.subscriptions:
-            if sub.trial or not same_month(sub.bought):
+            if sub.trial or sub.uid in paired_subs:
+                continue
+            if not same_month(sub.bought):
                 continue
             amount = int(sub.price)
             if sub.single:
@@ -1616,30 +1672,6 @@ class Store:
                 parts["future"] += amount
             else:
                 parts["active"] += amount
-        paired = self._paired_payments()
-        seen_subs: set[tuple] = set()
-        for payment in self.payments:
-            if payment.uid in paired or not same_month(payment.day):
-                continue
-            what = payment.what.strip()
-            if what == "Пробный урок":
-                continue  # пробные уроки не считаем
-            if what.startswith("Абонемент"):
-                # Абонемента уже нет, а деньги были — поступления не теряем.
-                # Одинаковые строки (прежние версии заводили дубли) считаем
-                # один раз.
-                sign = (payment.student, payment.day, what,
-                        int(payment.amount))
-                if sign in seen_subs:
-                    continue
-                seen_subs.add(sign)
-                parts["finished"] += int(payment.amount)
-            elif what in ("Разовый урок", "Урок"):
-                parts["single"] += int(payment.amount)
-            elif what in SERVICES:
-                parts["service"] += int(payment.amount)
-            else:
-                parts["other"] += int(payment.amount)
         return parts
 
     def earned_in_month(self, year: int, month: int) -> int:
