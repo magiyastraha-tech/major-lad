@@ -139,11 +139,39 @@ def ensure(folder: Path | None = None) -> Path:
     return folder
 
 
+# Звуки, которые сейчас играют через Qt. QSoundEffect нельзя выпускать из
+# рук, пока он звучит: без ссылки объект исчезнет и звук оборвётся.
+_qt_players: list = []
+
+
+def _play_qt(path: Path) -> None:
+    """Звук на Маке и Linux: winsound там нет, играет Qt Multimedia."""
+    try:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtMultimedia import QSoundEffect
+    except Exception as exc:
+        runlog.write(f"Звук {path.name} не сыграл: {exc}")
+        return
+    try:
+        player = QSoundEffect()
+        player.setSource(QUrl.fromLocalFile(str(path)))
+        player.setVolume(0.8)
+        player.play()
+        _qt_players.append(player)
+        # Держим последние несколько: короткие сигналы успевают доиграть,
+        # а список не растёт с каждым событием за весь урок.
+        while len(_qt_players) > 8:
+            _qt_players.pop(0)
+    except Exception as exc:
+        runlog.write(f"Звук {path.name} не сыграл: {exc}")
+
+
 def play(kind: str) -> None:
     """Играет звук события, не задерживая интерфейс.
 
-    PlaySound с SND_ASYNC возвращается сразу; на другой системе (во время
-    разработки) звука нет — это не ошибка.
+    На Windows — PlaySound с SND_ASYNC: он возвращается сразу. На Маке —
+    Qt Multimedia. Если звук не сыграл, это не ошибка: программа работает
+    дальше, в журнал пишется одна строка.
     """
     name = FILES.get(kind)
     if not name:
@@ -154,6 +182,7 @@ def play(kind: str) -> None:
     try:
         import winsound
     except ImportError:
+        _play_qt(path)
         return
     try:
         winsound.PlaySound(

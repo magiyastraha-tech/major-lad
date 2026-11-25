@@ -1,0 +1,60 @@
+name: Build macOS (student)
+
+# Только вручную: сборка для Мака запускается кнопкой в Actions, а не на
+# каждый коммит. Windows-сборка живёт отдельно в build-windows.yml.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-13
+            arch: intel
+    runs-on: ${{ matrix.runner }}
+    # Intel-сборка помечена continue-on-error: если GitHub перестанет
+    # давать старые маки, сборка для Apple Silicon всё равно доедет.
+    continue-on-error: ${{ matrix.arch == 'intel' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Opus
+        run: brew install opus
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build app
+        run: |
+          # На Intel Homebrew ставит в /usr/local, на Apple Silicon — в
+          # /opt/homebrew. Берём тот префикс, который есть на этом раннере.
+          OPUS_PREFIX="$(brew --prefix opus)"
+          export OPUS_LIB="$OPUS_PREFIX/lib/libopus.dylib"
+          echo "Opus: $OPUS_LIB"
+          python -m PyInstaller --noconfirm --clean MajorLad-Student-macos.spec
+
+      - name: Archive app
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            "MajorLad-Student.app" \
+            "MajorLad-Student-macos-${{ matrix.arch }}.zip"
+          ls -lh *.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: major-lad-macos-${{ matrix.arch }}
+          path: dist/MajorLad-Student-macos-${{ matrix.arch }}.zip

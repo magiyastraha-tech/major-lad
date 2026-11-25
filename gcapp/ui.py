@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 import uuid
 from datetime import datetime
@@ -37,6 +38,14 @@ from . import (__version__, audio, cameras, config, effects, history, media,
                runlog, shortcuts, sounds, students, updater)
 from .net import Client, Server
 from .video import FrameReassembler, VideoSender
+
+# На Маке звук и видео идут через системные устройства: встроенные
+# микрофон, динамики и камера обычно лучше всего, что ученик подключит
+# отдельно. Поэтому выбора драйверов и устройств здесь нет — программа
+# берёт то, что выбрала система. Правый Control как «нажми и говори» тоже
+# примета Windows: на Маке микрофон включается кнопкой в окне, а клавишу
+# ученик при желании назначает сам в «Сочетаниях клавиш».
+IS_MAC = sys.platform == "darwin"
 
 # Эффекты плеера: шаг скорости и её границы, предел сдвига тона.
 _SPEED_STEP = 0.1
@@ -844,6 +853,15 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         tabs.setAccessibleName("Вкладки аудиовходов")
 
+        if IS_MAC:
+            mac_hint = QLabel(
+                "На Маке программа сама берёт встроенный микрофон — "
+                "выбирать вход и драйвер не нужно."
+            )
+            mac_hint.setWordWrap(True)
+            mac_hint.setAccessibleName(mac_hint.text())
+            layout.addWidget(mac_hint)
+
         show_all = bool(self.cfg["audio"].get("show_all_drivers", False))
         inputs = audio.list_input_devices(show_all)
 
@@ -926,22 +944,27 @@ class SettingsDialog(QDialog):
         driver_form.addRow(asio_hint)
         self.asio_hint = asio_hint
 
-        tabs.addTab(driver_page, "Драйвер")
+        if not IS_MAC:
+            tabs.addTab(driver_page, "Драйвер")
 
         self.dev1_combo = self._device_combo(
             self.cfg["audio"].get("device1", ""), "Аудиоустройство 1", inputs)
         self.mode1_combo = self._mode_combo(
             self.cfg["audio"].get("mode1", "ch1"), "Режим канала 1")
-        tabs.addTab(self._device_tab(self.dev1_combo, self.mode1_combo,
-                                     with_fx=True),
-                    "Аудиоустройство 1")
+        dev1_tab = self._device_tab(self.dev1_combo, self.mode1_combo,
+                                    with_fx=True, hide_device=IS_MAC)
+        # На Маке вкладка остаётся ради обработки микрофона: срез низа и
+        # компрессор полезны и со встроенным микрофоном.
+        tabs.addTab(dev1_tab, "Обработка микрофона" if IS_MAC
+                    else "Аудиоустройство 1")
 
         self.dev2_combo = self._device_combo(
             self.cfg["audio"].get("device2", ""), "Аудиоустройство 2", inputs)
         self.mode2_combo = self._mode_combo(
             self.cfg["audio"].get("mode2", "ch1"), "Режим канала 2")
-        tabs.addTab(self._device_tab(self.dev2_combo, self.mode2_combo),
-                    "Аудиоустройство 2")
+        if not IS_MAC:
+            tabs.addTab(self._device_tab(self.dev2_combo, self.mode2_combo),
+                        "Аудиоустройство 2")
 
         midi_page = QWidget()
         midi_form = QFormLayout(midi_page)
@@ -1057,8 +1080,9 @@ class SettingsDialog(QDialog):
             self.cfg["audio"].get("usb", ""), "USB-устройство", inputs)
         self.usb_mode_combo = self._mode_combo(
             self.cfg["audio"].get("usb_mode", "ch1"), "Режим канала USB")
-        tabs.addTab(self._device_tab(self.usb_combo, self.usb_mode_combo),
-                    "USB-устройство")
+        if not IS_MAC:
+            tabs.addTab(self._device_tab(self.usb_combo, self.usb_mode_combo),
+                        "USB-устройство")
 
         self.driver_combo.currentIndexChanged.connect(self._driver_changed)
         self.asio_combo.currentIndexChanged.connect(self._asio_card_changed)
@@ -1072,12 +1096,20 @@ class SettingsDialog(QDialog):
             "Обычно в списках только WASAPI — современный драйвер Windows с "
             "малой задержкой. Включи, если нужного устройства в списке нет.")
         self.all_drivers_box.toggled.connect(self._refresh_device_lists)
-        layout.addWidget(self.all_drivers_box)
+        if not IS_MAC:
+            layout.addWidget(self.all_drivers_box)
 
-        hint = QLabel(
-            "Список устройств обновляется при открытии настроек. "
-            "Новую звуковую карту лучше подключить до запуска программы."
-        )
+        if IS_MAC:
+            hint = QLabel(
+                "Микрофон и динамики программа берёт у системы. Если ученик "
+                "подключит внешний микрофон, выберите его в системных "
+                "настройках звука — программа подхватит его сама."
+            )
+        else:
+            hint = QLabel(
+                "Список устройств обновляется при открытии настроек. "
+                "Новую звуковую карту лучше подключить до запуска программы."
+            )
         hint.setWordWrap(True)
         hint.setAccessibleName("Подсказка")
         layout.addWidget(hint)
@@ -1105,13 +1137,15 @@ class SettingsDialog(QDialog):
 
     def _device_tab(self, combo: QComboBox,
                     mode_combo: QComboBox | None = None,
-                    with_fx: bool = False) -> QWidget:
+                    with_fx: bool = False,
+                    hide_device: bool = False) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
-        combo_label = label_for("Устройство", combo)
-        form.addRow(combo_label, combo)
-        if mode_combo is not None:
-            form.addRow(label_for("Режим", mode_combo), mode_combo)
+        if not hide_device:
+            combo_label = label_for("Устройство", combo)
+            form.addRow(combo_label, combo)
+            if mode_combo is not None:
+                form.addRow(label_for("Режим", mode_combo), mode_combo)
         if with_fx:
             audio_cfg = self.cfg["audio"]
             self.monitor1_box = QCheckBox("Слышать себя")
@@ -1159,7 +1193,9 @@ class SettingsDialog(QDialog):
             self.out_combo, "Системное по умолчанию",
             audio.list_output_devices(show_all),
             str(self.cfg["audio"].get("output", "")))
-        form.addRow(label_for("Устройство вывода", self.out_combo), self.out_combo)
+        if not IS_MAC:
+            form.addRow(label_for("Устройство вывода", self.out_combo),
+                        self.out_combo)
 
         # Запас звука на сеть: больше — устойчивее и с более длинной
         # задержкой, меньше — отзывчивее и чувствительнее к провалам связи.
@@ -1210,10 +1246,17 @@ class SettingsDialog(QDialog):
         form.addRow(label_for("Компенсация задержки", self.tx_delay_spin),
                     self.tx_delay_spin)
 
-        hint = QLabel(
-            "Для занятий нужны наушники: без них микрофон поймает колонки "
-            "и вернёт эхо собеседнику."
-        )
+        if IS_MAC:
+            hint = QLabel(
+                "Звук идёт на встроенные динамики или в то устройство, "
+                "которое выбрано в системе. Для занятий нужны наушники: "
+                "без них микрофон поймает колонки и вернёт эхо собеседнику."
+            )
+        else:
+            hint = QLabel(
+                "Для занятий нужны наушники: без них микрофон поймает "
+                "колонки и вернёт эхо собеседнику."
+            )
         hint.setWordWrap(True)
         form.addRow(hint)
         # Настройки открыты: применяем сохранённый драйвер — поля ASIO
@@ -1258,7 +1301,10 @@ class SettingsDialog(QDialog):
         self.cam_combo.setAccessibleDescription(
             "Список подключённых камер. Если нужной камеры нет, подключите "
             "её до открытия настроек.")
-        form.addRow(label_for("Камера", self.cam_combo), self.cam_combo)
+        if IS_MAC:
+            form.addRow(QLabel("На Маке программа сама берёт встроенную камеру."))
+        else:
+            form.addRow(label_for("Камера", self.cam_combo), self.cam_combo)
 
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 30)
@@ -1444,6 +1490,14 @@ class SettingsDialog(QDialog):
             self._set_update_status(f"У вас последняя версия, {__version__}.")
             return
         version = info.get("version", "")
+        if IS_MAC:
+            # .app — это одна программа, подменить себя на ходу она не
+            # может. Открываем страницу релизов: новую версию ученик
+            # скачивает и ставит на место старой сам.
+            self._set_update_status(f"Доступна версия {version}.")
+            QDesktopServices.openUrl(
+                QUrl("https://github.com/magiyastraha-tech/major-lad/releases"))
+            return
         answer = QMessageBox.question(
             self, "Доступно обновление",
             f"Вышла версия {version}. Скачать и установить сейчас?\n\n"
@@ -2924,9 +2978,11 @@ class MainWindow(QMainWindow):
         # Так же, как у камеры: на кнопке состояние, действие — в описании.
         if self._mic_muted:
             text = "Микрофон выключен"
-            action = ("Нажмите, чтобы включить микрофон. Для короткой фразы "
-                      "можно просто удерживать правый Control: нажал — "
-                      "говоришь, отпустил — микрофон снова выключен")
+            action = "Нажмите, чтобы включить микрофон"
+            if not IS_MAC:
+                action += (". Для короткой фразы можно просто удерживать "
+                           "правый Control: нажал — говоришь, отпустил — "
+                           "микрофон снова выключен")
         else:
             text, action = "Микрофон включён", "Нажмите, чтобы выключить микрофон"
         hint = self._hint("mic")
@@ -2953,6 +3009,10 @@ class MainWindow(QMainWindow):
         сторону различаем по системе: спрашиваем у Windows, зажат ли именно
         правый Control. Коды из самого события — запасной путь, если
         система не ответила."""
+        if IS_MAC:
+            # На Маке «нажми и говори» на правом Control не работает:
+            # микрофон включается кнопкой или назначенной клавишей.
+            return False
         if event.key() != Qt.Key.Key_Control:
             return False
         if _right_ctrl_down():
@@ -2989,6 +3049,8 @@ class MainWindow(QMainWindow):
     def _ptt_press(self, event) -> bool:
         """Правый Control зажат: если микрофон выключен, включаем, пока
         держат. Если он и так включён — ничего не делаем."""
+        if IS_MAC:
+            return False
         if event.isAutoRepeat() or not self.isActiveWindow():
             return False
         if not self._ptt_logged and event.key() == Qt.Key.Key_Control:

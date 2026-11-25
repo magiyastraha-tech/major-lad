@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!MajorLad-Student-macos.spec
 *.json
 !requirements.json
 *_log.txt

@@ -159,8 +159,16 @@ def data_dir() -> Path:
     Рядом с exe остаются только сам exe и папка Data: скопировал папку
     программы на другой компьютер — вместе с ней переехали настройки,
     треки, история, звуки и громкости учеников.
+
+    На Маке собранная программа — это .app, то есть одна папка-программа,
+    а не папка с файлами рядом: писать внутрь неё нельзя, при обновлении
+    всё пропало бы. Поэтому там данные живут в Application Support.
     """
-    path = app_dir() / DATA_DIR
+    if getattr(sys, "frozen", False) and sys.platform == "darwin":
+        path = (Path.home() / "Library" / "Application Support"
+                / "Мажорный лад")
+    else:
+        path = app_dir() / DATA_DIR
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError:
