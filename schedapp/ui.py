@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QThread, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (QDate, QEvent, QThread, Qt, QTimer, QUrl,
+                            Signal)
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon,
                            QKeySequence, QPainter, QPixmap, QShortcut)
 from PySide6.QtWidgets import (
@@ -429,6 +431,19 @@ class WeekGrid(QWidget):
         return [(i, self.hours[i].value(), int(self.minutes[i].currentText()))
                 for i, check in enumerate(self.checks) if check.isChecked()]
 
+    def set_pattern(self, pairs: list[tuple[int, int, int]]) -> None:
+        """Отметить уже выбранные дни и поставить каждому своё время."""
+        for weekday, hour, minute in pairs:
+            if not 0 <= weekday < len(self.checks):
+                continue
+            self.checks[weekday].setChecked(True)
+            self.hours[weekday].setValue(int(hour))
+            index = self.minutes[weekday].findText(f"{int(minute):02d}")
+            if index < 0:
+                # Минуты в списке идут через пять: ближайшие снизу.
+                index = min(len(MINUTES) - 1, int(minute) // 5)
+            self.minutes[weekday].setCurrentIndex(index)
+
 
 def add_weekly_lessons(store: Store, student: data.Student,
                        picked: list[tuple[int, int, int]],
@@ -437,6 +452,8 @@ def add_weekly_lessons(store: Store, student: data.Student,
 
     Начало — сегодня или первый день абонемента, если он позже. Уже
     прошедшее время и уроки, которые в это же время уже стоят, пропускаются.
+    Если урок попадает на исключение, он переезжает на ту же неделю вперёд
+    (тот же день недели и час), пока не найдётся свободная неделя.
     """
     now = datetime.now()
     start = first or date.today()
@@ -450,7 +467,16 @@ def add_weekly_lessons(store: Store, student: data.Student,
             time = dates.fmt_time(hour, minute)
             if datetime(day.year, day.month, day.day, hour, minute) <= now:
                 continue
-            same = any(l.student == student.name and l.day == day
+            # Исключение — урок уходит в конец: та же неделя, тот же день
+            # и час. Полгода вперёд ищем свободную неделю, дальше некуда.
+            lesson_day = day
+            for _attempt in range(26):
+                if store.is_blocked(lesson_day, time) is None:
+                    break
+                lesson_day += timedelta(days=7)
+            else:
+                continue
+            same = any(l.student == student.name and l.day == lesson_day
                        and l.time == time and l.status == LESSON_WAIT
                        for l in store.lessons)
             if same:
@@ -459,7 +485,7 @@ def add_weekly_lessons(store: Store, student: data.Student,
             # иначе двадцать восемь уроков заново сохраняют всю таблицу
             # и текстовые копии — программа заметно подвисает.
             store.lessons.append(data.Lesson(
-                uid=uid, day=day, time=time, student=student.name,
+                uid=uid, day=lesson_day, time=time, student=student.name,
                 lesson_format=student.lesson_format,
                 direction=student.direction))
             uid += 1
@@ -501,6 +527,88 @@ class ScheduleDialog(QDialog):
         if not picked:
             announce(self, "Ни один день не отмечен. Поставь галочки на нужных днях.")
             return
+        self.added = add_weekly_lessons(self.store, self.student, picked)
+        self.accept()
+
+
+def weekly_pattern(store: Store,
+                   student_name: str) -> list[tuple[int, int, int]]:
+    """По каким дням и во сколько у ученика стоят будущие уроки.
+
+    Если на один день недели приходится несколько времён (урок переносили
+    вручную), берётся то, что встречается чаще.
+    """
+    today = date.today()
+    counts: dict[int, dict[tuple[int, int], int]] = {}
+    for lesson in store.lessons:
+        if lesson.student != student_name or lesson.status != LESSON_WAIT:
+            continue
+        if lesson.day <= today:
+            continue
+        try:
+            hour, minute = (int(part) for part in lesson.time.split(":")[:2])
+        except ValueError:
+            continue
+        by_time = counts.setdefault(lesson.day.weekday(), {})
+        by_time[(hour, minute)] = by_time.get((hour, minute), 0) + 1
+    pattern = []
+    for weekday in sorted(counts):
+        best = max(counts[weekday].items(), key=lambda pair: pair[1])[0]
+        pattern.append((weekday, best[0], best[1]))
+    return pattern
+
+
+class ScheduleEditDialog(QDialog):
+    """Правка постоянного расписания: дни и часы уже отмечены.
+
+    Человек снимает галочку с ненужного дня, ставит другой или меняет
+    время, а программа перестраивает будущие уроки заново.
+    """
+
+    def __init__(self, store: Store, student: data.Student, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.student = student
+        self.removed = 0
+        self.added = 0
+        self.setWindowTitle("Редактировать расписание")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        pattern = weekly_pattern(store, student.name)
+        if pattern:
+            text = ("Вот дни и время, по которым сейчас стоят уроки "
+                    f"{student.name}. Сними галочку с ненужного дня, "
+                    "поставь другой день или поменяй время и сохрани.")
+        else:
+            text = (f"Постоянных уроков у {student.name} сейчас нет. "
+                    "Отметь дни и время, и уроки встанут на четыре "
+                    "недели вперёд.")
+        hint = QLabel(text)
+        hint.setWordWrap(True)
+        hint.setAccessibleName(text)
+        lay.addWidget(hint)
+
+        self.grid = WeekGrid()
+        self.grid.set_pattern(pattern)
+        lay.addWidget(self.grid)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Сохранить расписание")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _save(self) -> None:
+        picked = self.grid.picked()
+        if not picked:
+            announce(self, "Ни один день не отмечен. Поставь галочки на "
+                           "нужных днях или нажми «Отмена».")
+            return
+        self.removed = self.store.delete_future_waiting_lessons(
+            self.student.name)
         self.added = add_weekly_lessons(self.store, self.student, picked)
         self.accept()
 
@@ -900,6 +1008,15 @@ class SubscriptionEditDialog(QDialog):
             self.finished_box.setAccessibleName("Абонемент закончен")
             lay.addWidget(self.finished_box)
 
+            # Расписание правится здесь же: дни и часы уже отмечены, их
+            # можно поменять, и уроки встанут заново.
+            self.schedule_button = QPushButton("Редактировать расписание")
+            self.schedule_button.setAccessibleName(
+                "Редактировать расписание: дни недели и время уроков")
+            self.schedule_button.clicked.connect(
+                lambda _checked=False: self.edit_schedule())
+            lay.addWidget(self.schedule_button)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
@@ -912,6 +1029,21 @@ class SubscriptionEditDialog(QDialog):
             self.count.selectAll()
         else:
             self.bought.setFocus()
+
+    def edit_schedule(self) -> None:
+        """Дни и часы уроков: открыть расписание с уже отмеченными днями."""
+        student = self.store.find_student(self.sub.student)
+        if student is None:
+            announce(self, "Ученик не найден в списке.", assertive=True)
+            return
+        dialog = ScheduleEditDialog(self.store, student, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        announce(
+            self,
+            "Расписание перестроено: убрано "
+            f"{dialog.removed} {plural(dialog.removed, 'урок', 'урока', 'уроков')}, "
+            f"записано {dialog.added}.", assertive=True)
 
     def _save(self) -> None:
         if self.sub.one_off:
@@ -945,6 +1077,9 @@ class SubscriptionEditDialog(QDialog):
              sub.price, sub.finished) = old
             announce(self, str(error), assertive=True)
             return
+        # Журнал оплат повторяет сумму и дату абонемента: иначе заработок
+        # считался бы по старой цифре.
+        self.store.sync_subscription_payment(sub, old[0], old[3])
         self.accept()
 
     def _save_one_off(self) -> None:
@@ -965,6 +1100,9 @@ class SubscriptionEditDialog(QDialog):
              sub.price) = old
             announce(self, str(error), assertive=True)
             return
+        # Разовый урок: журнал оплат получает ту же сумму и дату, что
+        # записаны в уроке.
+        self.store.sync_subscription_payment(sub, old[0])
         self.accept()
 
 
@@ -1179,31 +1317,52 @@ class BlockDialog(QDialog):
     скажет только то, что это время занято.
     """
 
-    def __init__(self, whole_day: bool, parent=None):
+    def __init__(self, whole_day: bool, parent=None,
+                 flexible: bool = False):
         super().__init__(parent)
         self.whole_day = whole_day
+        self.flexible = flexible
         self.day: date = date.today()
         self.start = ""
         self.end = ""
         self.note = ""
-        self.setWindowTitle("Добавить день" if whole_day else "Добавить время")
+        if flexible:
+            self.setWindowTitle("Добавить исключение уроков")
+        else:
+            self.setWindowTitle("Добавить день" if whole_day
+                                else "Добавить время")
         self.setMinimumWidth(460)
 
         lay = QVBoxLayout(self)
         form = QFormLayout()
         self.day_edit = make_date_edit("Дата исключения")
         form.addRow("Дата", self.day_edit)
-        if whole_day:
-            hint = QLabel("Весь этот день уроков не будет.")
-            hint.setWordWrap(True)
-            lay.addWidget(hint)
-        else:
-            self.from_hour, self.from_minute = self._time_row(
-                form, "С какого времени", "Час начала", "Минуты начала",
-                12, 0)
-            self.to_hour, self.to_minute = self._time_row(
-                form, "До какого времени", "Час окончания",
-                "Минуты окончания", 16, 0)
+        # В общем окне исключения можно закрыть и весь день, и часы:
+        # переключатель решает, что именно.
+        self.whole_box = None
+        if flexible:
+            self.whole_box = QCheckBox("Весь день — уроков не будет")
+            self.whole_box.setChecked(whole_day)
+            self.whole_box.setAccessibleName(
+                "Исключение на весь день, а не на часы")
+            self.whole_box.toggled.connect(self.set_whole_day)
+            lay.addWidget(self.whole_box)
+        self.day_hint = QLabel("Весь этот день уроков не будет.")
+        self.day_hint.setWordWrap(True)
+        lay.addWidget(self.day_hint)
+        self.time_box = QWidget()
+        time_lay = QVBoxLayout(self.time_box)
+        time_lay.setContentsMargins(0, 0, 0, 0)
+        time_form = QFormLayout()
+        self.from_hour, self.from_minute = self._time_row(
+            time_form, "С какого времени", "Час начала", "Минуты начала",
+            12, 0)
+        self.to_hour, self.to_minute = self._time_row(
+            time_form, "До какого времени", "Час окончания",
+            "Минуты окончания", 16, 0)
+        time_lay.addLayout(time_form)
+        lay.addWidget(self.time_box)
+        self.set_whole_day(whole_day)
         self.note_edit = QLineEdit()
         self.note_edit.setAccessibleName(
             "Причина для себя. Ученик её не увидит")
@@ -1239,6 +1398,12 @@ class BlockDialog(QDialog):
         row.addWidget(QLabel("минут"))
         form.addRow(title, row)
         return hour_edit, minute_edit
+
+    def set_whole_day(self, whole: bool) -> None:
+        """Весь день или часы: показываем только то, что нужно."""
+        self.whole_day = bool(whole)
+        self.day_hint.setVisible(self.whole_day)
+        self.time_box.setVisible(not self.whole_day)
 
     def _save(self) -> None:
         self.day = picked_date(self.day_edit)
@@ -1740,13 +1905,52 @@ class UpdateWorker(QThread):
             self.failed.emit(f"Обновление не удалось: {error}")
 
 
+# Цифры цифрового блока при выключенном Num Lock: Qt присылает вместо
+# цифры клавишу перемещения, но с пометкой цифрового блока.
+NUMPAD_DIGITS = {
+    int(Qt.Key.Key_0): 0,
+    int(Qt.Key.Key_End): 1,
+    int(Qt.Key.Key_Down): 2,
+    int(Qt.Key.Key_PageDown): 3,
+    int(Qt.Key.Key_Left): 4,
+    int(Qt.Key.Key_Clear): 5,
+    int(Qt.Key.Key_Right): 6,
+    int(Qt.Key.Key_Home): 7,
+    int(Qt.Key.Key_Up): 8,
+    int(Qt.Key.Key_PageUp): 9,
+}
+
+# «Ctrl+Num1» и «Ctrl+Num+1» — одна и та же запись: Qt пишет с плюсом.
+NUMPAD_TEXT = re.compile(r"(?i)(?<![A-Za-z])num(?=\s*[0-9])")
+NUMPAD_KEYS = re.compile(r"(?i)^(?:[A-Za-z]+\+)*Num\+[0-9]$")
+
+
+def numpad_digit(key: int) -> int | None:
+    """Какая цифра блока нажата — при любом положении Num Lock."""
+    return NUMPAD_DIGITS.get(key)
+
+
+def numpad_text(text: str) -> str:
+    """Отметить, что цифра нажата на цифровом блоке: «Ctrl» + «1» → «Ctrl+Num+1»."""
+    if not text or text[-1] not in "0123456789":
+        return text
+    return text[:-1] + "Num+" + text[-1]
+
+
 def norm_keys(text: str) -> str:
     """Клавиши единой записью: «ctrl+p», «Ctrl+P» и «CTRL+P» — одно и то же."""
     text = (text or "").strip()
     if not text:
         return ""
+    # Человек пишет «Ctrl+Num1», Qt понимает «Ctrl+Num+1».
+    text = NUMPAD_TEXT.sub("Num+", text)
+    text = re.sub(r"\s*\+\s*", "+", text).strip()
     sequence = QKeySequence(text)
-    return key_text(sequence) if not sequence.isEmpty() else ""
+    if not sequence.isEmpty():
+        return key_text(sequence)
+    # Сочетание с цифровым блоком Qt может и не разобрать: его ловит
+    # фильтр событий главного окна, поэтому запись храним как есть.
+    return text if NUMPAD_KEYS.match(text) else ""
 
 
 def combo_text(mods, key: int) -> str:
@@ -1823,6 +2027,22 @@ class KeyCaptureDialog(QDialog):
                                     | Qt.KeyboardModifier.ShiftModifier
                                     | Qt.KeyboardModifier.AltModifier
                                     | Qt.KeyboardModifier.MetaModifier)
+        if event.modifiers() & Qt.KeyboardModifier.KeypadModifier:
+            # Цифровой блок записываем цифрой: при выключенном Num Lock Qt
+            # присылает вместо неё стрелку или End, а человеку нужна цифра.
+            digit = numpad_digit(int(key))
+            if digit is not None:
+                if not mods & (Qt.KeyboardModifier.ControlModifier
+                               | Qt.KeyboardModifier.AltModifier
+                               | Qt.KeyboardModifier.MetaModifier):
+                    announce(self, "Цифровое поле назначается вместе с "
+                                   "Ctrl: голая цифра блока — это набор "
+                                   "числа.", assertive=True)
+                    return
+                self.keys = numpad_text(
+                    combo_text(mods, int(Qt.Key.Key_0) + digit))
+                self.accept()
+                return
         self.keys = combo_text(mods, key)
         self.accept()
 
@@ -2004,6 +2224,14 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         column.addWidget(note)
         add_key_buttons(settings.BUTTON_ACTIONS)
+        column.addSpacing(8)
+        column.addWidget(section_label("Вкладки"))
+        tabs_note = QLabel("Переключение на вкладки главного окна. "
+                           "Ctrl вместе с цифрой на цифровом блоке работает "
+                           "при любом положении Num Lock.")
+        tabs_note.setWordWrap(True)
+        column.addWidget(tabs_note)
+        add_key_buttons(settings.TAB_ACTIONS)
         self._show_keys()
         column.addStretch(1)
 
@@ -2360,10 +2588,14 @@ class MainWindow(QMainWindow):
         self.announcer = Announcer(self)
 
         self.tabs = QTabWidget(self)
+        # Стрелки прокрутки вкладок не нужны: вкладки переключаются с
+        # клавиатуры, а лишние кнопки только мешают.
+        self.tabs.tabBar().setUsesScrollButtons(False)
         self.setCentralWidget(self.tabs)
 
         # --- вкладка учеников
         page = QWidget()
+        self.students_page = page
         lay = QVBoxLayout(page)
         self.students_hint = QLabel()
         self.students_hint.setWordWrap(True)
@@ -2408,12 +2640,20 @@ class MainWindow(QMainWindow):
         self.cues_button = QPushButton()
         self.cues_button.clicked.connect(self.toggle_cues)
         row.addWidget(self.cues_button)
+        self.block_button = QPushButton("Добавить исключение уроков")
+        self.block_button.setAccessibleName(
+            "Добавить исключение уроков: день или часы, когда уроков не "
+            "будет вовсе")
+        self.block_button.clicked.connect(
+            lambda _checked=False: self.add_exception())
+        row.addWidget(self.block_button)
         row.addStretch(1)
         lay.addLayout(row)
         self.tabs.addTab(page, "Ученики")
 
         # --- вкладка расписания
         page = QWidget()
+        self.schedule_page = page
         lay = QVBoxLayout(page)
         self.schedule_hint = QLabel()
         self.schedule_hint.setWordWrap(True)
@@ -2488,6 +2728,9 @@ class MainWindow(QMainWindow):
         # --- горячие клавиши на всё приложение
         self._settings_open = False
         self._shortcuts: list[QShortcut] = []
+        # Сочетания с цифровым блоком приходят в фильтр событий, а не в
+        # QShortcut: фильтр понимает клавиши при любом положении Num Lock.
+        QApplication.instance().installEventFilter(self)
         self.install_shortcuts()
 
         # --- напоминания
@@ -2965,9 +3208,7 @@ class MainWindow(QMainWindow):
         future = [s for s in self.store.subscriptions
                   if s.future and not s.finished and not s.one_off]
         self._fill_subs(self.future_subs_list, future)
-        # Пустая вкладка будущих абонементов прячется, пока она не нужна.
-        self.tabs.setTabVisible(
-            self.tabs.indexOf(self.future_subs_page), bool(future))
+        self.update_tab_visibility()
 
     # Порядок переключателя: каждое нажатие — следующий вид.
     SUBS_ORDERS = (settings.SUBS_ORDER_DATE, settings.SUBS_ORDER_NAME,
@@ -3368,6 +3609,7 @@ class MainWindow(QMainWindow):
         щелчок открывает карточку ученика, которому эта услуга.
         """
         page = QWidget()
+        self.services_page = page
         lay = QVBoxLayout(page)
         self.services_hint = QLabel()
         self.services_hint.setWordWrap(True)
@@ -3554,6 +3796,31 @@ class MainWindow(QMainWindow):
         self.refresh_subscriptions()
         self.refresh_services()
         self.refresh_notifications()
+        self.update_tab_visibility()
+
+    def update_tab_visibility(self) -> None:
+        """Спрятать вкладки, в которых сейчас нечего показывать.
+
+        Ученики, расписание, действующие абонементы и услуги остаются
+        всегда: на них лежат кнопки, которыми заводят новые записи.
+        Остальные пустые вкладки не мешают переключаться.
+        """
+        pairs = (
+            ("finished_subs_page", "finished_subs_list"),
+            ("one_off_subs_page", "one_off_subs_list"),
+            ("future_subs_page", "future_subs_list"),
+            ("notifications_page", "notifications_list"),
+            ("blocks_page", "blocks_list"),
+        )
+        for page_name, list_name in pairs:
+            page = getattr(self, page_name, None)
+            item_list = getattr(self, list_name, None)
+            if page is None or item_list is None:
+                continue
+            index = self.tabs.indexOf(page)
+            if index < 0:
+                continue
+            self.tabs.setTabVisible(index, item_list.count() > 0)
 
     def selected_uid(self) -> int | None:
         item = self.students_list.currentItem()
@@ -3585,10 +3852,14 @@ class MainWindow(QMainWindow):
             if keys:
                 pieces.append(f"{keys} — {title.casefold()}")
         tail = " ".join(pieces)
+        tab_keys = norm_keys(self.bindings.get("tab_students", ""))
+        tab_tip = (f"Вкладки переключаются сочетанием {tab_keys} и дальше "
+                   "по цифрам по порядку. " if tab_keys else "")
         start_keys = norm_keys(self.bindings.get("start", ""))
         start_tip = (f"{start_keys} — начать урок. " if start_keys else "")
         self.students_hint.setText(
-            "Стрелки вверх и вниз — переход по ученикам. " + start_tip
+            "Стрелки вверх и вниз — переход по ученикам. " + tab_tip
+            + start_tip
             + "Урок начинается сам по расписанию; кнопка «Начать урок» — "
             "если ученик пришёл раньше или чуть позже. " + tail)
         self.start_button.setText(
@@ -3692,6 +3963,10 @@ class MainWindow(QMainWindow):
         for code, _title, _keys in settings.ALL_ACTIONS:
             text = norm_keys(self.bindings.get(code, ""))
             if not text:
+                continue
+            if NUMPAD_KEYS.match(text):
+                # Цифровой блок ловит фильтр событий главного окна: так
+                # сочетание работает при любом положении Num Lock.
                 continue
             sequence = QKeySequence(text)
             if sequence.isEmpty():
@@ -3881,6 +4156,68 @@ class MainWindow(QMainWindow):
             self.refresh_all()
         self.students_list.setFocus()
 
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt)
+        """Цифровой блок: поймать сочетание до окон, кнопок и полей.
+
+        Num Lock включён — Qt присылает цифру; выключен — ту же клавишу
+        как стрелку или End. Здесь цифровой блок узнаётся и в том, и в
+        другом положении, поэтому Ctrl с цифрой работает всегда.
+        """
+        if (event.type() == QEvent.Type.KeyPress
+                and not self._settings_open
+                and QApplication.activeModalWidget() in (None, self)):
+            action = self.numpad_action(event)
+            if action:
+                self.hotkey(action)
+                return True
+        return super().eventFilter(obj, event)
+
+    def numpad_action(self, event) -> str | None:
+        """Действие, назначенное на это сочетание цифрового блока."""
+        if not event.modifiers() & Qt.KeyboardModifier.KeypadModifier:
+            return None
+        # Голая цифра блока — это набор числа, а не команда: её пропускаем
+        # в поле, куда человек печатает. Команда — только с Ctrl, Alt
+        # или Meta.
+        if not event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                    | Qt.KeyboardModifier.AltModifier
+                                    | Qt.KeyboardModifier.MetaModifier):
+            return None
+        digit = numpad_digit(int(event.key()))
+        if digit is None:
+            return None
+        mods = event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                    | Qt.KeyboardModifier.ShiftModifier
+                                    | Qt.KeyboardModifier.AltModifier
+                                    | Qt.KeyboardModifier.MetaModifier)
+        pressed = norm_keys(numpad_text(
+            combo_text(mods, int(Qt.Key.Key_0) + digit)))
+        if not pressed:
+            return None
+        for code, _title, _keys in settings.ALL_ACTIONS:
+            if norm_keys(self.bindings.get(code, "")) == pressed:
+                return code
+        return None
+
+    def show_tab(self, page, item_list=None) -> None:
+        """Открыть вкладку по клавишам и поставить диктора на её список."""
+        index = self.tabs.indexOf(page)
+        if index < 0:
+            return
+        if not self.tabs.isTabVisible(index):
+            announce(self, "Эта вкладка сейчас пуста и спрятана.",
+                     assertive=True)
+            return
+        self.tabs.setCurrentIndex(index)
+        title = self.tabs.tabText(index)
+        if item_list is not None and item_list.count():
+            item_list.setFocus()
+            current = item_list.currentItem()
+            if current is not None:
+                announce(self, f"Вкладка {title}. {current.text()}")
+                return
+        announce(self, f"Вкладка {title}.")
+
     def hotkey(self, action: str) -> None:
         """Действие по коду из настроек — клавиши человек выбирает сам."""
         if action == "card":
@@ -3928,6 +4265,27 @@ class MainWindow(QMainWindow):
             self.edit_service()
         elif action == "service_remove":
             self.delete_service()
+        elif action == "block_add":
+            self.add_exception()
+        # Вкладки главного окна.
+        elif action == "tab_students":
+            self.show_tab(self.students_page, self.students_list)
+        elif action == "tab_schedule":
+            self.show_tab(self.schedule_page, self.schedule_list)
+        elif action == "tab_active":
+            self.show_tab(self.active_subs_page, self.active_subs_list)
+        elif action == "tab_finished":
+            self.show_tab(self.finished_subs_page, self.finished_subs_list)
+        elif action == "tab_one_off":
+            self.show_tab(self.one_off_subs_page, self.one_off_subs_list)
+        elif action == "tab_services":
+            self.show_tab(self.services_page, self.services_list)
+        elif action == "tab_notifications":
+            self.show_tab(self.notifications_page, self.notifications_list)
+        elif action == "tab_blocks":
+            self.show_tab(self.blocks_page, self.blocks_list)
+        elif action == "tab_future":
+            self.show_tab(self.future_subs_page, self.future_subs_list)
 
     def speak_day(self, day: date, what: str) -> None:
         lessons = [l for l in self.store.lessons
@@ -4128,6 +4486,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(self.block_line(block))
             item.setData(Qt.ItemDataRole.UserRole, block.uid)
             self.blocks_list.addItem(item)
+        self.update_tab_visibility()
 
     def selected_block(self) -> data.Block | None:
         item = self.blocks_list.currentItem()
@@ -4167,6 +4526,39 @@ class MainWindow(QMainWindow):
         announce(self, f"Закрыто {dates.human_date(block.day)}, с "
                        f"{block.start} до {block.end}. Записаться на это "
                        "время нельзя.")
+
+    def add_exception(self) -> None:
+        """Кнопка во вкладке «Ученики»: исключение на день или на часы.
+
+        То же самое, что делать это во вкладке «Исключения», только не
+        нужно туда переключаться: окно спрашивает дату и, если нужны
+        часы, переключатель «Весь день» снимается.
+        """
+        dialog = BlockDialog(whole_day=True, parent=self, flexible=True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.whole_day:
+            if self.store.overlapping_block(dialog.day) is not None:
+                announce(self, "На этот день исключение уже стоит.",
+                         assertive=True)
+                return
+            block = self.store.add_block(dialog.day, note=dialog.note)
+            text = (f"День закрыт: {dates.human_date(block.day)}. "
+                    "Записаться на него нельзя.")
+        else:
+            if self.store.overlapping_block(dialog.day, dialog.start,
+                                            dialog.end) is not None:
+                announce(self, "Это время уже закрыто исключением.",
+                         assertive=True)
+                return
+            block = self.store.add_block(dialog.day, dialog.start,
+                                         dialog.end, dialog.note)
+            text = (f"Закрыто {dates.human_date(block.day)}, с "
+                    f"{block.start} до {block.end}. Записаться на это "
+                    "время нельзя.")
+        self.refresh_blocks()
+        self.refresh_schedule()
+        announce(self, text, assertive=True)
 
     def remove_block(self) -> None:
         block = self.selected_block()
@@ -4290,6 +4682,7 @@ class MainWindow(QMainWindow):
         else:
             self.notifications_hint.setText(
                 "Неподтверждённых уведомлений нет.")
+        self.update_tab_visibility()
 
     def confirm_notification(self) -> None:
         """Подтвердить выбранное уведомление: оно уходит из списка."""

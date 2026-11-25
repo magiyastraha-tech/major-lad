@@ -78,9 +78,24 @@ BUTTON_ACTIONS = (
     ("service_add", "Добавить услугу", ""),
     ("service_edit", "Редактировать услугу", ""),
     ("service_remove", "Удалить услугу", ""),
+    ("block_add", "Добавить исключение уроков", ""),
 )
 
-ALL_ACTIONS = ACTIONS + BUTTON_ACTIONS
+# Вкладки главного окна. Клавиши по умолчанию — Ctrl вместе с цифрой
+# на цифровом блоке: Num Lock при этом работает в любом положении.
+TAB_ACTIONS = (
+    ("tab_students", "Вкладка «Ученики»", "Ctrl+Num1"),
+    ("tab_schedule", "Вкладка «Расписание»", "Ctrl+Num2"),
+    ("tab_active", "Вкладка «Действующие абонементы»", "Ctrl+Num3"),
+    ("tab_finished", "Вкладка «Законченные абонементы»", "Ctrl+Num4"),
+    ("tab_one_off", "Вкладка «Разовые и пробные уроки»", "Ctrl+Num5"),
+    ("tab_services", "Вкладка «Услуги»", "Ctrl+Num6"),
+    ("tab_notifications", "Вкладка «Уведомления»", "Ctrl+Num7"),
+    ("tab_blocks", "Вкладка «Исключения»", "Ctrl+Num8"),
+    ("tab_future", "Вкладка «Будущие абонементы»", "Ctrl+Num9"),
+)
+
+ALL_ACTIONS = ACTIONS + BUTTON_ACTIONS + TAB_ACTIONS
 
 # Раньше настройки открывались по F10. Если в файле так и осталось —
 # подставляем новую клавишу, иначе Ctrl+P не заработает у тех, кто уже
