@@ -1428,33 +1428,37 @@ class Store:
         """Привести запись журнала оплат в соответствие с абонементом.
 
         Запись, заведённая вместе с абонементом или разовым уроком, ищется
-        по ученику, дате покупки и подписи. Нашлась — правятся дата,
-        подпись и сумма: заработок и журнал держат одну и ту же цифру.
-        Не нашлась, а урок разовый и платный — запись заводится. Сумма
-        ноль — парная запись убирается, денег не брали.
+        по ученику и виду записи: сначала того же дня (старого или нового),
+        потом ближайшую к дню покупки. Нашлась — правятся дата, подпись и
+        сумма: заработок и журнал держат одну и ту же цифру. Не нашлась, а
+        урок разовый и платный — запись заводится. Сумма ноль — парная
+        запись убирается, денег не брали.
         """
         if sub.trial:
             return
+        want = "single" if sub.single else "sub"
         days = {day for day in (sub.bought, old_day) if day is not None}
         found = []
         for payment in self.payments:
-            if payment.student != sub.student or payment.day not in days:
+            if payment.student != sub.student:
                 continue
-            what = payment.what.strip()
-            if sub.single:
-                if what in ("Разовый урок", "Урок"):
-                    found.append(payment)
-            elif what.startswith("Абонемент"):
-                found.append(payment)
+            if self._payment_kind(payment.what) != want:
+                continue
+            gap = abs((payment.day - sub.bought).days)
+            if payment.day in days:
+                found.append((0, payment))
+            elif gap <= 45:
+                found.append((gap, payment))
+        found.sort(key=lambda item: item[0])
         pair = None
         if old_total is not None and not sub.single:
             old_label = self._subs_payment_label(old_total)
-            for payment in found:
+            for _gap, payment in found:
                 if payment.what.strip() == old_label:
                     pair = payment
                     break
         if pair is None and found:
-            pair = found[0]
+            pair = found[0][1]
         if pair is None:
             if sub.single and sub.price > 0:
                 self.add_payment(sub.student, "Разовый урок",
@@ -1524,15 +1528,72 @@ class Store:
                 return block
         return None
 
+    @staticmethod
+    def _payment_kind(what: str) -> str:
+        """Вид записи журнала: абонемент, разовый урок или не пара."""
+        what = (what or "").strip()
+        if what.startswith("Абонемент"):
+            return "sub"
+        if what in ("Разовый урок", "Урок"):
+            return "single"
+        return ""
+
+    def _paired_payments(self) -> set[int]:
+        """Записи журнала, заведённые вместе с абонементом или уроком.
+
+        Пара ищется по ученику и виду записи: сперва того же дня покупки,
+        потом ближайшего к нему — дату покупки могли поправить, а строка
+        журнала осталась старой. Без этого заработок то задваивался, то
+        терял деньги. Повтор уже найденной строки (тот же ученик, день,
+        подпись и сумма) тоже считается парным: старые дубли от прежних
+        версий не должны прибавляться второй раз.
+        """
+        taken: dict[int, Payment] = {}
+        used: set[int] = set()
+        for exact in (True, False):
+            for sub in self.subscriptions:
+                if sub.uid in taken:
+                    continue
+                want = "single" if sub.single else "sub"
+                best = None
+                for payment in self.payments:
+                    if payment.uid in used or payment.student != sub.student:
+                        continue
+                    if self._payment_kind(payment.what) != want:
+                        continue
+                    gap = abs((payment.day - sub.bought).days)
+                    if exact and gap:
+                        continue
+                    if not exact and gap > 45:
+                        continue
+                    if best is None or gap < abs((best.day - sub.bought).days):
+                        best = payment
+                if best is not None:
+                    taken[sub.uid] = best
+                    used.add(best.uid)
+        for payment in self.payments:
+            if payment.uid in used:
+                continue
+            for other in taken.values():
+                if (payment.student == other.student
+                        and payment.day == other.day
+                        and payment.what.strip() == other.what.strip()
+                        and int(payment.amount) == int(other.amount)):
+                    used.add(payment.uid)
+                    break
+        return used
+
     def earnings_in_month(self, year: int, month: int) -> dict[str, int]:
         """Из чего сложился заработок месяца.
 
         Абонементы и разовые уроки считаются по самой записи абонемента:
         деньги получены при покупке, и в заработок идёт ровно та сумма,
-        что стоит в абонементе или в разовом уроке. Запись журнала оплат,
-        заведённая вместе с ними, второй раз не прибавляется. Пробные
-        уроки не считаются вовсе. Услуги и прочие поступления берутся из
-        журнала оплат.
+        что стоит в абонементе или в разовом уроке, — её человек и правит
+        в окне. Запись журнала оплат, заведённая вместе с ними, второй раз
+        не прибавляется, даже если её дата разошлась с датой покупки.
+        Пробные уроки не считаются вовсе. Если абонемент удалён, а запись
+        журнала осталась, деньги не теряются: такая запись идёт в
+        законченные. Услуги и прочие поступления берутся из журнала оплат.
 
         Ключи: active — действующие абонементы, finished — законченные,
         future — купленные заранее, single — разовые уроки, service —
@@ -1543,47 +1604,37 @@ class Store:
 
         parts = {"active": 0, "finished": 0, "future": 0,
                  "single": 0, "service": 0, "other": 0}
-        singles = []
         for sub in self.subscriptions:
-            if sub.trial:
+            if sub.trial or not same_month(sub.bought):
                 continue
+            amount = int(sub.price)
             if sub.single:
-                # Сумма берётся из самого урока, а не из журнала: правка
-                # стоимости меняет заработок сразу.
-                if same_month(sub.bought):
-                    parts["single"] += int(sub.price)
-                singles.append(sub)
-                continue
-            if not same_month(sub.bought):
-                continue
-            if sub.finished:
-                parts["finished"] += int(sub.price)
+                parts["single"] += amount
+            elif sub.finished:
+                parts["finished"] += amount
             elif sub.future:
-                parts["future"] += int(sub.price)
+                parts["future"] += amount
             else:
-                parts["active"] += int(sub.price)
-        paid_for = set()
+                parts["active"] += amount
+        paired = self._paired_payments()
+        seen_subs: set[tuple] = set()
         for payment in self.payments:
-            if not same_month(payment.day):
+            if payment.uid in paired or not same_month(payment.day):
                 continue
             what = payment.what.strip()
-            if what.startswith("Абонемент"):
-                continue  # уже посчитан по самому абонементу
             if what == "Пробный урок":
                 continue  # пробные уроки не считаем
-            if what in ("Разовый урок", "Урок"):
-                # Одна запись журнала на каждый разовый урок: она уже
-                # посчитана по абонементу, второй раз не прибавляем.
-                pair = None
-                for sub in singles:
-                    if (sub.uid not in paid_for
-                            and sub.student == payment.student
-                            and sub.bought == payment.day):
-                        pair = sub
-                        break
-                if pair is not None:
-                    paid_for.add(pair.uid)
+            if what.startswith("Абонемент"):
+                # Абонемента уже нет, а деньги были — поступления не теряем.
+                # Одинаковые строки (прежние версии заводили дубли) считаем
+                # один раз.
+                sign = (payment.student, payment.day, what,
+                        int(payment.amount))
+                if sign in seen_subs:
                     continue
+                seen_subs.add(sign)
+                parts["finished"] += int(payment.amount)
+            elif what in ("Разовый урок", "Урок"):
                 parts["single"] += int(payment.amount)
             elif what in SERVICES:
                 parts["service"] += int(payment.amount)

@@ -1925,9 +1925,95 @@ NUMPAD_TEXT = re.compile(r"(?i)(?<![A-Za-z])num(?=\s*[0-9])")
 NUMPAD_KEYS = re.compile(r"(?i)^(?:[A-Za-z]+\+)*Num\+[0-9]$")
 
 
+# Скан-коды цифрового блока в Windows: 0x52 — 0, 0x4F–0x51 — 1–3,
+# 0x4B–0x4D — 4–6, 0x47–0x49 — 7–9. Они одинаковы при любом положении
+# Num Lock, поэтому это самая надёжная примета. Стрелки и End отдельной
+# части клавиатуры приходят со старшим битом (0x100) и сюда не попадают.
+NUMPAD_SCAN = {
+    0x52: 0, 0x4F: 1, 0x50: 2, 0x51: 3, 0x4B: 4,
+    0x4C: 5, 0x4D: 6, 0x47: 7, 0x48: 8, 0x49: 9,
+}
+
+# Действие без Ctrl, Alt или Meta не срабатывает: голая цифра блока —
+# это набор числа в поле, куда человек печатает.
+COMMAND_MODS = int(Qt.KeyboardModifier.ControlModifier
+                   | Qt.KeyboardModifier.AltModifier
+                   | Qt.KeyboardModifier.MetaModifier)
+ALL_MODS = int(Qt.KeyboardModifier.ControlModifier
+               | Qt.KeyboardModifier.ShiftModifier
+               | Qt.KeyboardModifier.AltModifier
+               | Qt.KeyboardModifier.MetaModifier)
+
+
 def numpad_digit(key: int) -> int | None:
     """Какая цифра блока нажата — при любом положении Num Lock."""
     return NUMPAD_DIGITS.get(key)
+
+
+def numpad_index(event) -> tuple[int | None, bool]:
+    """Цифра цифрового блока и уверенность, что нажата именно она.
+
+    Приметы по надёжности: скан-код Windows (Num Lock не важен), затем
+    пометка цифрового блока Qt, затем обычная цифра верхнего ряда. Раньше
+    всё держалось на одной пометке Qt — и на Windows она для цифр блока
+    с включённым Num Lock приходит не всегда, из-за чего сочетания с
+    Ctrl молчали. Обычная цифра считается догадкой: её может нажать и
+    верхний ряд, поэтому совпадение с назначением цифрового блока для
+    неё — запасной путь, а не первый.
+    """
+    if sys.platform == "win32":
+        try:
+            scan = int(event.nativeScanCode())
+        except (AttributeError, TypeError, ValueError):
+            scan = -1
+        if 0 <= scan < 0x100:
+            digit = NUMPAD_SCAN.get(scan)
+            if digit is not None:
+                return digit, True
+    if event.modifiers() & Qt.KeyboardModifier.KeypadModifier:
+        digit = numpad_digit(int(event.key()))
+        if digit is not None:
+            return digit, True
+    key = int(event.key())
+    if int(Qt.Key.Key_0) <= key <= int(Qt.Key.Key_9):
+        return key - int(Qt.Key.Key_0), False
+    return None, False
+
+
+def digit_binding(text: str) -> tuple[int, int, bool] | None:
+    """Назначение на цифру: (модификаторы, цифра, цифровой ли это блок).
+
+    «Ctrl+Num1» и «Ctrl+Num+1» — цифровой блок, «Ctrl+1» — обычная
+    цифра. Строку разбираем сами, без Qt: на разборе сочетаний с цифровым
+    блоком Qt ненадёжен, а сравнение выходит точным.
+    """
+    mods = 0
+    digit = None
+    keypad = False
+    for token in (text or "").replace(" ", "").split("+"):
+        low = token.casefold()
+        if not low:
+            continue
+        if low == "ctrl":
+            mods |= int(Qt.KeyboardModifier.ControlModifier)
+        elif low == "alt":
+            mods |= int(Qt.KeyboardModifier.AltModifier)
+        elif low == "shift":
+            mods |= int(Qt.KeyboardModifier.ShiftModifier)
+        elif low in ("meta", "win"):
+            mods |= int(Qt.KeyboardModifier.MetaModifier)
+        elif low == "num":
+            keypad = True
+        elif low.startswith("num") and low[3:].isdigit():
+            keypad = True
+            digit = int(low[3:])
+        elif len(low) == 1 and low.isdigit() and digit is None:
+            digit = int(low)
+        else:
+            return None
+    if digit is None:
+        return None
+    return mods, digit, keypad
 
 
 def numpad_text(text: str) -> str:
@@ -2027,22 +2113,21 @@ class KeyCaptureDialog(QDialog):
                                     | Qt.KeyboardModifier.ShiftModifier
                                     | Qt.KeyboardModifier.AltModifier
                                     | Qt.KeyboardModifier.MetaModifier)
-        if event.modifiers() & Qt.KeyboardModifier.KeypadModifier:
-            # Цифровой блок записываем цифрой: при выключенном Num Lock Qt
-            # присылает вместо неё стрелку или End, а человеку нужна цифра.
-            digit = numpad_digit(int(key))
-            if digit is not None:
-                if not mods & (Qt.KeyboardModifier.ControlModifier
-                               | Qt.KeyboardModifier.AltModifier
-                               | Qt.KeyboardModifier.MetaModifier):
-                    announce(self, "Цифровое поле назначается вместе с "
-                                   "Ctrl: голая цифра блока — это набор "
-                                   "числа.", assertive=True)
-                    return
-                self.keys = numpad_text(
-                    combo_text(mods, int(Qt.Key.Key_0) + digit))
-                self.accept()
+        # Цифровой блок узнаём так же, как главное окно (скан-код,
+        # пометка Qt или цифра), и записываем цифрой: при выключенном
+        # Num Lock Qt присылает вместо неё стрелку или End, а человеку
+        # нужна цифра.
+        digit, keypad = numpad_index(event)
+        if keypad and digit is not None:
+            if not mods & COMMAND_MODS:
+                announce(self, "Цифровое поле назначается вместе с "
+                               "Ctrl: голая цифра блока — это набор "
+                               "числа.", assertive=True)
                 return
+            self.keys = numpad_text(
+                combo_text(mods, int(Qt.Key.Key_0) + digit))
+            self.accept()
+            return
         self.keys = combo_text(mods, key)
         self.accept()
 
@@ -3960,15 +4045,33 @@ class MainWindow(QMainWindow):
             shortcut.deleteLater()
         self._shortcuts = []
         enabled = not self._settings_open
+        # Какие цифры верхнего ряда уже заняты: запасной ярлык для цифро-
+        # вого блока не должен перебивать собственное назначение человека.
+        plain_used = set()
         for code, _title, _keys in settings.ALL_ACTIONS:
-            text = norm_keys(self.bindings.get(code, ""))
+            parsed = digit_binding(self.bindings.get(code, ""))
+            if parsed is not None and not parsed[2] and parsed[0] & COMMAND_MODS:
+                plain_used.add((parsed[0], parsed[1]))
+        for code, _title, _keys in settings.ALL_ACTIONS:
+            raw = self.bindings.get(code, "")
+            text = norm_keys(raw)
             if not text:
                 continue
             if NUMPAD_KEYS.match(text):
                 # Цифровой блок ловит фильтр событий главного окна: так
-                # сочетание работает при любом положении Num Lock.
-                continue
-            sequence = QKeySequence(text)
+                # сочетание работает при любом положении Num Lock. Запасной
+                # ярлык — та же цифра верхнего ряда: если пометка блока до
+                # фильтра не дошла, Qt всё равно узнает сочетание.
+                parsed = digit_binding(raw)
+                if parsed is None:
+                    continue
+                mods, digit, _keypad = parsed
+                if (mods, digit) in plain_used:
+                    continue
+                sequence = QKeySequence(
+                    combo_text(mods, int(Qt.Key.Key_0) + digit))
+            else:
+                sequence = QKeySequence(text)
             if sequence.isEmpty():
                 continue
             shortcut = QShortcut(sequence, self)
@@ -4173,30 +4276,36 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def numpad_action(self, event) -> str | None:
-        """Действие, назначенное на это сочетание цифрового блока."""
-        if not event.modifiers() & Qt.KeyboardModifier.KeypadModifier:
+        """Действие, назначенное на это сочетание цифрового блока.
+
+        Цифру блока узнаём по скан-коду, пометке Qt или по самой цифре —
+        см. numpad_index. Назначение разбираем на модификаторы и цифру
+        (digit_binding) и сравниваем напрямую: так неважно, как именно Qt
+        записал сочетание в файле настроек. Если нажата не цифра блока,
+        а обычная цифра верхнего ряда, первыми проверяются назначения на
+        верхний ряд, и только потом — на блок.
+        """
+        mods = int(event.modifiers()) & ALL_MODS
+        if not mods & COMMAND_MODS:
             return None
-        # Голая цифра блока — это набор числа, а не команда: её пропускаем
-        # в поле, куда человек печатает. Команда — только с Ctrl, Alt
-        # или Meta.
-        if not event.modifiers() & (Qt.KeyboardModifier.ControlModifier
-                                    | Qt.KeyboardModifier.AltModifier
-                                    | Qt.KeyboardModifier.MetaModifier):
-            return None
-        digit = numpad_digit(int(event.key()))
+        digit, keypad = numpad_index(event)
         if digit is None:
             return None
-        mods = event.modifiers() & (Qt.KeyboardModifier.ControlModifier
-                                    | Qt.KeyboardModifier.ShiftModifier
-                                    | Qt.KeyboardModifier.AltModifier
-                                    | Qt.KeyboardModifier.MetaModifier)
-        pressed = norm_keys(numpad_text(
-            combo_text(mods, int(Qt.Key.Key_0) + digit)))
-        if not pressed:
-            return None
+        exact: list[str] = []
+        spare: list[str] = []
         for code, _title, _keys in settings.ALL_ACTIONS:
-            if norm_keys(self.bindings.get(code, "")) == pressed:
-                return code
+            parsed = digit_binding(self.bindings.get(code, ""))
+            if parsed is None:
+                continue
+            bind_mods, bind_digit, bind_keypad = parsed
+            if bind_digit != digit or bind_mods != mods:
+                continue
+            if bind_keypad == keypad:
+                exact.append(code)
+            else:
+                spare.append(code)
+        for code in exact + spare:
+            return code
         return None
 
     def show_tab(self, page, item_list=None) -> None:
