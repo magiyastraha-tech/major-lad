@@ -417,8 +417,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 "З"
             }
-            contentDescription = if (micOn) "Микрофон включён, нажмите, чтобы выключить"
-                else "Микрофон выключен, нажмите, чтобы включить"
+            contentDescription = if (micOn) "Микрофон включён" else "Микрофон выключен"
             setBackgroundResource(if (micOn) R.drawable.bg_pic_on else R.drawable.bg_pic_off)
         }
         btnMetro?.apply {
@@ -427,8 +426,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 "М"
             }
-            contentDescription = if (metroOn) "Метроном включён, нажмите, чтобы выключить"
-                else "Метроном выключен, нажмите, чтобы включить"
+            contentDescription = if (metroOn) "Метроном включён" else "Метроном выключен"
             setBackgroundResource(if (metroOn) R.drawable.bg_pic_on else R.drawable.bg_pic_off)
         }
         btnExpand?.apply {
@@ -442,7 +440,6 @@ class MainActivity : AppCompatActivity() {
         val full = findViewById<ImageView>(R.id.fullVideo)
         if (box.visibility == View.VISIBLE) {
             box.visibility = View.GONE
-            announce("Видео свёрнуто")
         } else {
             full.setImageDrawable(videoView?.drawable)
             box.visibility = View.VISIBLE
@@ -794,7 +791,7 @@ class MainActivity : AppCompatActivity() {
     private fun updatePlayButton() {
         btnPlay?.text = if (player.playing) (if (isTeacher) "Стоп" else "⏹")
         else (if (isTeacher) "Играть" else "▶")
-        btnPlay?.contentDescription = if (player.playing) "Остановить воспроизведение" else "Играть"
+        btnPlay?.contentDescription = if (player.playing) "Остановить" else "Играть"
         btnPlay?.setBackgroundResource(
             if (player.playing) R.drawable.bg_pic_on else R.drawable.bg_pic_off
         )

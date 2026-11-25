@@ -44,14 +44,12 @@
             android:imeOptions="actionSend"
             android:importantForAutofill="no"
             android:inputType="textCapSentences|textMultiLine"
-            android:contentDescription="Поле сообщения"
             android:maxLines="4" />
 
         <Button
             android:id="@+id/btnSend"
             android:layout_width="wrap_content"
             android:layout_height="52dp"
-            android:contentDescription="Отправить сообщение"
             android:text="Отправить" />
     </LinearLayout>
 

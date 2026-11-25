@@ -27,7 +27,7 @@
             android:layout_height="wrap_content"
             android:layout_marginEnd="6dp"
             android:layout_weight="1"
-            android:contentDescription="Импортировать треки от собеседника"
+            android:contentDescription="Импорт трека"
             android:text="Импорт" />
 
         <Button
@@ -35,7 +35,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:contentDescription="Удалить выбранный трек"
+            android:contentDescription="Удалить трек"
             android:text="Удалить" />
     </LinearLayout>
 
@@ -72,7 +72,7 @@
             android:layout_height="80dp"
             android:layout_weight="1"
             android:background="@drawable/bg_pic_off"
-            android:contentDescription="Перемотка назад на 5 секунд"
+            android:contentDescription="Перемотка назад"
             android:minWidth="0dp"
             android:text="⏪"
             android:textColor="#ffffff"
@@ -86,7 +86,7 @@
             android:layout_marginEnd="8dp"
             android:layout_weight="1"
             android:background="@drawable/bg_pic_off"
-            android:contentDescription="Играть или остановить"
+            android:contentDescription="Играть"
             android:minWidth="0dp"
             android:text="▶"
             android:textColor="#ffffff"
@@ -98,7 +98,7 @@
             android:layout_height="80dp"
             android:layout_weight="1"
             android:background="@drawable/bg_pic_off"
-            android:contentDescription="Перемотка вперёд на 5 секунд"
+            android:contentDescription="Перемотка вперёд"
             android:minWidth="0dp"
             android:text="⏩"
             android:textColor="#ffffff"
