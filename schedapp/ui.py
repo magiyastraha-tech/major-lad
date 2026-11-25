@@ -4054,23 +4054,21 @@ class MainWindow(QMainWindow):
                 plain_used.add((parsed[0], parsed[1]))
         for code, _title, _keys in settings.ALL_ACTIONS:
             raw = self.bindings.get(code, "")
-            text = norm_keys(raw)
-            if not text:
-                continue
-            if NUMPAD_KEYS.match(text):
+            parsed = digit_binding(raw)
+            if parsed is not None and parsed[2]:
                 # Цифровой блок ловит фильтр событий главного окна: так
                 # сочетание работает при любом положении Num Lock. Запасной
                 # ярлык — та же цифра верхнего ряда: если пометка блока до
                 # фильтра не дошла, Qt всё равно узнает сочетание.
-                parsed = digit_binding(raw)
-                if parsed is None:
-                    continue
                 mods, digit, _keypad = parsed
                 if (mods, digit) in plain_used:
                     continue
                 sequence = QKeySequence(
                     combo_text(mods, int(Qt.Key.Key_0) + digit))
             else:
+                text = norm_keys(raw)
+                if not text:
+                    continue
                 sequence = QKeySequence(text)
             if sequence.isEmpty():
                 continue
