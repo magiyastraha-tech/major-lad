@@ -73,12 +73,23 @@ coll = COLLECT(
     name="MajorLad-Student",
 )
 
+# Версия в окне «Об этом приложении» на Маке. Берём её из пакета,
+# чтобы не держать второй список версий в spec-файле.
+_version = "0.0.0"
+with open("gcapp/__init__.py", encoding="utf-8") as _f:
+    for _line in _f:
+        if _line.startswith("__version__"):
+            _version = _line.split("=", 1)[1].strip().strip('"').strip("'")
+            break
+
 app = BUNDLE(
     coll,
     name="MajorLad-Student.app",
     icon=None,
     bundle_identifier="tech.magiyastraha.majorlad.student",
     info_plist={
+        "CFBundleShortVersionString": _version,
+        "CFBundleVersion": _version,
         "CFBundleDisplayName": "Мажорный лад ученик",
         "CFBundleName": "MajorLad-Student",
         "NSMicrophoneUsageDescription":

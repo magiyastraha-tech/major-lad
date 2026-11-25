@@ -8,6 +8,7 @@ on:
       - '**.md'
       # Правка маковской сборки не повод пересобирать Windows.
       - '.github/workflows/build-macos.yml'
+      - 'MajorLad-Student-macos.spec'
 
 jobs:
   build:
