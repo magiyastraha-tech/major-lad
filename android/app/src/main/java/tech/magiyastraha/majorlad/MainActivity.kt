@@ -208,10 +208,25 @@ class MainActivity : AppCompatActivity() {
         (findViewById<View>(viewId("btnConnect")) as? Button)?.setOnClickListener { connectStudent() }
     }
 
-    /** Порт из настроек; пустой или неверный — порт по умолчанию. */
-    private fun savedPort(): Int =
-        prefs.getString("port", "").orEmpty().trim().toIntOrNull()
-            ?.takeIf { it in 1..65535 } ?: Proto.APP_PORT
+    /**
+     * Порт из настроек; пустой, неверный или старый (45800) — порт по умолчанию.
+     * Версии учителя и ученика ставятся поверх друг друга, поэтому в настройках
+     * может лежать порт, сохранённый прежней установкой.
+     */
+    private fun savedPort(): Int {
+        val raw = prefs.getString("port", "").orEmpty().trim()
+        val stored = raw.toIntOrNull()
+        if (stored == Proto.LEGACY_PORT) {
+            prefs.edit().putString("port", Proto.APP_PORT.toString()).apply()
+            return Proto.APP_PORT
+        }
+        return stored?.takeIf { it in 1..65535 } ?: Proto.APP_PORT
+    }
+
+    /** Порт, введённый руками: старый 45800 тоже заменяется на текущий. */
+    private fun enteredPort(text: String): Int =
+        text.toIntOrNull()?.takeIf { it in 1..65535 && it != Proto.LEGACY_PORT }
+            ?: Proto.APP_PORT
 
     private fun startServer() {
         val name = prefs.getString("name", "").orEmpty().ifEmpty { "Преподаватель" }
@@ -248,7 +263,7 @@ class MainActivity : AppCompatActivity() {
         val port = findViewById<View>(R.id.editPort) as? EditText
         val name = findViewById<View>(R.id.editName) as? EditText
         host?.setText(prefs.getString("host", ""))
-        port?.setText(prefs.getString("port", Proto.APP_PORT.toString()))
+        port?.setText(savedPort().toString())
         name?.setText(prefs.getString("name", ""))
     }
 
@@ -270,7 +285,7 @@ class MainActivity : AppCompatActivity() {
         val portText = (findViewById<View>(R.id.editPort) as? EditText)?.text?.toString()?.trim().orEmpty()
         val name = (findViewById<View>(R.id.editName) as? EditText)?.text?.toString()?.trim().orEmpty()
             .ifEmpty { "Ученик" }
-        val port = portText.toIntOrNull()?.takeIf { it in 1..65535 } ?: Proto.APP_PORT
+        val port = enteredPort(portText)
         if (host.isEmpty()) {
             setStatus("Впишите адрес преподавателя, например 192.168.1.42")
             return
@@ -834,7 +849,7 @@ class MainActivity : AppCompatActivity() {
         val ipRow = view.findViewById<View>(R.id.ipRow)
         nameEdit.setText(prefs.getString("name", ""))
         hostEdit.setText(prefs.getString("host", ""))
-        portEdit.setText(prefs.getString("port", Proto.APP_PORT.toString()))
+        portEdit.setText(savedPort().toString())
         // Адрес преподавателя нужен только ученику, а порт —
         // обоим: преподаватель открывает на нём кабинет.
         if (isTeacher) ipRow.visibility = View.GONE
@@ -852,11 +867,12 @@ class MainActivity : AppCompatActivity() {
         outSpinner.setSelection(indexOfType(outDevices, prefs.getInt("outType", -1)))
 
         AlertDialog.Builder(this)
-            .setTitle("Настройки")
+            .setTitle("Настройки, версия ${BuildConfig.VERSION_NAME}")
             .setView(view)
             .setPositiveButton("Сохранить") { _, _ ->
                 val portText = portEdit.text.toString().trim()
-                val newPort = portText.toIntOrNull()?.takeIf { it in 1..65535 }
+                val newPort = portText.toIntOrNull()
+                    ?.takeIf { it in 1..65535 && it != Proto.LEGACY_PORT }
                 prefs.edit()
                     .putString("name", nameEdit.text.toString().trim())
                     .putString("host", hostEdit.text.toString().trim())
