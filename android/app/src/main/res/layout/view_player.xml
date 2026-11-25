@@ -24,6 +24,7 @@
             android:layout_height="wrap_content"
             android:layout_marginEnd="6dp"
             android:layout_weight="1"
+            android:contentDescription="Импортировать треки от собеседника"
             android:text="Импорт трека" />
 
         <Button
@@ -31,6 +32,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:contentDescription="Удалить выбранный трек"
             android:text="Удалить трек" />
     </LinearLayout>
 
