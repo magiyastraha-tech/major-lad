@@ -361,6 +361,10 @@ class Store:
         # расхождение из старых версий сводим к тому, что записано в
         # журнале, — там деньги, которые человек получил.
         self.reconcile_payments()
+        # Старые версии при отметке урока дописывали в журнал строку «Урок»
+        # на цену урока, хотя денег за неё не получали. Это не оплата —
+        # убираем такие строки из журнала, чтобы они не путали заработок.
+        self._purge_mark_payments()
         self._refresh_files()
 
     # --- база ------------------------------------------------------------
@@ -1552,12 +1556,19 @@ class Store:
 
     @staticmethod
     def _payment_kind(what: str) -> str:
-        """Вид записи журнала: абонемент, разовый, пробный или не пара.
+        """Вид записи журнала: абонемент, разовый, пробный или отметка.
 
         Подпись сравниваем без регистра, лишних пробелов и разницы «ё/е»:
-        старые версии и правки руками пишут «разовый урок», «Урок»,
-        «Разовый» — это всё один разовый урок, и деньги за него нельзя
-        терять в «прочих поступлениях», а урок нельзя оставить без пары.
+        старые версии и правки руками пишут «разовый урок», «Разовый» —
+        это всё один разовый урок, и деньги за него нельзя терять в
+        «прочих поступлениях».
+
+        Отдельно — голая подпись «Урок». Так старые версии отмечали, что
+        урок проведён: строку на сумму урока они писали в журнал оплат
+        сами, хотя денег за неё никто не получал. Нынешняя версия так не
+        делает: разовый урок пишется как «Разовый урок», абонемент — как
+        «Абонемент, N занятий». Поэтому «Урок» — не оплата, а старая
+        отметка, и в заработок она не идёт.
         """
         text = _norm_label(what)
         if not text:
@@ -1568,7 +1579,9 @@ class Store:
             return "trial"
         if text.startswith("разов"):
             return "single"
-        if text in ("урок", "уроки", "занятие", "занятия", "урок разовый"):
+        if text in ("урок", "уроки"):
+            return "mark"
+        if text in ("занятие", "занятия", "урок разовый"):
             return "single"
         if text.startswith("урок,") or text.startswith("урок "):
             return "single"
@@ -1678,6 +1691,36 @@ class Store:
         if changed:
             self.save_subscriptions()
 
+    def _purge_mark_payments(self) -> None:
+        """Убрать из журнала старые отметки «Урок», которые не были оплатой.
+
+        Старые версии при отметке урока писали в журнал строку «Урок» на
+        цену урока, хотя урок шёл по абонементу или был пробным, и денег
+        за такую строку никто не получал. Удаляем только доказуемое: у
+        строки в тот же день есть проведённый урок того же ученика на ту
+        же сумму, и урок записан в абонемент — значит, деньги пришли
+        абонементом. Строка без такой пары остаётся в журнале (её могли
+        вписать руками), но в заработок она всё равно не идёт.
+        """
+        marked = set()
+        for lesson in self.lessons:
+            if lesson.status != LESSON_DONE or not lesson.subscription:
+                continue
+            marked.add((_norm_label(lesson.student), lesson.day,
+                        int(lesson.price)))
+        doomed = [payment for payment in self.payments
+                  if self._payment_kind(payment.what) == "mark"
+                  and (_norm_label(payment.student), payment.day,
+                       int(payment.amount)) in marked]
+        if not doomed:
+            return
+        gone = {payment.uid for payment in doomed}
+        self.payments = [p for p in self.payments if p.uid not in gone]
+        self.save_payments()
+        tail = (f"Из журнала оплат убрано старых отметок «Урок»: "
+                f"{len(doomed)}. Это не были деньги.")
+        self.notice = (self.notice + " " + tail) if self.notice else tail
+
     def earnings_in_month(self, year: int, month: int) -> dict[str, int]:
         """Из чего сложился заработок месяца.
 
@@ -1714,24 +1757,14 @@ class Store:
             else:
                 parts["active"] += amount
 
-        # Старые версии при отметке урока писали строку «Урок» на сумму
-        # урока, даже если урок шёл по абонементу. Такая строка без пары
-        # не разовый урок: если у ученика в тот день есть проведённый
-        # урок на ту же сумму, деньги принадлежат его абонементу.
-        lesson_subs: dict[tuple[str, date, int], int] = {}
-        for lesson in self.lessons:
-            if lesson.status != LESSON_DONE or not lesson.subscription:
-                continue
-            lesson_subs.setdefault(
-                (_norm_label(lesson.student), lesson.day, int(lesson.price)),
-                lesson.subscription)
-
         for payment in self.payments:
             if payment.uid in dups or not same_month(payment.day):
                 continue
             kind = self._payment_kind(payment.what)
             if kind == "trial":
                 continue  # пробные уроки не считаем
+            if kind == "mark":
+                continue  # старая отметка урока, а не оплата
             amount = int(payment.amount)
             sub = by_uid.get(pair_of.get(payment.uid, -1))
             if sub is not None:
@@ -1742,12 +1775,7 @@ class Store:
                 # Абонемента уже нет, а деньги были — поступления не теряем.
                 parts["finished"] += amount
             elif kind == "single":
-                lesson_sub = by_uid.get(lesson_subs.get(
-                    (_norm_label(payment.student), payment.day, amount), -1))
-                if lesson_sub is not None and not lesson_sub.trial:
-                    add_to_sub(lesson_sub, amount)
-                else:
-                    parts["single"] += amount
+                parts["single"] += amount
             elif _norm_label(payment.what) in _SERVICE_LABELS:
                 parts["service"] += amount
             else:
