@@ -8,7 +8,10 @@ on:
       - '**.md'
       # Правка маковской сборки не повод пересобирать Windows.
       - '.github/workflows/build-macos.yml'
+      - '.github/workflows/build-android.yml'
       - 'MajorLad-Student-macos.spec'
+      # Android-версия собирается своим workflow, Windows она не трогает.
+      - 'android/**'
 
 jobs:
   build:

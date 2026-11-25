@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Звук преподавателя"
+        android:textColor="#e6e6ef"
+        android:textSize="18sp" />
+
+    <TextView
+        android:id="@+id/labelPlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="100%"
+        android:textColor="#b9b9c6" />
+
+    <SeekBar
+        android:id="@+id/seekPlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="100"
+        android:progress="100" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="28dp"
+        android:text="Чувствительность микрофона"
+        android:textColor="#e6e6ef"
+        android:textSize="18sp" />
+
+    <TextView
+        android:id="@+id/labelMic"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="100%"
+        android:textColor="#b9b9c6" />
+
+    <SeekBar
+        android:id="@+id/seekMic"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="200"
+        android:progress="100" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="28dp"
+        android:text="Если преподаватель слышит вас тихо — поднимите чувствительность. Если слишком громко и с шумом — опустите."
+        android:textColor="#8f8f9c" />
+
+</LinearLayout>
