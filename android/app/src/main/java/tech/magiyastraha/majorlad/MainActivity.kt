@@ -7,14 +7,17 @@ import android.graphics.Bitmap
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -49,6 +52,8 @@ class MainActivity : AppCompatActivity() {
 
     private var server: NetServer? = null
     private var client: NetClient? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var audio: AudioEngine? = null
     private var camera: CameraSender? = null
     private var frameCounter = 0
@@ -122,6 +127,7 @@ class MainActivity : AppCompatActivity() {
         camera = null
         client?.close()
         server?.stop()
+        holdAwake(false)
         audio?.stop()
         player.release()
         super.onDestroy()
@@ -244,6 +250,46 @@ class MainActivity : AppCompatActivity() {
         text.toIntOrNull()?.takeIf { it in 1..65535 && it != Proto.LEGACY_PORT }
             ?: Proto.APP_PORT
 
+    /**
+     * Пока кабинет открыт, телефон не должен засыпать. Иначе экран гаснет,
+     * Wi-Fi уходит в экономию энергии и ученик с компьютера не достучится:
+     * на телефоне написано «кабинет открыт», а соединение не проходит.
+     */
+    private fun holdAwake(on: Boolean) {
+        if (on) {
+            if (wakeLock == null) {
+                val pm = getSystemService(POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "majorlad:cabinet")
+                    .apply {
+                        setReferenceCounted(false)
+                        acquire(8 * 60 * 60 * 1000L)
+                    }
+            }
+            if (wifiLock == null) {
+                val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                @Suppress("DEPRECATION")
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "majorlad:net")
+                    .apply {
+                        setReferenceCounted(false)
+                        acquire()
+                    }
+            }
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            try {
+                wakeLock?.release()
+            } catch (_: Exception) {
+            }
+            wakeLock = null
+            try {
+                wifiLock?.release()
+            } catch (_: Exception) {
+            }
+            wifiLock = null
+        }
+    }
+
     private fun startServer() {
         val name = prefs.getString("name", "").orEmpty().ifEmpty { "Преподаватель" }
         val port = savedPort()
@@ -266,6 +312,7 @@ class MainActivity : AppCompatActivity() {
         )
         server = srv
         srv.start()
+        holdAwake(true)
         val ip = ownWifiAddress()
         addressText?.text = if (ip != null) {
             "Мой адрес в вайфае: $ip, порт $port"
