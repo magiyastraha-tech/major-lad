@@ -987,9 +987,9 @@ class MainActivity : AppCompatActivity() {
 
     // ---- список сообщений ----
 
-    private inner class ChatAdapter : BaseAdapter() {
+    private class Row(val text: String, val header: Boolean, val mine: Boolean)
 
-        private class Row(val text: String, val header: Boolean, val mine: Boolean)
+    private inner class ChatAdapter : BaseAdapter() {
 
         private var rows: List<Row> = emptyList()
         private var stamp = -1
