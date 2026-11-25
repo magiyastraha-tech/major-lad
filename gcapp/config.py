@@ -21,11 +21,11 @@ DEFAULT_DEVICE = "__default__"
 DEFAULTS = {
     # Версия схемы настроек: по ней load() понимает, какие старые
     # умолчания пора привести к новым.
-    "settings_version": 8,
+    "settings_version": 9,
     "role": "",
     "name": "",
     "server_ip": "",
-    "server_port": 45800,
+    "server_port": 45801,
     "autoconnect": True,
     "audio": {
         # Драйвер звука. По умолчанию WASAPI: на ноутбуке со встроенной
@@ -330,6 +330,13 @@ def load() -> dict:
     if int(cfg.get("settings_version", 1) or 1) < 8:
         cfg.setdefault("audio", {}).setdefault("device_buffer", 0)
         cfg["settings_version"] = 8
+    # 0.6.1: у телефона и компьютера теперь один порт — 45801. Старое
+    # значение 45800 осталось в настройках прежних установок; меняем его
+    # один раз, дальше ручной выбор порта не трогаем.
+    if int(cfg.get("settings_version", 1) or 1) < 9:
+        if int(cfg.get("server_port", 0) or 0) == 45800:
+            cfg["server_port"] = 45801
+        cfg["settings_version"] = 9
     return cfg
 
 

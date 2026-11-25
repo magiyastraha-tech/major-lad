@@ -102,6 +102,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        migrateSettings()
         setContentView(R.layout.activity_main)
         bindViews()
         setupTabs()
@@ -206,6 +207,21 @@ class MainActivity : AppCompatActivity() {
         }
         // Кнопка подключения есть только у ученика — ищем по имени.
         (findViewById<View>(viewId("btnConnect")) as? Button)?.setOnClickListener { connectStudent() }
+    }
+
+    /**
+     * Разовый перенос настроек при обновлении. Радиоустройства, выбранные
+     * вручную в прежних версиях, возвращаются к «Автоматически»: так
+     * программа сама берёт микрофон и выход, которые есть на телефоне.
+     */
+    private fun migrateSettings() {
+        if (prefs.getInt("settingsVersion", 1) < 2) {
+            prefs.edit()
+                .remove("micType")
+                .remove("outType")
+                .putInt("settingsVersion", 2)
+                .apply()
+        }
     }
 
     /**

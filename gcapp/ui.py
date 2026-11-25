@@ -630,7 +630,7 @@ class SettingsDialog(QDialog):
 
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1024, 65535)
-        self.port_spin.setValue(int(self.cfg.get("server_port", 45800)))
+        self.port_spin.setValue(int(self.cfg.get("server_port", 45801)))
         self.port_spin.setAccessibleName("Порт соединения")
         form.addRow(label_for("Порт", self.port_spin), self.port_spin)
 
@@ -2349,7 +2349,7 @@ class MainWindow(QMainWindow):
             on_metro_state=self.sig_peer_metro.emit,
             on_history_loaded=self.sig_history_loaded.emit,
             chat_history=self._history,
-            port=int(self.cfg.get("server_port", 45800)),
+            port=int(self.cfg.get("server_port", 45801)),
         )
         if self.server.start():
             self.connect_button.setText("Закрыть кабинет")
@@ -2399,7 +2399,7 @@ class MainWindow(QMainWindow):
         self._want_connection = True
         self.client = Client(
             name, host,
-            port=int(self.cfg.get("server_port", 45800)),
+            port=int(self.cfg.get("server_port", 45801)),
             on_status=self.sig_status.emit,
             on_chat=self.sig_chat.emit,
             on_chat_delete=self.sig_chat_delete.emit,
