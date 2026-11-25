@@ -30,6 +30,7 @@ import kotlin.math.sin
  */
 class AudioEngine(
     private val serverHost: String?,
+    private val udpPort: Int,
     private val onFrame: (Bitmap) -> Unit,
     private val onLog: (String) -> Unit,
 ) {
@@ -81,7 +82,7 @@ class AudioEngine(
             val s = if (isServer) {
                 DatagramSocket(null).apply {
                     reuseAddress = true
-                    bind(InetSocketAddress(Proto.UDP_PORT))
+                    bind(InetSocketAddress(udpPort))
                 }
             } else {
                 DatagramSocket()
@@ -95,7 +96,7 @@ class AudioEngine(
         }
         if (!isServer) {
             try {
-                peer = InetSocketAddress(InetAddress.getByName(serverHost), Proto.UDP_PORT)
+                peer = InetSocketAddress(InetAddress.getByName(serverHost), udpPort)
             } catch (_: Exception) {
             }
         }

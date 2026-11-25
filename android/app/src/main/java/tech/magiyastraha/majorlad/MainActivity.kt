@@ -208,10 +208,16 @@ class MainActivity : AppCompatActivity() {
         (findViewById<View>(viewId("btnConnect")) as? Button)?.setOnClickListener { connectStudent() }
     }
 
+    /** Порт из настроек; пустой или неверный — порт по умолчанию. */
+    private fun savedPort(): Int =
+        prefs.getString("port", "").orEmpty().trim().toIntOrNull()
+            ?.takeIf { it in 1..65535 } ?: Proto.APP_PORT
+
     private fun startServer() {
         val name = prefs.getString("name", "").orEmpty().ifEmpty { "Преподаватель" }
+        val port = savedPort()
         val srv = NetServer(
-            handler, name, Proto.APP_PORT,
+            handler, name, port,
             { text -> setStatus(text) },
             { msg -> onMessage(msg) },
             { peer -> onPeerJoined(peer) },
@@ -231,7 +237,7 @@ class MainActivity : AppCompatActivity() {
         srv.start()
         val ip = ownWifiAddress()
         addressText?.text = if (ip != null) {
-            "Мой адрес в вайфае: $ip, порт ${Proto.APP_PORT}"
+            "Мой адрес в вайфае: $ip, порт $port"
         } else {
             "Вайфай не найден. Включите его — ученик подключится по адресу телефона."
         }
@@ -264,7 +270,7 @@ class MainActivity : AppCompatActivity() {
         val portText = (findViewById<View>(R.id.editPort) as? EditText)?.text?.toString()?.trim().orEmpty()
         val name = (findViewById<View>(R.id.editName) as? EditText)?.text?.toString()?.trim().orEmpty()
             .ifEmpty { "Ученик" }
-        val port = portText.toIntOrNull() ?: Proto.APP_PORT
+        val port = portText.toIntOrNull()?.takeIf { it in 1..65535 } ?: Proto.APP_PORT
         if (host.isEmpty()) {
             setStatus("Впишите адрес преподавателя, например 192.168.1.42")
             return
@@ -828,6 +834,8 @@ class MainActivity : AppCompatActivity() {
         nameEdit.setText(prefs.getString("name", ""))
         hostEdit.setText(prefs.getString("host", ""))
         portEdit.setText(prefs.getString("port", Proto.APP_PORT.toString()))
+        // Адрес преподавателя нужен только ученику, а порт —
+        // обоим: преподаватель открывает на нём кабинет.
         if (isTeacher) ipRow.visibility = View.GONE
 
         val devices = audioDevices()
@@ -846,10 +854,12 @@ class MainActivity : AppCompatActivity() {
             .setTitle("Настройки")
             .setView(view)
             .setPositiveButton("Сохранить") { _, _ ->
+                val portText = portEdit.text.toString().trim()
+                val newPort = portText.toIntOrNull()?.takeIf { it in 1..65535 }
                 prefs.edit()
                     .putString("name", nameEdit.text.toString().trim())
                     .putString("host", hostEdit.text.toString().trim())
-                    .putString("port", portEdit.text.toString().trim())
+                    .putString("port", (newPort ?: Proto.APP_PORT).toString())
                     .putInt("micType", micDevices.getOrNull(micSpinner.selectedItemPosition)?.first ?: -1)
                     .putInt("outType", outDevices.getOrNull(outSpinner.selectedItemPosition)?.first ?: -1)
                     .apply()
@@ -857,7 +867,22 @@ class MainActivity : AppCompatActivity() {
                 val n = nameEdit.text.toString().trim()
                 if (n.isNotEmpty()) t.text = "Мажорный лад — $n"
                 audio?.let { applyDevices(it) }
-                setStatus("Настройки сохранены")
+                // У ученика порт ещё и в окошке на главном экране.
+                (findViewById<View>(R.id.editPort) as? EditText)
+                    ?.setText((newPort ?: Proto.APP_PORT).toString())
+                if (isTeacher) {
+                    // Кабинет слушает порт с запуска — переоткрываем его,
+                    // иначе новый порт начнёт работать только после
+                    // перезапуска программы.
+                    server?.stop()
+                    server = null
+                    connected = false
+                    startServer()
+                }
+                setStatus(
+                    if (newPort == null) "Порт неверный, оставил $Proto.APP_PORT"
+                    else "Настройки сохранены, порт $newPort"
+                )
             }
             .setNegativeButton("Отмена", null)
             .show()

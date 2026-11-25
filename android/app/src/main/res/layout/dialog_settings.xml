@@ -45,18 +45,18 @@
                 android:inputType="text"
                 android:singleLine="true"
                 android:textSize="17sp" />
-
-            <EditText
-                android:id="@+id/editPort"
-                android:layout_width="90dp"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:hint="Порт"
-                android:importantForAutofill="no"
-                android:inputType="number"
-                android:singleLine="true"
-                android:textSize="17sp" />
         </LinearLayout>
+
+        <EditText
+            android:id="@+id/editPort"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="Порт, обычно 45801"
+            android:importantForAutofill="no"
+            android:inputType="number"
+            android:singleLine="true"
+            android:textSize="17sp" />
 
         <TextView
             android:layout_width="match_parent"

@@ -168,7 +168,7 @@ class NetClient(
 
     private fun startAudio() {
         if (audio != null) return
-        val engine = AudioEngine(host,
+        val engine = AudioEngine(host, port,
             { bmp -> post { onFrame(bmp) } },
             { text -> post { onStatus(text) } })
         engine.start()

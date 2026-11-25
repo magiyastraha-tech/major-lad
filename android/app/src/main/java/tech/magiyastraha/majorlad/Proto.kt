@@ -38,8 +38,8 @@ data class ChatMsg(
  * и JSON в UTF-8.
  */
 object Proto {
-    const val APP_PORT = 45800
-    const val UDP_PORT = 45801
+    /** Порт по умолчанию: и для связи, и для звука. Его можно сменить в настройках. */
+    const val APP_PORT = 45801
 
     fun send(
         out: OutputStream,
