@@ -19,6 +19,19 @@ android {
         buildConfig = true
     }
 
+    // Один постоянный ключ на все сборки. Без него каждая сборка на сервере
+    // подписывается заново своим случайным ключом, и телефон отказывается
+    // обновлять установленную программу: подпись не совпадает.
+    signingConfigs {
+        create("majorlad") {
+            storeFile = rootProject.file("keystore/majorlad.p12")
+            storePassword = "majorlad2016"
+            keyAlias = "majorlad"
+            keyPassword = "majorlad2016"
+            storeType = "PKCS12"
+        }
+    }
+
     // Две версии из одного кода: для преподавателя — обычные кнопки с
     // подписями, для ученика — кнопки-картинки. Пакеты разные, поэтому
     // обе версии могут стоять на одном телефоне рядом.
@@ -41,8 +54,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("majorlad")
+        }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("majorlad")
         }
     }
 
