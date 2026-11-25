@@ -15,6 +15,14 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+# На Windows-сборке вывод по умолчанию cp1252 — русский текст в нём не
+# печатается. Переключаем поток на UTF-8, иначе проверки падают не из-за
+# расчёта, а из-за кодировки консоли.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from schedapp.store import LESSON_DONE, Store  # noqa: E402
 
