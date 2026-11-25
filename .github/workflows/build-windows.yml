@@ -6,6 +6,8 @@ on:
     branches: [ main ]
     paths-ignore:
       - '**.md'
+      # Правка маковской сборки не повод пересобирать Windows.
+      - '.github/workflows/build-macos.yml'
 
 jobs:
   build:
