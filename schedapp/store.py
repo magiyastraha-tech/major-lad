@@ -56,6 +56,15 @@ DIRECTIONS = ("Вокал", "Аккомпанирующая гитара", "Ак
               "Электрогитара")
 SERVICES = ("Аренда гитары", "Настройка гитары", "Студийная работа")
 
+
+def _norm_label(text: str) -> str:
+    """Текст подписи или имени без регистра, лишних пробелов и «ё»."""
+    text = (text or "").replace("ё", "е").replace("Ё", "Е")
+    return " ".join(text.split()).casefold()
+
+
+_SERVICE_LABELS = frozenset(_norm_label(service) for service in SERVICES)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS students (
     uid INTEGER PRIMARY KEY,
@@ -348,6 +357,10 @@ class Store:
         # цифра, которую кто-то вписал руками. Сверяем её при каждом
         # запуске: иначе «вписал 4 из 8, а дат не внёс» так и висело бы.
         self.recount_used()
+        # Цена урока и его строка в журнале оплат живут одной цифрой:
+        # расхождение из старых версий сводим к тому, что записано в
+        # журнале, — там деньги, которые человек получил.
+        self.reconcile_payments()
         self._refresh_files()
 
     # --- база ------------------------------------------------------------
@@ -1446,37 +1459,28 @@ class Store:
         """Привести запись журнала оплат в соответствие с абонементом.
 
         Запись, заведённая вместе с абонементом или разовым уроком, ищется
-        по ученику и виду записи: сначала того же дня (старого или нового),
-        потом ближайшую к дню покупки. Нашлась — правятся дата, подпись и
-        сумма: заработок и журнал держат одну и ту же цифру. Не нашлась, а
-        урок разовый и платный — запись заводится. Сумма ноль — парная
-        запись убирается, денег не брали.
+        по ученику и виду записи так же, как при подсчёте заработка: дату
+        покупки могли поправить, поэтому расстояние по дате заранее не
+        ограничиваем — оно решает, только когда строк несколько. Нашлась —
+        правятся дата, подпись и сумма: заработок и журнал держат одну и ту
+        же цифру. Не нашлась, а урок разовый и платный — запись заводится.
+        Сумма ноль — парная запись убирается, денег не брали.
         """
         if sub.trial:
             return
-        want = "single" if sub.single else "sub"
-        days = {day for day in (sub.bought, old_day) if day is not None}
-        found = []
-        for payment in self.payments:
-            if payment.student != sub.student:
-                continue
-            if self._payment_kind(payment.what) != want:
-                continue
-            gap = abs((payment.day - sub.bought).days)
-            if payment.day in days:
-                found.append((0, payment))
-            elif gap <= 45:
-                found.append((gap, payment))
-        found.sort(key=lambda item: item[0])
+        pair_of, dups = self._sub_pairs()
+        found = [payment for payment in self.payments
+                 if pair_of.get(payment.uid) == sub.uid
+                 and payment.uid not in dups]
         pair = None
         if old_total is not None and not sub.single:
-            old_label = self._subs_payment_label(old_total)
-            for _gap, payment in found:
-                if payment.what.strip() == old_label:
+            old_label = _norm_label(self._subs_payment_label(old_total))
+            for payment in found:
+                if _norm_label(payment.what) == old_label:
                     pair = payment
                     break
         if pair is None and found:
-            pair = found[0][1]
+            pair = found[0]
         if pair is None:
             if sub.single and sub.price > 0:
                 self.add_payment(sub.student, "Разовый урок",
@@ -1548,46 +1552,87 @@ class Store:
 
     @staticmethod
     def _payment_kind(what: str) -> str:
-        """Вид записи журнала: абонемент, разовый урок или не пара."""
-        what = (what or "").strip()
-        if what.startswith("Абонемент"):
+        """Вид записи журнала: абонемент, разовый, пробный или не пара.
+
+        Подпись сравниваем без регистра, лишних пробелов и разницы «ё/е»:
+        старые версии и правки руками пишут «разовый урок», «Урок»,
+        «Разовый» — это всё один разовый урок, и деньги за него нельзя
+        терять в «прочих поступлениях», а урок нельзя оставить без пары.
+        """
+        text = _norm_label(what)
+        if not text:
+            return ""
+        if text.startswith("абонемент") or text.startswith("абон."):
             return "sub"
-        if what in ("Разовый урок", "Урок"):
+        if text.startswith("пробн"):
+            return "trial"
+        if text.startswith("разов"):
+            return "single"
+        if text in ("урок", "уроки", "занятие", "занятия", "урок разовый"):
+            return "single"
+        if text.startswith("урок,") or text.startswith("урок "):
             return "single"
         return ""
+
+    @staticmethod
+    def _same_student(one: str, other: str) -> bool:
+        """Один и тот же ученик: имя без лишних пробелов и регистра."""
+        return _norm_label(one) == _norm_label(other)
 
     def _sub_pairs(self) -> tuple[dict[int, int], set[int]]:
         """Парные строки журнала: uid строки → uid абонемента или урока.
 
-        Пара ищется по ученику и виду записи: сперва того же дня покупки,
-        потом ближайшего к нему — дату покупки могли поправить, а строка
-        журнала осталась старой. Второй результат — uid повторов уже
-        найденной строки (тот же ученик, день, подпись и сумма): старые
-        дубли от прежних версий не должны прибавляться второй раз.
+        Пара ищется по ученику и виду записи: сперва того же дня, потом
+        ближайшая по дате — дату покупки могли поправить, а строка
+        журнала осталась старой, поэтому расстояние заранее не
+        ограничиваем. Последний заход — для старых разовых уроков, где
+        имя ученика в строке не совпало с именем в уроке: если на этот
+        день в журнале ровно одна свободная строка разового урока, это
+        она. Абонемент на один урок тоже считается разовым: старые
+        данные могли сохранить его без отметки «разовый», и терять из-за
+        этого деньги нельзя.
+
+        Второй результат — uid повторов уже найденной строки (тот же
+        ученик, день, подпись и сумма): старые дубли от прежних версий
+        не должны прибавляться второй раз.
         """
         pair_of: dict[int, int] = {}
         used: set[int] = set()
         for exact in (True, False):
             for sub in self.subscriptions:
-                if sub.uid in pair_of.values():
+                if sub.uid in pair_of.values() or sub.trial:
                     continue
-                want = "single" if sub.single else "sub"
+                kinds = {"single"} if sub.single else {"sub"}
+                if sub.total == 1:
+                    kinds.add("single")
                 best = None
                 for payment in self.payments:
-                    if payment.uid in used or payment.student != sub.student:
+                    if payment.uid in used:
                         continue
-                    if self._payment_kind(payment.what) != want:
+                    if not self._same_student(payment.student, sub.student):
+                        continue
+                    if self._payment_kind(payment.what) not in kinds:
                         continue
                     gap = abs((payment.day - sub.bought).days)
                     if exact and gap:
-                        continue
-                    if not exact and gap > 45:
                         continue
                     if best is None or gap < abs((best.day - sub.bought).days):
                         best = payment
                 if best is not None:
                     pair_of[best.uid] = sub.uid
                     used.add(best.uid)
+        # Старый разовый урок с чужим именем в строке: на этот день в
+        # журнале осталась ровно одна свободная строка разового урока.
+        for sub in self.subscriptions:
+            if sub.uid in pair_of.values() or not sub.single:
+                continue
+            free = [payment for payment in self.payments
+                    if payment.uid not in used
+                    and payment.day == sub.bought
+                    and self._payment_kind(payment.what) == "single"]
+            if len(free) == 1:
+                pair_of[free[0].uid] = sub.uid
+                used.add(free[0].uid)
         rows = {payment.uid: payment for payment in self.payments}
         dups: set[int] = set()
         for payment in self.payments:
@@ -1597,13 +1642,41 @@ class Store:
                 other = rows.get(uid)
                 if other is None:
                     continue
-                if (payment.student == other.student
+                if (self._same_student(payment.student, other.student)
                         and payment.day == other.day
-                        and payment.what.strip() == other.what.strip()
+                        and _norm_label(payment.what) == _norm_label(other.what)
                         and int(payment.amount) == int(other.amount)):
                     dups.add(payment.uid)
                     break
         return pair_of, dups
+
+    def reconcile_payments(self) -> None:
+        """Свести стоимость урока или абонемента с его строкой в журнале.
+
+        В журнале — деньги, которые человек действительно получил:
+        поправил сумму там, и это же число должны называть окно урока,
+        карточка ученика и заработок месяца. Раньше цена и строка могли
+        разойтись, и тогда отчёт произносил одну цифру, а карточка
+        другую. При запуске расхождение сводится к журналу; правка цены
+        в карточке по-прежнему возвращается в журнал.
+        """
+        pair_of, dups = self._sub_pairs()
+        by_uid = {sub.uid: sub for sub in self.subscriptions}
+        changed = False
+        for payment in self.payments:
+            if payment.uid in dups:
+                continue
+            sub = by_uid.get(pair_of.get(payment.uid, -1))
+            if sub is None or sub.trial:
+                continue
+            amount = int(payment.amount)
+            if amount <= 0:
+                continue
+            if int(sub.price) != amount:
+                sub.price = amount
+                changed = True
+        if changed:
+            self.save_subscriptions()
 
     def earnings_in_month(self, year: int, month: int) -> dict[str, int]:
         """Из чего сложился заработок месяца.
@@ -1633,8 +1706,8 @@ class Store:
         for payment in self.payments:
             if payment.uid in dups or not same_month(payment.day):
                 continue
-            what = payment.what.strip()
-            if what == "Пробный урок":
+            kind = self._payment_kind(payment.what)
+            if kind == "trial":
                 continue  # пробные уроки не считаем
             amount = int(payment.amount)
             sub = by_uid.get(pair_of.get(payment.uid, -1))
@@ -1649,12 +1722,12 @@ class Store:
                     parts["future"] += amount
                 else:
                     parts["active"] += amount
-            elif what.startswith("Абонемент"):
+            elif kind == "sub":
                 # Абонемента уже нет, а деньги были — поступления не теряем.
                 parts["finished"] += amount
-            elif what in ("Разовый урок", "Урок"):
+            elif kind == "single":
                 parts["single"] += amount
-            elif what in SERVICES:
+            elif _norm_label(payment.what) in _SERVICE_LABELS:
                 parts["service"] += amount
             else:
                 parts["other"] += amount
