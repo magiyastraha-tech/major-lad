@@ -298,7 +298,8 @@ class AudioEngine(
         var pending: ShortArray? = null
         var pendingPos = 0
         while (running) {
-            val t = ensureTrack() ?: run {
+            val t = ensureTrack()
+            if (t == null) {
                 sleep(200)
                 continue
             }

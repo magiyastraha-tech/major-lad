@@ -130,7 +130,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindViews() {
         statusText = findViewById(R.id.statusText)
-        addressText = findViewById(R.id.addressText)
+        // У ученика этой надписи в разметке нет, поэтому ищем по имени.
+        addressText = findViewById(viewId("addressText"))
         videoView = findViewById(R.id.videoView)
         videoHint = findViewById(R.id.videoHint)
         btnMic = findViewById(R.id.btnMic)
@@ -203,7 +204,8 @@ class MainActivity : AppCompatActivity() {
         editBeats?.setOnFocusChangeListener { _, hasFocus ->
             if (!hasFocus) applyMetroFields()
         }
-        (findViewById<View>(R.id.btnConnect) as? Button)?.setOnClickListener { connectStudent() }
+        // Кнопка подключения есть только у ученика — ищем по имени.
+        (findViewById<View>(viewId("btnConnect")) as? Button)?.setOnClickListener { connectStudent() }
     }
 
     private fun startServer() {
@@ -258,9 +260,9 @@ class MainActivity : AppCompatActivity() {
             refreshAll()
             return
         }
-        val host = findViewById<View>(R.id.editHost) as? EditText?.text?.toString()?.trim().orEmpty()
-        val portText = findViewById<View>(R.id.editPort) as? EditText?.text?.toString()?.trim().orEmpty()
-        val name = findViewById<View>(R.id.editName) as? EditText?.text?.toString()?.trim().orEmpty()
+        val host = (findViewById<View>(R.id.editHost) as? EditText)?.text?.toString()?.trim().orEmpty()
+        val portText = (findViewById<View>(R.id.editPort) as? EditText)?.text?.toString()?.trim().orEmpty()
+        val name = (findViewById<View>(R.id.editName) as? EditText)?.text?.toString()?.trim().orEmpty()
             .ifEmpty { "Ученик" }
         val port = portText.toIntOrNull() ?: Proto.APP_PORT
         if (host.isEmpty()) {
@@ -961,6 +963,12 @@ class MainActivity : AppCompatActivity() {
         }
         if (missing.isNotEmpty()) permLauncher.launch(missing.toTypedArray())
     }
+
+    /**
+     * Идентификатор по имени: у преподавателя и ученика разные разметки,
+     * и R.id для чужой версии не существует.
+     */
+    private fun viewId(name: String): Int = resources.getIdentifier(name, "id", packageName)
 
     private fun ownWifiAddress(): String? {
         try {

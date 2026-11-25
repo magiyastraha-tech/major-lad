@@ -33,7 +33,7 @@ class ChatStore(private val ctx: Context) {
 
     /** Сообщения, начиная с первого в этот день, для заголовка с датой. */
     fun page(before: String, limit: Int): Pair<List<ChatMsg>, Boolean> {
-        var source = messages
+        var source: List<ChatMsg> = messages
         if (before.isNotEmpty()) {
             val index = messages.indexOfFirst { it.id == before }
             if (index <= 0) return Pair(emptyList(), false)
