@@ -1934,15 +1934,34 @@ NUMPAD_SCAN = {
     0x4C: 5, 0x4D: 6, 0x47: 7, 0x48: 8, 0x49: 9,
 }
 
+def mods_value(flags) -> int:
+    """Модификаторы числом.
+
+    В новых сборках PySide6 перечисление KeyboardModifier к int не
+    приводится: int() на нём падает ещё при запуске программы. Число
+    берём из .value — оно есть и у одной клавиши, и у сочетания.
+    """
+    try:
+        return int(flags)
+    except (TypeError, ValueError):
+        pass
+    value = getattr(flags, "value", None)
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+CTRL_MOD = mods_value(Qt.KeyboardModifier.ControlModifier)
+SHIFT_MOD = mods_value(Qt.KeyboardModifier.ShiftModifier)
+ALT_MOD = mods_value(Qt.KeyboardModifier.AltModifier)
+META_MOD = mods_value(Qt.KeyboardModifier.MetaModifier)
+KEYPAD_MOD = mods_value(Qt.KeyboardModifier.KeypadModifier)
+
 # Действие без Ctrl, Alt или Meta не срабатывает: голая цифра блока —
 # это набор числа в поле, куда человек печатает.
-COMMAND_MODS = int(Qt.KeyboardModifier.ControlModifier
-                   | Qt.KeyboardModifier.AltModifier
-                   | Qt.KeyboardModifier.MetaModifier)
-ALL_MODS = int(Qt.KeyboardModifier.ControlModifier
-               | Qt.KeyboardModifier.ShiftModifier
-               | Qt.KeyboardModifier.AltModifier
-               | Qt.KeyboardModifier.MetaModifier)
+COMMAND_MODS = CTRL_MOD | ALT_MOD | META_MOD
+ALL_MODS = CTRL_MOD | SHIFT_MOD | ALT_MOD | META_MOD
 
 
 def numpad_digit(key: int) -> int | None:
@@ -1970,7 +1989,7 @@ def numpad_index(event) -> tuple[int | None, bool]:
             digit = NUMPAD_SCAN.get(scan)
             if digit is not None:
                 return digit, True
-    if event.modifiers() & Qt.KeyboardModifier.KeypadModifier:
+    if mods_value(event.modifiers()) & KEYPAD_MOD:
         digit = numpad_digit(int(event.key()))
         if digit is not None:
             return digit, True
@@ -1995,13 +2014,13 @@ def digit_binding(text: str) -> tuple[int, int, bool] | None:
         if not low:
             continue
         if low == "ctrl":
-            mods |= int(Qt.KeyboardModifier.ControlModifier)
+            mods |= CTRL_MOD
         elif low == "alt":
-            mods |= int(Qt.KeyboardModifier.AltModifier)
+            mods |= ALT_MOD
         elif low == "shift":
-            mods |= int(Qt.KeyboardModifier.ShiftModifier)
+            mods |= SHIFT_MOD
         elif low in ("meta", "win"):
-            mods |= int(Qt.KeyboardModifier.MetaModifier)
+            mods |= META_MOD
         elif low == "num":
             keypad = True
         elif low.startswith("num") and low[3:].isdigit():
@@ -2051,14 +2070,15 @@ def combo_text(mods, key: int) -> str:
     name = QKeySequence(key).toString(QKeySequence.SequenceFormat.PortableText)
     if not name:
         return ""
+    value = mods_value(mods)
     parts = []
-    if mods & Qt.KeyboardModifier.ControlModifier:
+    if value & CTRL_MOD:
         parts.append("Ctrl")
-    if mods & Qt.KeyboardModifier.AltModifier:
+    if value & ALT_MOD:
         parts.append("Alt")
-    if mods & Qt.KeyboardModifier.ShiftModifier:
+    if value & SHIFT_MOD:
         parts.append("Shift")
-    if mods & Qt.KeyboardModifier.MetaModifier:
+    if value & META_MOD:
         parts.append("Meta")
     parts.append(name)
     return "+".join(parts)
@@ -2109,10 +2129,7 @@ class KeyCaptureDialog(QDialog):
         if key in (Qt.Key.Key_Unknown, Qt.Key.Key_Shift, Qt.Key.Key_Control,
                    Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_AltGr):
             return
-        mods = event.modifiers() & (Qt.KeyboardModifier.ControlModifier
-                                    | Qt.KeyboardModifier.ShiftModifier
-                                    | Qt.KeyboardModifier.AltModifier
-                                    | Qt.KeyboardModifier.MetaModifier)
+        mods = mods_value(event.modifiers()) & ALL_MODS
         # Цифровой блок узнаём так же, как главное окно (скан-код,
         # пометка Qt или цифра), и записываем цифрой: при выключенном
         # Num Lock Qt присылает вместо неё стрелку или End, а человеку
@@ -4283,7 +4300,7 @@ class MainWindow(QMainWindow):
         а обычная цифра верхнего ряда, первыми проверяются назначения на
         верхний ряд, и только потом — на блок.
         """
-        mods = int(event.modifiers()) & ALL_MODS
+        mods = mods_value(event.modifiers()) & ALL_MODS
         if not mods & COMMAND_MODS:
             return None
         digit, keypad = numpad_index(event)
