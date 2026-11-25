@@ -1703,6 +1703,29 @@ class Store:
         paired_subs = set(pair_of.values())
         parts = {"active": 0, "finished": 0, "future": 0,
                  "single": 0, "service": 0, "other": 0}
+
+        def add_to_sub(sub, amount: int) -> None:
+            if sub.single:
+                parts["single"] += amount
+            elif sub.finished:
+                parts["finished"] += amount
+            elif sub.future:
+                parts["future"] += amount
+            else:
+                parts["active"] += amount
+
+        # Старые версии при отметке урока писали строку «Урок» на сумму
+        # урока, даже если урок шёл по абонементу. Такая строка без пары
+        # не разовый урок: если у ученика в тот день есть проведённый
+        # урок на ту же сумму, деньги принадлежат его абонементу.
+        lesson_subs: dict[tuple[str, date, int], int] = {}
+        for lesson in self.lessons:
+            if lesson.status != LESSON_DONE or not lesson.subscription:
+                continue
+            lesson_subs.setdefault(
+                (_norm_label(lesson.student), lesson.day, int(lesson.price)),
+                lesson.subscription)
+
         for payment in self.payments:
             if payment.uid in dups or not same_month(payment.day):
                 continue
@@ -1714,19 +1737,17 @@ class Store:
             if sub is not None:
                 if sub.trial:
                     continue
-                if sub.single:
-                    parts["single"] += amount
-                elif sub.finished:
-                    parts["finished"] += amount
-                elif sub.future:
-                    parts["future"] += amount
-                else:
-                    parts["active"] += amount
+                add_to_sub(sub, amount)
             elif kind == "sub":
                 # Абонемента уже нет, а деньги были — поступления не теряем.
                 parts["finished"] += amount
             elif kind == "single":
-                parts["single"] += amount
+                lesson_sub = by_uid.get(lesson_subs.get(
+                    (_norm_label(payment.student), payment.day, amount), -1))
+                if lesson_sub is not None and not lesson_sub.trial:
+                    add_to_sub(lesson_sub, amount)
+                else:
+                    parts["single"] += amount
             elif _norm_label(payment.what) in _SERVICE_LABELS:
                 parts["service"] += amount
             else:
@@ -1736,15 +1757,7 @@ class Store:
                 continue
             if not same_month(sub.bought):
                 continue
-            amount = int(sub.price)
-            if sub.single:
-                parts["single"] += amount
-            elif sub.finished:
-                parts["finished"] += amount
-            elif sub.future:
-                parts["future"] += amount
-            else:
-                parts["active"] += amount
+            add_to_sub(sub, int(sub.price))
         return parts
 
     def earned_in_month(self, year: int, month: int) -> int:
