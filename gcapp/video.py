@@ -45,11 +45,13 @@ def _quiet_thread() -> None:
 
 
 class VideoSender:
+    QUALITY_FLOOR = 10
+
     def __init__(self, camera: int, fps: int, quality: int, send_fn, log=None,
                  width: int = 640, height: int = 480, bitrate: int = 0):
         self.camera = camera
         self.fps = max(1, min(30, int(fps)))
-        self.quality = max(20, min(95, int(quality)))
+        self.quality = max(self.QUALITY_FLOOR, min(95, int(quality)))
         self.width = max(160, min(1920, int(width)))
         self.height = max(120, min(1080, int(height)))
         # Предел потока в килобитах в секунду; 0 — без предела.
@@ -59,6 +61,10 @@ class VideoSender:
         self._running = False
         self._thread = None
         self._frame_id = 0
+        # Множитель размера кадра: когда и качество, и предел уже на
+        # нижней границе, кадр уменьшается — иначе он не влезает в
+        # бюджет никогда и видео замирает совсем.
+        self._scale = 1.0
 
     def start(self) -> tuple[bool, str]:
         if cv2 is None:
@@ -84,31 +90,88 @@ class VideoSender:
             self.log(f"Видео: {self.width}×{self.height}, {self.fps} кадров/с, "
                      f"без предела потока.")
         interval = 1.0 / self.fps
-        # Бюджет одного кадра в байтах, если задан предел потока.
-        budget = (self.bitrate * 1000 / 8 / self.fps) if self.bitrate else 0
+        # Предел потока: байт в секунду. Бюджет одного кадра — его
+        # fps-доля. Раньше качество подгонялось под бюджет, а кадр
+        # отправлялся всегда: картинка «не влезала» в 600 кбит/с и
+        # уходила втрое тяжелее, забивая канал, по которому рядом идёт
+        # звук. Теперь бюджет — жёсткий: что не влезло, не отправляется.
+        rate = (self.bitrate * 1000 / 8) if self.bitrate else 0.0
+        budget = (rate / self.fps) if rate else 0.0
+        # Копилка на три кадра: короткий всплеск движения не рвёт видео,
+        # средний поток остаётся в пределе.
+        capacity = budget * 3 if budget else 0.0
+        tokens = capacity
+        last = time.monotonic()
+        # Статистика за окно — чтобы в журнале было видно, что реально
+        # уходит в канал, а не что задумано настройками.
+        stat_at = last
+        stat_frames = 0
+        stat_dropped = 0
+        stat_bytes = 0
         try:
             while self._running:
                 started = time.monotonic()
+                dt = started - last
+                last = started
+                if rate:
+                    tokens = min(capacity, tokens + rate * max(0.0, min(dt, 1.0)))
                 ok, frame = cap.read()
                 if not ok:
                     time.sleep(0.05)
                     continue
-                if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                if self._scale < 0.999:
+                    frame = cv2.resize(
+                        frame,
+                        (max(160, int(self.width * self._scale)),
+                         max(120, int(self.height * self._scale))),
+                        interpolation=cv2.INTER_AREA)
+                elif (frame.shape[1] != self.width
+                        or frame.shape[0] != self.height):
                     frame = cv2.resize(frame, (self.width, self.height),
                                        interpolation=cv2.INTER_AREA)
                 ok, buf = cv2.imencode(".jpg", frame,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
                 if ok:
                     data = buf.tobytes()
+                    size = len(data)
                     if budget:
-                        # Подбираем качество под предел: кадр великоват —
-                        # понижаем сразу, заметно меньше бюджета — поднимаем
-                        # понемногу, чтобы картинка не скакала.
-                        if len(data) > budget * 1.05 and self.quality > 20:
-                            self.quality = max(20, self.quality - 3)
-                        elif len(data) < budget * 0.7 and self.quality < 95:
-                            self.quality += 1
-                    self._send(data, interval, started + interval)
+                        if size > budget * 1.1:
+                            # Кадр великоват: сначала режем качество, а
+                            # когда оно уже на полу — размер кадра.
+                            if self.quality > self.QUALITY_FLOOR:
+                                self.quality = max(
+                                    self.QUALITY_FLOOR, self.quality - 4)
+                            elif self._scale > 0.4:
+                                self._scale = max(0.35, self._scale - 0.1)
+                        elif size < budget * 0.5:
+                            if self.quality < 95:
+                                self.quality += 1
+                            elif self._scale < 0.999:
+                                self._scale = min(1.0, self._scale + 0.05)
+                        if size <= tokens:
+                            tokens -= size
+                            stat_bytes += size
+                            stat_frames += 1
+                            self._send(data, interval, started + interval)
+                        else:
+                            # Не влезает в предел — молчим этот кадр.
+                            # Лучше реже, но целым, и без ущерба звуку.
+                            stat_dropped += 1
+                    else:
+                        stat_bytes += size
+                        stat_frames += 1
+                        self._send(data, interval, started + interval)
+                now = time.monotonic()
+                if budget and now - stat_at >= 10.0:
+                    elapsed = now - stat_at
+                    kbps = stat_bytes * 8 / 1000 / elapsed
+                    self.log(
+                        f"Видео: {stat_frames / elapsed:.1f} кадров/с, "
+                        f"{kbps:.0f} кбит/с "
+                        f"(предел {self.bitrate}), "
+                        f"пропущено {stat_dropped}.")
+                    stat_at = now
+                    stat_frames = stat_dropped = stat_bytes = 0
                 rest = interval - (time.monotonic() - started)
                 if rest > 0:
                     time.sleep(rest)

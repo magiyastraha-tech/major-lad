@@ -1367,6 +1367,9 @@ class AudioEngine:
         # читаем по капле — иначе старт связи начинается с треска.
         self._peer_live = False
         self._peer_wait = 0.0
+        # Когда последний раз приходил звук собеседника. По этой метке
+        # отличаем «кольцо пусто на доли секунды» от «собеседник ушёл».
+        self._peer_rx_at = 0.0
         # Разрыв в потоке собеседника: первый целый пакет после него
         # вводим плавно, иначе слышно щелчок.
         self._peer_gap = False
@@ -1439,6 +1442,10 @@ class AudioEngine:
         # Сторож: следит за обратными вызовами вывода. Если звук встал,
         # переоткрывает выход сам, без участия человека.
         self._watchdog: threading.Thread | None = None
+        # Флаг остановки сторожа. Без него сторож просыпался посреди
+        # stop() и звал start() прямо во время закрытия ASIO — драйвер
+        # падал с 0x8001010d и утягивал программу.
+        self._watchdog_stop = threading.Event()
         self._last_cb = 0.0
         self._last_reopen = 0.0
         self._start_args: dict | None = None
@@ -1564,7 +1571,8 @@ class AudioEngine:
         self._send_thread.start()
         if self._watchdog is None or not self._watchdog.is_alive():
             self._watchdog = threading.Thread(
-                target=self._watchdog_loop, daemon=True)
+                target=self._watchdog_loop,
+                args=(self._watchdog_stop,), daemon=True)
             self._watchdog.start()
 
         asio = (str(driver or "").lower() == "asio" and asio_supported())
@@ -2033,6 +2041,9 @@ class AudioEngine:
     # -- остановка ----------------------------------------------------------
 
     def stop(self) -> None:
+        # Сначала гасим сторожа: иначе он может проснуться посреди
+        # закрытия ASIO и переоткрыть устройство прямо под руками.
+        self._watchdog_stop.set()
         self._running = False
         if self._stat_connected:
             span = time.monotonic() - self._stat_t0
@@ -2076,6 +2087,13 @@ class AudioEngine:
                 thread.join(timeout=1.5)
         self._send_thread = None
         self._udp_thread = None
+        # Сторож должен уйти до следующего start(): старый поток держит
+        # ссылку на этот объект и иначе закроет уже новое устройство.
+        watchdog = self._watchdog
+        self._watchdog = None
+        if watchdog is not None and watchdog.is_alive():
+            watchdog.join(timeout=2.0)
+        self._watchdog_stop = threading.Event()
         self._peer = None
         self.student.clear()
         self.student_r.clear()
@@ -2360,6 +2378,14 @@ class AudioEngine:
         # несколько десятков миллисекунд, чем начать связь с треска.
         # Предохранитель на 1,5 с — на случай совсем плохой сети, чтобы
         # не остаться без звука совсем.
+        # Собеседник ушёл: полсекунды ни одного пакета — кольцо пустое не
+        # от рваного приёма. Снимаем «жив», чтобы после возвращения связь
+        # начиналась снова с наполнения, а не с провалов.
+        if (self._peer_live and self._peer_rx_at > 0.0
+                and time.monotonic() - self._peer_rx_at > 0.5):
+            self._peer_live = False
+            self._peer_wait = 0.0
+            self._peer_gap = True
         if not self._peer_live:
             self._peer_wait += frames / SAMPLE_RATE
             # Пустое кольцо, пока ученик не подключился, — это не провал
@@ -2623,6 +2649,13 @@ class AudioEngine:
         лишних ста миллисекунд задержки. Через десять секунд чистого
         приёма запас уменьшается — по шагу, чтобы не устроить новый провал.
         """
+        # Собеседника нет — приём голодает не по вине сети: пустое кольцо
+        # после обрыва связи не должно раздувать запас и писать в журнал
+        # «звук рвался» каждые две секунды. Ждём пакетов молча.
+        if self._peer_rx_at <= 0.0 or time.monotonic() - self._peer_rx_at > 0.5:
+            self._recv_starve = 0
+            self._recv_clean_t = 0.0
+            return
         if self._recv_starve > 0:
             deficit = self._recv_starve
             self._recv_starve = 0
@@ -2631,11 +2664,14 @@ class AudioEngine:
             self._apply_recv_reserve(True)
             self._recv_clean_t = 0.0
             return
+        # Отпускаем быстрее, чем раньше: запас в 400 мс после одного
+        # сбоя держался минутами. Теперь 40 мс за каждые две секунды
+        # чистого приёма — путь с 400 до 60 мс занимает секунд двадцать.
         self._recv_clean_t += frames / SAMPLE_RATE
-        if self._recv_clean_t >= 10.0:
+        if self._recv_clean_t >= 2.0:
             self._recv_clean_t = 0.0
             if self._recv_adapt > 0:
-                self._recv_adapt = max(0, self._recv_adapt - BLOCK * 2)
+                self._recv_adapt = max(0, self._recv_adapt - BLOCK * 4)
                 self._apply_recv_reserve(False)
 
     def _apply_recv_reserve(self, grow: bool) -> None:
@@ -2654,6 +2690,23 @@ class AudioEngine:
         else:
             self._recv_note = (f"Приём устойчив — запас приёма уменьшен "
                                f"до {ms} мс.")
+
+    def _reset_peer_link(self) -> None:
+        """Готовит приём к новой связи после обрыва.
+
+        Запас, накопленный рваным приёмом, к вернувшемуся собеседнику
+        отношения не имеет — иначе он приходит с лишними сотнями
+        миллисекунд задержки и ждёт их же, чтобы отпустить.
+        """
+        self._peer_live = False
+        self._peer_wait = 0.0
+        self._peer_rx_at = 0.0
+        self._peer_gap = True
+        self._recv_starve = 0
+        self._recv_clean_t = 0.0
+        if self._recv_adapt:
+            self._recv_adapt = 0
+            set_recv_reserve(self._recv_base)
 
     def _write_peer(self, samples: np.ndarray, stereo: bool) -> None:
         """Кладёт пришедший звук в буферы воспроизведения."""
@@ -2854,15 +2907,14 @@ class AudioEngine:
         except Exception:
             pass
 
-    def _watchdog_loop(self) -> None:
+    def _watchdog_loop(self, stop_event: threading.Event) -> None:
         """Сторож вывода: если обратные вызовы встали, выход переоткрывается.
 
         Живёт отдельно от звукового потока: упавший или замолчавший callback
         сам о себе не сообщит. Раз в две секунды сверяем время последнего
         вызова; молчание дольше двух секунд — переоткрываем выход.
         """
-        while True:
-            time.sleep(2.0)
+        while not stop_event.wait(2.0):
             if not self._running or self._out is None:
                 continue
             now = time.monotonic()
@@ -2878,6 +2930,9 @@ class AudioEngine:
                 pass
             args = self._start_args
             if not args:
+                continue
+            # Пока решали, могли начать остановку — тогда не открываем.
+            if not self._running or stop_event.is_set():
                 continue
             try:
                 ok, message = self.start(**args)
@@ -2905,6 +2960,12 @@ class AudioEngine:
 
             magic = data[:4]
             if magic == MAGIC_HELLO:
+                # Собеседник, которого не слышно дольше секунды, — это
+                # новая связь: запас приёма, накопленный прошлым обрывом,
+                # ему только добавит задержки.
+                if (self._peer_rx_at > 0.0
+                        and time.monotonic() - self._peer_rx_at > 1.0):
+                    self._reset_peer_link()
                 self._peer = addr if self._is_server else self._server_addr
                 if self._is_server:
                     try:
@@ -2936,6 +2997,10 @@ class AudioEngine:
                                                 MAGIC_AUDIO_OPUS_STEREO,
                                                 MAGIC_VIDEO):
                 self._peer = addr
+
+            if magic in (MAGIC_AUDIO, MAGIC_AUDIO_STEREO,
+                         MAGIC_AUDIO_OPUS, MAGIC_AUDIO_OPUS_STEREO):
+                self._peer_rx_at = time.monotonic()
 
             if magic == MAGIC_AUDIO:
                 if self._seq_gap(data):
@@ -3066,8 +3131,10 @@ class AudioEngine:
                         self.log("Формат звука: несжатый PCM, "
                                  "библиотека Opus не найдена.")
                     elif not self._peer_opus:
-                        self.log("Формат звука: несжатый PCM, собеседник "
-                                 "не подтвердил сжатие (старая версия?).")
+                        # Телефон сжатие не умеет и не скрывает этого:
+                        # в возможностях стоит только бит стерео.
+                        self.log("Формат звука: несжатый PCM, "
+                                 "собеседник работает без сжатия.")
                 except Exception:
                     pass
             try:

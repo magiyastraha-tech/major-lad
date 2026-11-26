@@ -122,6 +122,36 @@ def save_received(name: str, data: bytes) -> str:
 # Сервер (преподаватель)
 # ---------------------------------------------------------------------------
 
+def _tune_keepalive(sock: socket.socket) -> None:
+    """Держит соединение живым и быстро узнаёт, что оно умерло.
+
+    Без этого замолчавший собеседник висит часами: TCP не замечает, что
+    на другом конце никого нет. Для кабинета это особенно дорого —
+    мёртвый вход держит место занятым, и вернувшийся ученик получает
+    «идёт урок».
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    # У Windows свои имена и своя форма вызова, у остальных — опции TCP.
+    if os.name == "nt" and hasattr(socket, "SIO_KEEPALIVE_VALS"):
+        try:
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
+            return
+        except OSError:
+            pass
+    for option, value in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5),
+                          ("TCP_KEEPCNT", 3)):
+        name = getattr(socket, option, None)
+        if name is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, name, value)
+        except OSError:
+            pass
+
+
 class Server:
     """Кабинет преподавателя. Один активный ученик, остальные ждут."""
 
@@ -209,6 +239,23 @@ class Server:
                 self._active = session
                 return True
             return False
+
+    def reclaim(self, session: "_Session") -> "_Session | None":
+        """Отдаёт кабинет тому же ученику, вернувшемуся после обрыва.
+
+        Мёртвое соединение может держать место ещё десятки секунд, пока
+        TCP не решит, что оно оборвано. Ученику в это время кабинет
+        кажется занятым, и он видит «идёт урок» на собственном месте.
+        Возвращает отпущенный вход или None, если в кабинете другой.
+        """
+        with self._lock:
+            active = self._active
+            if active is None or active is session:
+                return None
+            if active.name_key != session.name_key:
+                return None
+            self._active = session
+        return active
 
     @property
     def active_name(self) -> str:
@@ -386,6 +433,9 @@ class Server:
                 conn, addr = self._sock.accept()
             except OSError:
                 return
+            # Тот же обмен «жив ли ты», что и у ученика: иначе оборванное
+            # соединение висит в кабинете, пока не истечёт само.
+            _tune_keepalive(conn)
             session = _Session(self, conn, addr)
             threading.Thread(target=session.run, daemon=True).start()
 
@@ -402,6 +452,11 @@ class _Session:
         self._promoted = threading.Event()
         self._refused = threading.Event()
         self._closed = False
+
+    @property
+    def name_key(self) -> str:
+        """Имя для сверки «это тот же ученик»: без учёта регистра."""
+        return " ".join(self.name.split()).casefold()
 
     def send_json(self, obj: dict) -> bool:
         try:
@@ -443,6 +498,17 @@ class _Session:
             self.send_json({"type": "joined", "teacher": self.server.name})
             self.server.on_peer(True)
             self.server.on_status(f"Ученик в кабинете: {self.name}")
+        elif (previous := self.server.reclaim(self)) is not None:
+            # Тот же ученик вернулся после обрыва: его прежний вход висит
+            # мёртвым и держит кабинет. Отпускаем его молча, без вопроса
+            # преподавателю — ученик не должен видеть «идёт урок» на
+            # своём же месте и ждать, пока истечёт TCP.
+            self.server.on_status(
+                f"Ученик {self.name} вернулся после обрыва связи.")
+            previous.end("replaced")
+            self.server.activate_history(self.name)
+            self.send_json({"type": "joined", "teacher": self.server.name})
+            self.server.on_peer(True)
         else:
             # Место занято: спрашиваем преподавателя, а не ставим молча
             # в очередь. Ученик в это время видит «ждёт решения».
@@ -713,31 +779,7 @@ class Client:
 
     @staticmethod
     def _keepalive(sock: socket.socket) -> None:
-        """Держим соединение живым и быстро узнаём, если оно умерло.
-
-        Без этого замолчавший собеседник висит часами: TCP не замечает,
-        что на другом конце никого нет.
-        """
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        except OSError:
-            return
-        # У Windows свои имена и своя форма вызова, у остальных — опции TCP.
-        if os.name == "nt" and hasattr(socket, "SIO_KEEPALIVE_VALS"):
-            try:
-                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
-                return
-            except OSError:
-                pass
-        for option, value in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5),
-                              ("TCP_KEEPCNT", 3)):
-            name = getattr(socket, option, None)
-            if name is None:
-                continue
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, name, value)
-            except OSError:
-                pass
+        _tune_keepalive(sock)
 
     def _wait_ready(self) -> None:
         sock = self._sock

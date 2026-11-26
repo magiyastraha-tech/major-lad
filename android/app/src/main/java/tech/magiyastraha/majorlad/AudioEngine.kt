@@ -41,6 +41,10 @@ class AudioEngine(
         private const val VIDEO_CHUNK = 1000
         /** Сколько пакетов копим перед воспроизведением, чтобы рывки сети не давали щелчков. */
         private const val PREBUFFER = 3
+        /** Потолок запаса: на плохой сети копим больше, но не выше 80 мс. */
+        private const val MAX_PREBUFFER = 8
+        /** Потолок очереди приёма; выше — звук уже отстал на 160 мс, режем. */
+        private const val MAX_QUEUE = 16
         /** Длина плавного входа после провала, в отсчётах. */
         private const val FADE_IN = 96
     }
@@ -111,6 +115,13 @@ class AudioEngine(
                 DatagramSocket()
             }
             s.soTimeout = 500
+            // Буфер приёма побольше: видео идёт десятками пакетов подряд,
+            // и на маленьком буфере ядро выбрасывало звук ещё до того,
+            // как его успевал прочитать поток. Это и слышалось треском.
+            try {
+                s.receiveBufferSize = 1 shl 20
+            } catch (_: Exception) {
+            }
             socket = s
         } catch (e: Exception) {
             onLog("Нет доступа к звуку по сети: ${e.message}")
@@ -297,7 +308,7 @@ class AudioEngine(
             if (a > peak) peak = a
         }
         if (peak > peerPeak) peerPeak = peak
-        while (pcmQueue.size > 8) pcmQueue.poll()
+        while (pcmQueue.size > MAX_QUEUE) pcmQueue.poll()
         pcmQueue.add(out)
     }
 
@@ -366,6 +377,11 @@ class AudioEngine(
         var primed = false
         var fadeIn = false
         var lastValue = 0
+        // Запас растёт только по факту провала и потом сам сползает
+        // обратно: на хорошей сети задержка остаётся 30 мс, на плохой
+        // звук не рвётся каждые пару секунд.
+        var preTarget = PREBUFFER
+        var cleanBlocks = 0
         while (running) {
             val t = ensureTrack()
             if (t == null) {
@@ -379,7 +395,7 @@ class AudioEngine(
             // Ждём запас только когда слушаем собеседника. Если тикает свой
             // метроном, ждать нечего — иначе такт сорвался бы.
             val needPrebuffer = !(metroOn && !peerMetroOn)
-            if (!primed && needPrebuffer && pcmQueue.size < PREBUFFER) {
+            if (!primed && needPrebuffer && pcmQueue.size < preTarget) {
                 sleep(5)
                 continue
             }
@@ -407,7 +423,18 @@ class AudioEngine(
                 lastValue = v
                 fadeIn = true
                 primed = false
+                // Провал на пустой очереди — значит её мало. Добавляем
+                // один блок запаса, чтобы следующий разрыв был позже.
+                if (preTarget < MAX_PREBUFFER) preTarget++
+                cleanBlocks = 0
             } else {
+                cleanBlocks++
+                // Пять секунд без единого провала — запас можно
+                // отпустить на блок: задержка важнее перестраховки.
+                if (cleanBlocks >= 500 && preTarget > PREBUFFER) {
+                    cleanBlocks = 0
+                    preTarget--
+                }
                 if (fadeIn) {
                     val n = min(BLOCK, FADE_IN)
                     for (i in 0 until n) {
@@ -422,9 +449,20 @@ class AudioEngine(
             }
             playClock += BLOCK
             try {
-                t.write(out, 0, BLOCK)
+                // Отрицательный ответ — дорожка умерла (так бывает после
+                // переключения на громкую связь и смены устройства).
+                // Раньше результат никто не смотрел, и звук молчал до
+                // конца занятия: писатель стучал в мёртвую дорожку.
+                if (t.write(out, 0, BLOCK) < 0) {
+                    releaseTrack()
+                    fadeIn = true
+                    primed = false
+                    sleep(50)
+                }
             } catch (_: Exception) {
                 releaseTrack()
+                fadeIn = true
+                primed = false
                 sleep(100)
             }
         }
@@ -542,6 +580,11 @@ class AudioEngine(
         val packet = ByteArray(8 + BLOCK * 2)
         "GCA1".toByteArray().copyInto(packet, 0)
         var seq = 0
+        // Подряд идущие пустые чтения. Захват умирает после переключения
+        // выхода на громкую связь или после смены устройства: поток жив,
+        // а данных нет. Тогда сессию надо переоткрыть, а не крутиться в
+        // sleep до конца занятия.
+        var deadReads = 0
         while (running && micVersion == myVersion) {
             val read = try {
                 rec.read(local, 0, BLOCK)
@@ -549,9 +592,12 @@ class AudioEngine(
                 -1
             }
             if (read <= 0) {
+                deadReads++
+                if (deadReads >= 20) return
                 sleep(10)
                 continue
             }
+            deadReads = 0
             var peak = 0
             for (i in 0 until read) {
                 val raw = local[i].toInt()
