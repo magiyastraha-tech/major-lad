@@ -24,6 +24,7 @@ import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.BaseAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -111,6 +112,12 @@ class MainActivity : AppCompatActivity() {
             setStatus("Без разрешения на микрофон вас не будет слышно. Разрешите его в настройках Android")
         } else if (mic == true) {
             RunLog.write("perm", "разрешение на микрофон есть")
+        }
+        // Камеру просим только у того, кто собирается показывать картинку.
+        val cam = granted[Manifest.permission.CAMERA]
+        if (cam == true && connected && videoWanted()) startCameraIfPossible()
+        else if (cam == false && videoWanted()) {
+            setStatus("Без разрешения на камеру видео не отправить")
         }
     }
     private val openDoc = registerForActivityResult(
@@ -561,18 +568,45 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.fullVideoBox).visibility = View.GONE
     }
 
+    /** Видео по умолчанию: у преподавателя — да, у ученика — нет. */
+    private fun videoWanted(): Boolean = prefs.getBoolean("videoOn", isTeacher)
+
     private fun startCameraIfPossible() {
         if (camera != null) return
+        if (!videoWanted()) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
         ) return
         val cam = CameraSender(this, this,
             { text -> setStatus(text) },
-            { jpeg -> audio?.sendVideoFrame(jpeg) })
+            // H.264 включается, как только собеседник о нём сообщил.
+            { audio?.peerSupportsH264() == true },
+            { data, h264 -> audio?.sendVideoFrame(data, h264) })
         cam.start()
         camera = cam
         if (connected) {
             if (isTeacher) server?.sendVideoState(true) else client?.sendVideoState(true)
+        }
+    }
+
+    /** Переключить видео на ходу: кнопка в настройках. */
+    private fun setVideoSending(on: Boolean) {
+        prefs.edit().putBoolean("videoOn", on).apply()
+        if (on) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                permLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+                return
+            }
+            if (connected) startCameraIfPossible()
+            return
+        }
+        val had = camera != null
+        camera?.stop()
+        camera = null
+        if (had && connected) {
+            if (isTeacher) server?.sendVideoState(false) else client?.sendVideoState(false)
         }
     }
 
@@ -957,6 +991,11 @@ class MainActivity : AppCompatActivity() {
         micSpinner.setSelection(indexOfType(micDevices, prefs.getInt("micType", -1)))
         outSpinner.setSelection(indexOfType(outDevices, prefs.getInt("outType", -1)))
 
+        // Видео с камеры: у ученика по умолчанию выключено — ему нужно
+        // смотреть, а не показывать.
+        val boxVideo = view.findViewById<CheckBox>(R.id.boxVideo)
+        boxVideo.isChecked = videoWanted()
+
         // Запись лога: включить, выключить, отправить файл в Telegram.
         val logState = view.findViewById<TextView>(R.id.logState)
         val btnLogStart = view.findViewById<Button>(R.id.btnLogStart)
@@ -1007,6 +1046,7 @@ class MainActivity : AppCompatActivity() {
                     .putInt("micType", micDevices.getOrNull(micSpinner.selectedItemPosition)?.first ?: -1)
                     .putInt("outType", outDevices.getOrNull(outSpinner.selectedItemPosition)?.first ?: -1)
                     .apply()
+                if (boxVideo.isChecked != videoWanted()) setVideoSending(boxVideo.isChecked)
                 val t = findViewById<TextView>(R.id.headerTitle)
                 val n = nameEdit.text.toString().trim()
                 if (n.isNotEmpty()) t.text = "Мажорный лад — $n"
@@ -1200,7 +1240,9 @@ class MainActivity : AppCompatActivity() {
     private fun askPermissions() {
         val wanted = ArrayList<String>()
         wanted.add(Manifest.permission.RECORD_AUDIO)
-        wanted.add(Manifest.permission.CAMERA)
+        // Ученику по умолчанию камера не нужна — не тревожим его лишним
+        // вопросом. Включит видео в настройках — спросим тогда.
+        if (videoWanted()) wanted.add(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= 33) {
             wanted.add(Manifest.permission.READ_MEDIA_AUDIO)
         } else {

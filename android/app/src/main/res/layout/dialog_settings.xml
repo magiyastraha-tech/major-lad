@@ -142,6 +142,33 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="18dp"
+            android:text="Видео"
+            android:textColor="#e6e6ef"
+            android:textSize="17sp"
+            android:textStyle="bold" />
+
+        <CheckBox
+            android:id="@+id/boxVideo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:contentDescription="Отправлять видео с камеры собеседнику"
+            android:minHeight="48dp"
+            android:text="Отправлять видео с камеры"
+            android:textSize="17sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="У ученика видео выключено по умолчанию: занятие идёт со звуком, а картинку показывает преподаватель."
+            android:textColor="#8f8f9c"
+            android:textSize="15sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
             android:text="Запись лога"
             android:textColor="#e6e6ef"
             android:textSize="17sp"

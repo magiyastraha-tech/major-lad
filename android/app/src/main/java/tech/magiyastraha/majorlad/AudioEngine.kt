@@ -45,6 +45,12 @@ class AudioEngine(
         private const val MAX_QUEUE = 16
         /** Длина плавного входа после провала, в отсчётах. */
         private const val FADE_IN = 96
+        /** Обмен возможностями: собеседник понимает стерео. */
+        const val CAPS_STEREO = 0x01
+        /** Обмен возможностями: я понимаю сжатый звук Opus. */
+        const val CAPS_OPUS = 0x02
+        /** Обмен возможностями: я понимаю видео H.264. */
+        const val CAPS_H264 = 0x04
     }
 
     private val isServer = serverHost == null
@@ -90,10 +96,21 @@ class AudioEngine(
     @Volatile private var micActive = false
     private var lastMicError = ""
     private var lastMicErrorAt = 0L
-    private var lastCompressedLog = 0L
     private var lastOutErrorAt = 0L
+    private var lastNoOpusLog = 0L
     private var videoId = 0
+    private var lastVideoId = -1
     private val videoFrames = HashMap<Int, VideoAccum>()
+
+    // Что умеет собеседник. До обмена возможностями считаем, что он на
+    // старой версии: шлём несжатый звук и JPEG — это понимает всякий.
+    @Volatile private var peerOpus = false
+    @Volatile private var peerH264 = false
+    private var opusMono: OpusDecoder? = null
+    private var opusStereo: OpusDecoder? = null
+    @Volatile private var h264Decoder: H264Decoder? = null
+    /** Номер последнего пакета своего звука: один счётчик на PCM и Opus. */
+    private var txSeq = 0
 
     private class VideoAccum(val total: Int) {
         val parts = arrayOfNulls<ByteArray>(total)
@@ -157,6 +174,16 @@ class AudioEngine(
         socket = null
         peer = null
         pcmQueue.clear()
+        opusMono?.release()
+        opusMono = null
+        opusStereo?.release()
+        opusStereo = null
+        h264Decoder?.release()
+        h264Decoder = null
+        synchronized(videoFrames) {
+            videoFrames.clear()
+        }
+        lastVideoId = -1
         releaseTrack()
         RunLog.write("audio", "звук остановлен")
     }
@@ -177,22 +204,34 @@ class AudioEngine(
         }
     }
 
-    /** Кадр видео уходит собеседнику частями; телефонный Wi-Fi не любит больших пакетов. */
-    fun sendVideoFrame(jpeg: ByteArray) {
+    /** Собеседник понимает H.264 — об этом он сообщил в обмене возможностями. */
+    fun peerSupportsH264(): Boolean = peerH264
+
+    /**
+     * Кадр видео уходит собеседнику частями; телефонный Wi-Fi не любит
+     * больших пакетов. h264 = false — кадр JPEG, true — кусок потока
+     * H.264. Метка разная (GCV1 / GCV2), чтобы старая версия на том конце
+     * такой пакет просто пропустила, а не пыталась показать.
+     */
+    fun sendVideoFrame(data: ByteArray, h264: Boolean = false) {
         val p = peer ?: return
         val s = socket ?: return
-        val total = (jpeg.size + VIDEO_CHUNK - 1) / VIDEO_CHUNK
+        val total = (data.size + VIDEO_CHUNK - 1) / VIDEO_CHUNK
         if (total <= 0 || total > 60000) return
         val id = ++videoId
         for (index in 0 until total) {
             val from = index * VIDEO_CHUNK
-            val to = min(jpeg.size, from + VIDEO_CHUNK)
+            val to = min(data.size, from + VIDEO_CHUNK)
             val buf = java.nio.ByteBuffer.allocate(12 + (to - from))
-            buf.put(0x47); buf.put(0x43); buf.put(0x56); buf.put(0x31) // GCV1
+            if (h264) {
+                buf.put(0x47); buf.put(0x43); buf.put(0x56); buf.put(0x32) // GCV2
+            } else {
+                buf.put(0x47); buf.put(0x43); buf.put(0x56); buf.put(0x31) // GCV1
+            }
             buf.putInt(id)
             buf.putShort(index.toShort())
             buf.putShort(total.toShort())
-            buf.put(jpeg, from, to - from)
+            buf.put(data, from, to - from)
             try {
                 s.send(DatagramPacket(buf.array(), buf.capacity(), p))
             } catch (_: Exception) {
@@ -217,8 +256,12 @@ class AudioEngine(
 
     private fun helloLoop() {
         val hello = "GCH1".toByteArray() + byteArrayOf(0, 0, 0, 0)
-        // Флаг возможностей: ноль — шлём несжатый звук, его понимает компьютер.
-        val caps = "GCC2".toByteArray() + byteArrayOf(0)
+        // Что умеет этот телефон: Opus и H.264 проверяются по списку
+        // кодеков, а не по версии Android. Неизвестные биты собеседник
+        // игнорирует, поэтому старым версиям этот пакет не мешает.
+        val flags = (if (OpusSupport.decoderAvailable) CAPS_OPUS else 0) or
+            (if (H264Support.decoderAvailable) CAPS_H264 else 0)
+        val caps = "GCC2".toByteArray() + byteArrayOf(flags.toByte())
         while (running) {
             val p = peer
             val s = socket
@@ -262,16 +305,11 @@ class AudioEngine(
             when (magic) {
                 "GCA1" -> deliverPcm(packet, false)
                 "GCA2" -> deliverPcm(packet, true)
-                "GCV1" -> feedVideo(packet)
-                "GCA5", "GCA6" -> {
-                    // Не засоряем лог: собеседник шлёт такой пакет десять раз в секунду.
-                    val now = System.currentTimeMillis()
-                    if (now - lastCompressedLog > 5000) {
-                        lastCompressedLog = now
-                        RunLog.write("audio", "пришёл сжатый звук $magic — на телефоне пока не поддерживается")
-                        onLog("Собеседник шлёт сжатый звук — на телефоне пока не поддерживается")
-                    }
-                }
+                "GCA5" -> deliverOpus(packet, false)
+                "GCA6" -> deliverOpus(packet, true)
+                "GCV1" -> feedVideo(packet, false)
+                "GCV2" -> feedVideo(packet, true)
+                "GCC2" -> readCaps(packet)
             }
         }
     }
@@ -300,6 +338,12 @@ class AudioEngine(
         }
         if (out.isEmpty()) return
         rxAudioPackets++
+        enqueuePcm(out)
+    }
+
+    /** Общая очередь воспроизведения: и несжатый звук, и Opus приходят сюда. */
+    private fun enqueuePcm(out: ShortArray) {
+        if (out.isEmpty()) return
         var peak = 0
         for (v in out) {
             val a = if (v < 0) -v.toInt() else v.toInt()
@@ -308,6 +352,78 @@ class AudioEngine(
         if (peak > peerPeak) peerPeak = peak
         while (pcmQueue.size > MAX_QUEUE) pcmQueue.poll()
         pcmQueue.add(out)
+    }
+
+    private fun readCaps(packet: DatagramPacket) {
+        if (packet.length < 5) return
+        val flags = packet.data[4].toInt() and 0xff
+        val opus = (flags and CAPS_OPUS) != 0
+        val h264 = (flags and CAPS_H264) != 0
+        if (opus != peerOpus || h264 != peerH264) {
+            peerOpus = opus
+            peerH264 = h264
+            RunLog.write(
+                "audio",
+                "возможности собеседника: Opus=${if (opus) "да" else "нет"}, " +
+                    "H.264=${if (h264) "да" else "нет"}"
+            )
+        }
+    }
+
+    /**
+     * Пакет Opus -> звук в наушники. Каналы берём из метки пакета, а не из
+     * настроек: собеседник сам решает, стерео ему слать или моно.
+     */
+    private fun deliverOpus(packet: DatagramPacket, stereo: Boolean) {
+        val end = packet.length
+        if (end <= 8) return
+        val dec = opusDecoder(stereo)
+        if (dec == null) {
+            // Декодера нет — говорим об этом один раз, а не десять раз в
+            // секунду; собеседника это не чинит, но в журнале видно.
+            if (lastNoOpusLog == 0L) {
+                lastNoOpusLog = System.currentTimeMillis()
+                RunLog.write("audio", "пришёл Opus, но на телефоне нет декодера — звука не будет")
+                onLog("Телефон не умеет сжатый звук Opus — пусть собеседник выключит сжатие")
+            }
+            return
+        }
+        rxAudioPackets++
+        dec.decode(packet.data.copyOfRange(8, end))
+    }
+
+    private fun opusDecoder(stereo: Boolean): OpusDecoder? {
+        if (stereo) {
+            opusStereo?.let { return it }
+            val d = OpusDecoder(2, ::enqueuePcm, onLog)
+            if (!d.start()) return null
+            opusStereo = d
+            return d
+        }
+        opusMono?.let { return it }
+        val d = OpusDecoder(1, ::enqueuePcm, onLog)
+        if (!d.start()) return null
+        opusMono = d
+        return d
+    }
+
+    /** Свой звук сжатым пакетом Opus. */
+    private fun sendOpus(data: ByteArray) {
+        val p = peer ?: return
+        val s = socket ?: return
+        val packet = ByteArray(8 + data.size)
+        packet[0] = 0x47; packet[1] = 0x43; packet[2] = 0x41; packet[3] = 0x35 // GCA5
+        val seq = txSeq++
+        packet[4] = ((seq shr 24) and 0xff).toByte()
+        packet[5] = ((seq shr 16) and 0xff).toByte()
+        packet[6] = ((seq shr 8) and 0xff).toByte()
+        packet[7] = (seq and 0xff).toByte()
+        System.arraycopy(data, 0, packet, 8, data.size)
+        try {
+            s.send(DatagramPacket(packet, packet.size, p))
+            txAudioPackets++
+        } catch (_: Exception) {
+        }
     }
 
     private fun ensureTrack(): AudioTrack? {
@@ -566,6 +682,9 @@ class AudioEngine(
         val packet = ByteArray(8 + BLOCK * 2)
         "GCA1".toByteArray().copyInto(packet, 0)
         var seq = 0
+        // Opus включаем, только когда собеседник сообщил, что понимает его,
+        // и сам телефон умеет кодировать. Иначе — несжатый звук, как раньше.
+        var opus: OpusEncoder? = null
         // Подряд идущие пустые чтения. Захват умирает после переключения
         // выхода на громкую связь или после смены устройства: поток жив,
         // а данных нет. Тогда сессию надо переоткрыть, а не крутиться в
@@ -579,7 +698,7 @@ class AudioEngine(
             }
             if (read <= 0) {
                 deadReads++
-                if (deadReads >= 20) return
+                if (deadReads >= 20) break
                 sleep(10)
                 continue
             }
@@ -601,28 +720,49 @@ class AudioEngine(
             if (metroOn && !peerMetroOn && metroVolumeOut > 0.01f) {
                 mixClicks(local, micClock, read, metroVolumeOut)
             }
-            var off = 8
-            for (i in 0 until read) {
-                val v = local[i].toInt()
-                packet[off++] = (v and 0xff).toByte()
-                packet[off++] = ((v shr 8) and 0xff).toByte()
-            }
-            packet[4] = ((seq shr 24) and 0xff).toByte()
-            packet[5] = ((seq shr 16) and 0xff).toByte()
-            packet[6] = ((seq shr 8) and 0xff).toByte()
-            packet[7] = (seq and 0xff).toByte()
-            seq++
-            micClock += read
-            val p = peer
-            val s = socket
-            if (p != null && s != null) {
-                try {
-                    s.send(DatagramPacket(packet, off, p))
-                    txAudioPackets++
-                } catch (_: Exception) {
+            var enc = opus
+            if (enc == null && peerOpus && OpusSupport.encoderAvailable) {
+                val fresh = OpusEncoder({ data -> sendOpus(data) }, onLog)
+                if (fresh.start()) {
+                    opus = fresh
+                    enc = fresh
                 }
             }
+            if (enc != null && enc.isBroken) {
+                // Кодировщик сломался — возвращаемся к несжатому звуку,
+                // чтобы урок не остался без голоса.
+                enc.release()
+                opus = null
+                enc = null
+            }
+            val active = enc
+            if (active != null) {
+                active.encode(local, read)
+            } else {
+                var off = 8
+                for (i in 0 until read) {
+                    val v = local[i].toInt()
+                    packet[off++] = (v and 0xff).toByte()
+                    packet[off++] = ((v shr 8) and 0xff).toByte()
+                }
+                packet[4] = ((seq shr 24) and 0xff).toByte()
+                packet[5] = ((seq shr 16) and 0xff).toByte()
+                packet[6] = ((seq shr 8) and 0xff).toByte()
+                packet[7] = (seq and 0xff).toByte()
+                seq++
+                val p = peer
+                val s = socket
+                if (p != null && s != null) {
+                    try {
+                        s.send(DatagramPacket(packet, off, p))
+                        txAudioPackets++
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            micClock += read
         }
+        opus?.release()
         try {
             rec.stop()
         } catch (_: Exception) {
@@ -733,7 +873,7 @@ class AudioEngine(
         }
     }
 
-    private fun feedVideo(packet: DatagramPacket) {
+    private fun feedVideo(packet: DatagramPacket, h264: Boolean) {
         if (packet.length < 13) return
         val bb = java.nio.ByteBuffer.wrap(packet.data, 0, 12).order(java.nio.ByteOrder.BIG_ENDIAN)
         bb.position(4)
@@ -767,9 +907,20 @@ class AudioEngine(
                 all.toByteArray()
             }
         }
-        if (jpeg != null) {
+        if (jpeg == null) return
+        if (!h264) {
             val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
             if (bmp != null) onFrame(bmp)
+            return
         }
+        val dec = h264Decoder ?: run {
+            if (!H264Support.decoderAvailable) return
+            H264Decoder(onFrame, onLog).also { h264Decoder = it }
+        }
+        // Пропуск в нумерации — кадр H.264 потерялся целиком. Кормить
+        // декодер разницей после дыры нельзя: ждём ключевой кадр.
+        if (lastVideoId >= 0 && id != lastVideoId + 1) dec.reset()
+        lastVideoId = id
+        dec.feed(jpeg)
     }
 }

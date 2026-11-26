@@ -68,7 +68,7 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --windowed
           --name MajorLad-Teacher --collect-all sounddevice
-          --collect-all rtmidi --collect-all cv2 --collect-all soundfile --collect-all PySide6.QtMultimedia --exclude-module tkinter
+          --collect-all rtmidi --collect-all cv2 --collect-all soundfile --collect-all av --collect-all PySide6.QtMultimedia --exclude-module tkinter
           ${{ steps.opus.outputs.args }}
           main_teacher.py
 
@@ -76,7 +76,7 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --onefile --windowed
           --name MajorLad-Student --collect-all sounddevice
-          --collect-all rtmidi --collect-all cv2 --collect-all soundfile --collect-all PySide6.QtMultimedia --exclude-module tkinter
+          --collect-all rtmidi --collect-all cv2 --collect-all soundfile --collect-all av --collect-all PySide6.QtMultimedia --exclude-module tkinter
           ${{ steps.opus.outputs.args }}
           main_student.py
 

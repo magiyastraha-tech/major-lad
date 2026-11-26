@@ -1217,17 +1217,18 @@ class SettingsDialog(QDialog):
                     self.buffer_combo)
 
         # Битрейт Opus. Действует на исходящий поток: чем выше, тем лучше
-        # качество и тем больше данных нужно каналу. Для урока хватает 96.
+        # качество и тем больше данных нужно каналу. 192 кбит/с — умолчание:
+        # на 96 гитара звучала глухо, а с H.264 на видео канал это тянет.
         self.opus_bitrate_combo = QComboBox()
         self.opus_bitrate_combo.setAccessibleName("Битрейт сжатия звука")
         self.opus_bitrate_combo.setAccessibleDescription(
-            "Сколько данных уходит собеседнику. 96 кбит/с — для урока "
-            "достаточно, 128–320 — если канал позволяет. Работает, когда "
-            "оба конца поддерживают сжатие Opus.")
+            "Сколько данных уходит собеседнику. 192 кбит/с — по умолчанию, "
+            "96 — если канал слабый. Работает, когда оба конца поддерживают "
+            "сжатие Opus.")
         for kbps in (96, 128, 192, 320):
             self.opus_bitrate_combo.addItem(f"{kbps} кбит/с", kbps)
         index = self.opus_bitrate_combo.findData(
-            int(self.cfg["audio"].get("opus_bitrate", 96) or 96))
+            int(self.cfg["audio"].get("opus_bitrate", 192) or 192))
         self.opus_bitrate_combo.setCurrentIndex(index if index >= 0 else 0)
         form.addRow(label_for("Битрейт сжатия звука",
                               self.opus_bitrate_combo),
@@ -1313,7 +1314,7 @@ class SettingsDialog(QDialog):
 
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 30)
-        self.fps_spin.setValue(int(self.cfg["video"].get("fps", 15)))
+        self.fps_spin.setValue(int(self.cfg["video"].get("fps", 20)))
         self.fps_spin.setAccessibleName("Кадров в секунду")
         form.addRow(label_for("Кадров в секунду", self.fps_spin), self.fps_spin)
 
@@ -1334,7 +1335,7 @@ class SettingsDialog(QDialog):
         self.video_height_spin = QSpinBox()
         self.video_height_spin.setRange(120, 1080)
         self.video_height_spin.setSingleStep(8)
-        self.video_height_spin.setValue(int(self.cfg["video"].get("height", 480)))
+        self.video_height_spin.setValue(int(self.cfg["video"].get("height", 360)))
         self.video_height_spin.setAccessibleName("Высота видео")
         form.addRow(label_for("Высота", self.video_height_spin),
                     self.video_height_spin)
@@ -1353,6 +1354,22 @@ class SettingsDialog(QDialog):
         self.video_bitrate_combo.setCurrentIndex(index if index >= 0 else 0)
         form.addRow(label_for("Предел потока", self.video_bitrate_combo),
                     self.video_bitrate_combo)
+
+        # Как сжимать кадр. «Авто» — H.264, если его понимает собеседник:
+        # при том же потоке картинка заметно чище, а на неподвижной
+        # картинке почти ничего не уходит. Старая версия H.264 не поймёт,
+        # поэтому с ней видео останется на JPEG.
+        self.video_codec_combo = QComboBox()
+        self.video_codec_combo.setAccessibleName("Сжатие видео")
+        for title, key in (("Автоматически", "auto"),
+                           ("H.264 (чище при том же потоке)", "h264"),
+                           ("JPEG (каждый кадр отдельно)", "jpeg")):
+            self.video_codec_combo.addItem(title, key)
+        index = self.video_codec_combo.findData(
+            str(self.cfg["video"].get("codec", "auto")))
+        self.video_codec_combo.setCurrentIndex(index if index >= 0 else 0)
+        form.addRow(label_for("Сжатие", self.video_codec_combo),
+                    self.video_codec_combo)
 
         self.show_remote_box = QCheckBox("Показывать видео собеседника")
         self.show_remote_box.setChecked(bool(self.cfg["video"].get("show_remote", True)))
@@ -1623,7 +1640,7 @@ class SettingsDialog(QDialog):
         cfg["audio"]["show_all_drivers"] = self.all_drivers_box.isChecked()
         cfg["audio"]["buffer"] = str(self.buffer_combo.currentData() or "normal")
         cfg["audio"]["opus_bitrate"] = int(
-            self.opus_bitrate_combo.currentData() or 96)
+            self.opus_bitrate_combo.currentData() or 192)
         cfg["audio"]["tx_delay_ms"] = int(self.tx_delay_spin.value())
         cfg["shortcuts"] = dict(self.shortcut_map)
 
@@ -1633,6 +1650,8 @@ class SettingsDialog(QDialog):
         cfg["video"]["quality"] = int(self.quality_spin.value())
         cfg["video"]["width"] = int(self.video_width_spin.value())
         cfg["video"]["height"] = int(self.video_height_spin.value())
+        cfg["video"]["codec"] = str(
+            self.video_codec_combo.currentData() or "auto")
         cfg["video"]["bitrate"] = int(
             self.video_bitrate_combo.currentData() or 0)
         cfg["video"]["show_remote"] = self.show_remote_box.isChecked()
@@ -2709,6 +2728,9 @@ class MainWindow(QMainWindow):
                 self.engine.stop()
                 self._start_audio(local_only=True)
             return
+        # Новая сторона — новый видеопоток: прежний H.264 сюда не
+        # продолжается, ждём ключевой кадр.
+        self.reassembler.reset()
         if self.is_teacher:
             # Если прошлый урок ещё не закрыт отдельным сигналом (ученика
             # заменили), фиксируем его до начала нового.
@@ -2742,7 +2764,7 @@ class MainWindow(QMainWindow):
         # когда откроет устройства.
         self.engine.tx_delay_ms = int(cfg_audio.get("tx_delay_ms", 0) or 0)
         self.engine.set_opus_bitrate(
-            int(cfg_audio.get("opus_bitrate", 96) or 96))
+            int(cfg_audio.get("opus_bitrate", 192) or 192))
         devices = {
             "in1": cfg_audio.get("device1", ""),
             "in2": cfg_audio.get("device2", ""),
@@ -2796,11 +2818,15 @@ class MainWindow(QMainWindow):
         self.video_label.setVisible(bool(self.cfg["video"].get("show_remote", True)))
         sender = VideoSender(
             camera=int(self.cfg["video"].get("camera", 0)),
-            fps=int(self.cfg["video"].get("fps", 15)),
+            fps=int(self.cfg["video"].get("fps", 20)),
             quality=int(self.cfg["video"].get("quality", 60)),
             width=int(self.cfg["video"].get("width", 640)),
-            height=int(self.cfg["video"].get("height", 480)),
-            bitrate=int(self.cfg["video"].get("bitrate", 0)),
+            height=int(self.cfg["video"].get("height", 360)),
+            bitrate=int(self.cfg["video"].get("bitrate", 500)),
+            codec=str(self.cfg["video"].get("codec", "auto")),
+            # «Авто» включает H.264 только после того, как собеседник
+            # объявил, что умеет его принимать.
+            h264_ok=self.engine.peer_h264,
             send_fn=self.engine.send_video_packet,
             log=self._log_threadsafe,
         )
@@ -4621,7 +4647,7 @@ class MainWindow(QMainWindow):
             int(self.cfg["audio"].get("tx_delay_ms", 0) or 0))
         # Битрейт применяется к следующему кодировщику, поток не рвём.
         self.engine.set_opus_bitrate(
-            int(self.cfg["audio"].get("opus_bitrate", 96) or 96))
+            int(self.cfg["audio"].get("opus_bitrate", 192) or 192))
         # Обработка первого входа (мониторинг, срез низа, компрессор)
         # включается без перезапуска звука: фильтр и компрессор живут в
         # состоянии потока, мониторинг читается на каждом блоке.

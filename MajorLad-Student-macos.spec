@@ -18,7 +18,9 @@ import os
 from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = [], [], []
-for _package in ("sounddevice", "rtmidi", "cv2", "soundfile",
+# av — видео кодеком H.264: внутри пакета libx264 и декодер H.264,
+# собранные под эту систему. Без пакета видео работает на JPEG.
+for _package in ("sounddevice", "rtmidi", "cv2", "soundfile", "av",
                  "PySide6.QtMultimedia"):
     _d, _b, _h = collect_all(_package)
     datas += _d

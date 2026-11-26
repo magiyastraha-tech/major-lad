@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover - без PortAudio модуль всё р�
         sd = None
     _ASIO_DLL = False
 
-from . import opus_codec
+from . import opus_codec, video_h264
 from .config import DEFAULT_DEVICE
 from .media import Player
 from .metronome import Metronome
@@ -347,6 +347,8 @@ MAGIC_VIDEO = b"GCV1"
 # значит, стерео она понимает, а сжатие нет.
 CAPS_STEREO = 0x01
 CAPS_OPUS = 0x02
+# Собеседник умеет H.264: можно слать видео сжатым потоком, а не JPEG.
+CAPS_H264 = 0x04
 
 
 # ---------------------------------------------------------------------------
@@ -1359,6 +1361,8 @@ class AudioEngine:
         # Собеседник умеет принимать Opus. Пока не подтвердил — шлём
         # несжатый звук: старая версия сжатый пакет не разберёт.
         self._peer_opus = False
+        # Собеседник умеет H.264. Пока не подтвердил — видео идёт JPEG.
+        self._peer_h264 = False
         # Собеседник прислал свои возможности. Пока их нет, свои шлём
         # настойчивее: иначе сторона, услышавшая чужие раньше, замолкает и
         # вторая так и не узнаёт про Opus — звук идёт несжатым.
@@ -1492,7 +1496,7 @@ class AudioEngine:
         # Битрейт Opus в кбит/с. Он влияет только на исходящий поток:
         # собеседник декодирует то, что получил, и его настройка ничего не
         # меняет. 96 хватает для урока, 128–320 — если канал позволяет.
-        self.opus_bitrate = 96
+        self.opus_bitrate = 192
         self._tx_delay = DelayBuffer()
         self._tx_delay_auto = 0
         # Заполнение входного буфера в последнем блоке: по нему считается
@@ -2114,6 +2118,7 @@ class AudioEngine:
         self._recv_stereo = False
         self._peer_stereo = False
         self._peer_opus = False
+        self._peer_h264 = False
         self._peer_caps = False
         self._peer_live = False
         self._peer_wait = 0.0
@@ -2180,7 +2185,7 @@ class AudioEngine:
         """
         value = int(kbps or 0)
         if value not in (96, 128, 192, 320):
-            value = 96
+            value = 192
         self.opus_bitrate = value
         return value
 
@@ -2591,7 +2596,13 @@ class AudioEngine:
         flags = CAPS_STEREO
         if opus_codec.available():
             flags |= CAPS_OPUS
+        if video_h264.available():
+            flags |= CAPS_H264
         return bytes([flags])
+
+    def peer_h264(self) -> bool:
+        """Собеседник умеет принимать H.264. Видео спрашивает об этом."""
+        return bool(self._peer_h264)
 
     def _seq_gap(self, data: bytes) -> int:
         """Сколько пакетов потеряно перед этим. Ничего не меняет."""
@@ -3024,12 +3035,13 @@ class AudioEngine:
 
             if magic == MAGIC_CAPS:
                 # Собеседник сообщил, что умеет: бит 0 — стерео, бит 1 —
-                # Opus. Старая версия присылает один байт b"\x01", поэтому
+                # Opus, бит 2 — H.264. Старая версия присылает один байт b"\x01", поэтому
                 # незнакомый хвост просто не учитываем.
                 self._peer = addr if self._is_server else self._server_addr
                 flags = data[4] if len(data) > 4 else CAPS_STEREO
                 self._peer_stereo = bool(flags & CAPS_STEREO)
                 self._peer_opus = bool(flags & CAPS_OPUS)
+                self._peer_h264 = bool(flags & CAPS_H264)
                 self._peer_caps = True
                 if self._is_server:
                     try:

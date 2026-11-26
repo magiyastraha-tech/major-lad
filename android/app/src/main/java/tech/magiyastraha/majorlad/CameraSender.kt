@@ -18,19 +18,36 @@ import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 
 /**
- * Камера шлёт собеседнику картинку в JPEG примерно пятнадцать раз в секунду.
- * Такой поток тянет и слабый телефон, и домашний Wi-Fi.
+ * Камера шлёт собеседнику картинку примерно пятнадцать раз в секунду.
+ * Кодек H.264 включается, когда собеседник его понимает: на том же потоке
+ * картинка заметно чище, потому что передаётся разница между кадрами, а не
+ * каждый кадр целиком. Если H.264 недоступен, идёт JPEG — он работает
+ * всегда и на любом телефоне.
  */
 class CameraSender(
     private val ctx: Context,
     private val owner: LifecycleOwner,
     private val onLog: (String) -> Unit,
-    private val onJpeg: (ByteArray) -> Unit,
+    /** Стоит ли слать H.264: собеседник его понимает. */
+    private val useH264: () -> Boolean,
+    /** Готовый кусок потока и признак: true — H.264, false — JPEG. */
+    private val onFrame: (ByteArray, Boolean) -> Unit,
 ) {
+    companion object {
+        /** Кадров в секунду: больше канал не держит вместе со звуком. */
+        private const val H264_FPS = 15
+        /** Предел потока H.264, бит в секунду. */
+        private const val H264_BITRATE = 500_000
+    }
+
     private var provider: ProcessCameraProvider? = null
     private val executor = Executors.newSingleThreadExecutor()
     @Volatile private var lastFrame = 0L
     @Volatile private var active = false
+    private var encoder: H264Encoder? = null
+    private var encoderRotation = -1
+    private var h264On = false
+    private var noEncoderLogged = false
 
     fun start() {
         if (active) return
@@ -61,6 +78,10 @@ class CameraSender(
         } catch (_: Exception) {
         }
         provider = null
+        encoder?.release()
+        encoder = null
+        encoderRotation = -1
+        h264On = false
     }
 
     private fun analyze(image: ImageProxy) {
@@ -69,12 +90,64 @@ class CameraSender(
             val now = System.currentTimeMillis()
             if (now - lastFrame < 66) return
             lastFrame = now
+            if (useH264()) {
+                val enc = ensureEncoder(image)
+                if (enc != null) {
+                    enc.encode(image, image.imageInfo.rotationDegrees)
+                    return
+                }
+            } else if (encoder != null) {
+                encoder?.release()
+                encoder = null
+                encoderRotation = -1
+                h264On = false
+                RunLog.write("video", "H.264: собеседник его не понимает — видео идёт JPEG")
+            }
             val jpeg = imageToJpeg(image)
-            if (jpeg != null) onJpeg(jpeg)
+            if (jpeg != null) onFrame(jpeg, false)
         } catch (_: Exception) {
         } finally {
             image.close()
         }
+    }
+
+    /**
+     * Кодировщик под текущий поворот камеры. Если телефон повернули, размер
+     * кадра меняется местами — кодировщик пересоздаётся.
+     */
+    private fun ensureEncoder(image: ImageProxy): H264Encoder? {
+        val rotation = ((image.imageInfo.rotationDegrees % 360) + 360) % 360
+        val sideways = rotation == 90 || rotation == 270
+        val w = if (sideways) image.height else image.width
+        val h = if (sideways) image.width else image.height
+        // H.264 требует чётных сторон; нечётный кадр честнее отдать JPEG.
+        if (w <= 0 || h <= 0 || w % 2 != 0 || h % 2 != 0) return null
+        var enc = encoder
+        if (enc != null && encoderRotation != rotation) {
+            enc.release()
+            enc = null
+            encoder = null
+            h264On = false
+        }
+        if (enc == null) {
+            if (!H264Support.encoderAvailable) {
+                if (!noEncoderLogged) {
+                    noEncoderLogged = true
+                    RunLog.write("video", "H.264: кодировщика нет — видео идёт JPEG")
+                }
+                return null
+            }
+            enc = H264Encoder(w, h, H264_FPS, H264_BITRATE,
+                { data -> onFrame(data, true) }, onLog)
+            if (!enc.start()) return null
+            encoder = enc
+            encoderRotation = rotation
+        }
+        if (!h264On) {
+            h264On = true
+            RunLog.write("video", "H.264: $w×$h, $H264_FPS кадров/с, до ${H264_BITRATE / 1000} кбит/с")
+        }
+        return enc
     }
 
     private fun imageToJpeg(image: ImageProxy): ByteArray? {
