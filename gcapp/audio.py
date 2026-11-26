@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover - без PortAudio модуль всё р�
         sd = None
     _ASIO_DLL = False
 
-from . import opus_codec, video_h264
+from . import aac_codec, opus_codec, video_h264
 from .config import DEFAULT_DEVICE
 from .media import Player
 from .metronome import Metronome
@@ -62,6 +62,11 @@ BLOCK = 480          # 10 мс — единица буферов и пакето
 # отсчётов — 5 мс. Не всякий драйвер даёт такой блок, поэтому при отказе
 # откатываемся на 10 мс.
 AUDIO_BLOCK = 240
+
+# Сколько звука предсказываем на месте потерянных пакетов, прежде чем впустить
+# настоящий. 200 мс хватает на дрожание сети; дольше — уже выдумка, которая
+# тянет за собой тишину на месте музыки.
+_PLC_LIMIT = SAMPLE_RATE // 5
 
 # Сколько звука держим в буфере. Это и есть задержка сверх драйвера.
 # Рабочая цель — 4 блока, 40 мс: на локальной сети этого с запасом хватает
@@ -341,6 +346,10 @@ MAGIC_CAPS = b"GCC2"
 # поймёт, поэтому Opus включается только после обмена возможностями.
 MAGIC_AUDIO_OPUS = b"GCA5"
 MAGIC_AUDIO_OPUS_STEREO = b"GCA6"
+# Запасной сжатый звук: AAC-LC, моно. Нужен там, где Opus на телефоне
+# открывается и сразу умирает. Отдельная метка — старый собеседник такой
+# пакет не разберёт.
+MAGIC_AUDIO_AAC = b"GCA7"
 MAGIC_VIDEO = b"GCV1"
 
 # Байт возможностей в пакете GCC2. Старая версия шлёт просто b"\x01" —
@@ -349,6 +358,8 @@ CAPS_STEREO = 0x01
 CAPS_OPUS = 0x02
 # Собеседник умеет H.264: можно слать видео сжатым потоком, а не JPEG.
 CAPS_H264 = 0x04
+# Собеседник понимает AAC-LC: если Opus не пойдёт, звук всё равно сжатый.
+CAPS_AAC = 0x08
 
 
 # ---------------------------------------------------------------------------
@@ -1361,6 +1372,9 @@ class AudioEngine:
         # Собеседник умеет принимать Opus. Пока не подтвердил — шлём
         # несжатый звук: старая версия сжатый пакет не разберёт.
         self._peer_opus = False
+        # Собеседник понимает AAC-LC. Это запасной сжатый формат: Opus
+        # предпочтительнее, но AAC есть везде.
+        self._peer_aac = False
         # Собеседник умеет H.264. Пока не подтвердил — видео идёт JPEG.
         self._peer_h264 = False
         # Собеседник прислал свои возможности. Пока их нет, свои шлём
@@ -1399,6 +1413,14 @@ class AudioEngine:
         # Счётчики сбоев кодека: первый попадёт в журнал, остальные молча.
         self._opus_errors = 0
         self._opus_fail_logged = False
+        # Декодер Opus не работает — заявку снимаем, собеседник шлёт AAC.
+        self._opus_deaf = False
+        self._opus_decode_fails = 0
+        # То же для AAC: счётчики сбоев и снятая заявка.
+        self._aac_errors = 0
+        self._aac_fail_logged = False
+        self._aac_deaf = False
+        self._aac_decode_fails = 0
         self.sources: dict[str, Source] = {}
         # Снимок источников для звукового потока. Поток колбэка не имеет
         # права перебирать словарь, пока его меняет start()/stop(): Python
@@ -2118,6 +2140,7 @@ class AudioEngine:
         self._recv_stereo = False
         self._peer_stereo = False
         self._peer_opus = False
+        self._peer_aac = False
         self._peer_h264 = False
         self._peer_caps = False
         self._peer_live = False
@@ -2590,12 +2613,18 @@ class AudioEngine:
 
     # -- статистика ---------------------------------------------------------
 
-    @staticmethod
-    def _caps_flags() -> bytes:
-        """Что мы умеем: стерео и, если библиотека нашлась, Opus."""
+    def _caps_flags(self) -> bytes:
+        """Что мы умеем: стерео, Opus, запасной AAC и H.264.
+
+        Заявка обновляется каждый второй вместе с пакетом: если декодер
+        сорвался, его бит снимается и собеседник сам выбирает следующий
+        формат — Opus, затем AAC. Несжатый звук в работе не остаётся.
+        """
         flags = CAPS_STEREO
-        if opus_codec.available():
+        if opus_codec.available() and not self._opus_deaf:
             flags |= CAPS_OPUS
+        if aac_codec.available() and not self._aac_deaf:
+            flags |= CAPS_AAC
         if video_h264.available():
             flags |= CAPS_H264
         return bytes([flags])
@@ -3006,6 +3035,8 @@ class AudioEngine:
         sock = self._sock
         # Декодеры по числу каналов; None — этот компьютер не смог.
         decoders: dict[int, object] = {}
+        # Запасной декодер AAC: AacCodec ленив, создаём при первом пакете.
+        aac_decoder = None
         while (self._running and sock is not None
                and generation == self._generation):
             try:
@@ -3035,13 +3066,15 @@ class AudioEngine:
 
             if magic == MAGIC_CAPS:
                 # Собеседник сообщил, что умеет: бит 0 — стерео, бит 1 —
-                # Opus, бит 2 — H.264. Старая версия присылает один байт b"\x01", поэтому
-                # незнакомый хвост просто не учитываем.
+                # Opus, бит 2 — H.264, бит 3 — AAC. Старая версия присылает
+                # один байт b"\x01", поэтому незнакомый хвост просто не
+                # учитываем.
                 self._peer = addr if self._is_server else self._server_addr
                 flags = data[4] if len(data) > 4 else CAPS_STEREO
                 self._peer_stereo = bool(flags & CAPS_STEREO)
                 self._peer_opus = bool(flags & CAPS_OPUS)
                 self._peer_h264 = bool(flags & CAPS_H264)
+                self._peer_aac = bool(flags & CAPS_AAC)
                 self._peer_caps = True
                 if self._is_server:
                     try:
@@ -3055,11 +3088,13 @@ class AudioEngine:
                                                 MAGIC_AUDIO_STEREO,
                                                 MAGIC_AUDIO_OPUS,
                                                 MAGIC_AUDIO_OPUS_STEREO,
+                                                MAGIC_AUDIO_AAC,
                                                 MAGIC_VIDEO):
                 self._peer = addr
 
             if magic in (MAGIC_AUDIO, MAGIC_AUDIO_STEREO,
-                         MAGIC_AUDIO_OPUS, MAGIC_AUDIO_OPUS_STEREO):
+                         MAGIC_AUDIO_OPUS, MAGIC_AUDIO_OPUS_STEREO,
+                         MAGIC_AUDIO_AAC):
                 self._peer_rx_at = time.monotonic()
 
             if magic == MAGIC_AUDIO:
@@ -3094,9 +3129,9 @@ class AudioEngine:
                     except Exception as exc:
                         decoders[channels] = None
                         self._opus_errors += 1
+                        self._opus_deaf = True
                         try:
-                            self.log(f"Приём Opus не завёлся, звук пойдёт "
-                                     f"несжатым: {exc}")
+                            self.log(f"Приём Opus не завёлся, ждём AAC: {exc}")
                         except Exception:
                             pass
                 decoder = decoders[channels]
@@ -3113,21 +3148,74 @@ class AudioEngine:
                         # Дырку закрываем предсказанием. Раньше хватало
                         # 50 мс, но и после них в буфере оставалась дыра,
                         # которая слышалась треском: теперь до 200 мс, а
-                        # настоящий звук после дырки входит плавно.
-                        for _ in range(min(gap, 20)):
+                        # настоящий звук после дырки входит плавно. Считаем
+                        # по отсчётам, а не по пакетам: кадр бывает и 20 мс,
+                        # и 120 мс, и потолок должен быть один и тот же.
+                        filled = 0
+                        while filled < _PLC_LIMIT:
                             plc = decoder.decode(b"")
                             self._write_peer(np.frombuffer(plc, np.int16),
                                              stereo)
+                            filled += len(plc) // 2
                     pcm = decoder.decode(data[8:])
                 except Exception as exc:
                     self._opus_errors += 1
+                    self._opus_decode_fails += 1
                     if self._opus_errors == 1:
                         try:
                             self.log(f"Сбой декодера Opus: {exc}")
                         except Exception:
                             pass
+                    # Одиночный пакет мог быть битым, но если сбои идут
+                    # подряд — декодер не тянет, честнее попросить PCM.
+                    if self._opus_decode_fails >= 3 and not self._opus_deaf:
+                        self._opus_deaf = True
+                        decoders[channels] = None
+                        try:
+                            self.log("Декодер Opus не тянет — собеседник "
+                                     "перейдёт на AAC")
+                        except Exception:
+                            pass
                     continue
                 self._write_peer(np.frombuffer(pcm, np.int16), stereo)
+            elif magic == MAGIC_AUDIO_AAC:
+                # Запасной сжатый формат: всегда моно, AAC-LC.
+                gap = self._seq_gap(data)
+                self._note_seq(data)
+                if gap:
+                    self._peer_gap = True
+                if aac_decoder is None and not self._aac_deaf:
+                    try:
+                        aac_decoder = aac_codec.Decoder()
+                    except Exception as exc:
+                        self._aac_deaf = True
+                        if not self._aac_fail_logged:
+                            self._aac_fail_logged = True
+                            try:
+                                self.log(f"Приём AAC не завёлся: {exc}")
+                            except Exception:
+                                pass
+                if aac_decoder is None:
+                    continue
+                try:
+                    pcm = aac_decoder.decode(data[8:])
+                except Exception as exc:
+                    self._aac_errors += 1
+                    self._aac_decode_fails += 1
+                    if self._aac_errors == 1:
+                        try:
+                            self.log(f"Сбой декодера AAC: {exc}")
+                        except Exception:
+                            pass
+                    if self._aac_decode_fails >= 3 and not self._aac_deaf:
+                        self._aac_deaf = True
+                        aac_decoder = None
+                        try:
+                            self.log("Декодер AAC не тянет — заявку снимаем")
+                        except Exception:
+                            pass
+                    continue
+                self._write_peer(np.frombuffer(pcm, np.int16), False)
             elif magic == MAGIC_VIDEO and self.on_video is not None:
                 self.on_video(data)
 
@@ -3141,14 +3229,30 @@ class AudioEngine:
         # один компьютер сжимает звук, а второй шлёт его целиком.
         peer_at = 0.0
         mode_logged = False
-        # Своя библиотека Opus есть? Если нет — о сжатии не заикаемся.
+        # Что умеем слать сами. Если библиотеки нет — о сжатии не заикаемся.
         local_opus = opus_codec.available()
+        local_aac = aac_codec.available()
+        # Кодировщик может сорваться уже на живом звуке: тогда этот формат
+        # для нас закрыт до перезапуска, а звук уходит следующим сжатым.
+        opus_send_broken = False
+        aac_send_broken = False
         encoders: dict[int, object] = {}
+        aac_cache: dict[str, object] = {}
         # Звуковая карта отдаёт блоки по 5 мс, а Opus работает кадром 10 мс:
-        # копим неполный кадр здесь.
+        # копим неполный кадр здесь. AAC копит кадр внутри себя, ему нужен
+        # блок как есть.
         pending = bytearray()
         pending_stereo = False
         opus_logged = False
+        aac_logged = False
+        # Сообщения о сбоях — по одному разу за прогон, чтобы журнал не
+        # забивался одинаковыми строками каждые 10 мс.
+        opus_send_fail_logged = False
+        aac_send_fail_logged = False
+        silent_logged = False
+        # Текущий исходящий формат: "opus", "aac" или "pcm". При смене
+        # выкидываем недособранный кадр — это меньше 10 мс потери.
+        mode = ""
         while (self._running and sock is not None
                and generation == self._generation):
             now = time.monotonic()
@@ -3183,14 +3287,25 @@ class AudioEngine:
                     and (self._peer_caps or now - peer_at >= 6.0)):
                 mode_logged = True
                 try:
-                    if self._peer_opus and local_opus:
+                    opus_ok = (self._peer_opus and local_opus
+                               and not opus_send_broken)
+                    aac_ok = (self._peer_aac and local_aac
+                              and not aac_send_broken)
+                    if opus_ok:
                         bits = self.opus_bitrate
-                        mode = "стерео" if self._peer_stereo else "моно"
-                        self.log(f"Формат звука: Opus, {bits} кбит/с, {mode}.")
-                    elif not local_opus:
+                        channels = "стерео" if self._peer_stereo else "моно"
+                        self.log(f"Формат звука: Opus, {bits} кбит/с, "
+                                 f"{channels}.")
+                    elif aac_ok:
+                        self.log(f"Формат звука: AAC, "
+                                 f"{aac_codec.BITRATE // 1000} кбит/с, моно.")
+                    elif self._peer_opus or self._peer_aac:
+                        self.log("Формат звука: сжать этот компьютер "
+                                 "не может — звук не отправляется.")
+                    elif not local_opus and not local_aac:
                         self.log("Формат звука: несжатый PCM, "
-                                 "библиотека Opus не найдена.")
-                    elif not self._peer_opus:
+                                 "библиотеки сжатия не найдены.")
+                    elif not self._peer_opus and not self._peer_aac:
                         # Телефон сжатие не умеет и не скрывает этого:
                         # в возможностях стоит только бит стерео.
                         self.log("Формат звука: несжатый PCM, "
@@ -3204,11 +3319,72 @@ class AudioEngine:
             if self._peer is None:
                 self._tx_nopeer += 1
                 continue
-            if not (self._peer_opus and local_opus):
-                # Собеседник сжатый звук не понимает — шлём как раньше.
+            opus_ok = (self._peer_opus and local_opus
+                       and not opus_send_broken)
+            aac_ok = (self._peer_aac and local_aac
+                      and not aac_send_broken)
+            if not opus_ok and not aac_ok:
+                if self._peer_opus or self._peer_aac:
+                    # Собеседник сжатый звук понимает, а нам сжать нечем:
+                    # несжатый поток в такой ситуации забил бы канал.
+                    # Лучше пауза, чем треск во всю полосу.
+                    pending.clear()
+                    if not silent_logged:
+                        silent_logged = True
+                        try:
+                            self.log("Сжать звук нечем, а собеседник ждёт "
+                                     "сжатый — звук приостановлен.")
+                        except Exception:
+                            pass
+                    continue
+                # Собеседник вообще не понимает сжатия — это старый выпуск.
+                # Шлём как раньше, иначе он не услышит ничего.
                 pending.clear()
+                mode = "pcm"
                 self._send_audio(sock, stereo, pcm, opus=False)
                 continue
+            if aac_ok and not opus_ok:
+                # Запасной сжатый формат. AAC всегда моно и идёт кадром
+                # 1024 отсчёта, поэтому неполный кадр он копит сам: блок
+                # отдаём как есть, без своей сборки.
+                if mode != "aac":
+                    mode = "aac"
+                    pending.clear()
+                encoder = self._aac_encoder(aac_cache)
+                if encoder is None:
+                    # В этом прогоне AAC недоступен; следующий блок пойдёт
+                    # следующим форматом.
+                    aac_send_broken = True
+                    continue
+                payload = b""
+                try:
+                    payload = encoder.encode(self._mono_pcm(stereo, pcm))
+                except Exception as exc:
+                    aac_send_broken = True
+                    self._aac_errors += 1
+                    if not aac_send_fail_logged:
+                        aac_send_fail_logged = True
+                        try:
+                            self.log(f"Кодер AAC отказал: {exc}")
+                        except Exception:
+                            pass
+                    continue
+                # Пустой ответ — кадр ещё не набран: тишина в эфире
+                # законна, а несжатый огрызок — нет.
+                if not payload:
+                    continue
+                self._send_audio(sock, stereo, payload, opus=False, aac=True)
+                if not aac_logged:
+                    aac_logged = True
+                    try:
+                        self.log(f"Звук сжимается кодеком AAC, "
+                                 f"{aac_codec.BITRATE // 1000} кбит/с, моно.")
+                    except Exception:
+                        pass
+                continue
+            if mode != "opus":
+                mode = "opus"
+                pending.clear()
             if pending and stereo != pending_stereo:
                 pending.clear()
             pending_stereo = stereo
@@ -3218,21 +3394,26 @@ class AudioEngine:
                 chunk = bytes(pending[:frame_bytes])
                 del pending[:frame_bytes]
                 encoder = self._encoder(encoders, 2 if stereo else 1)
-                payload = b""
-                if encoder is not None:
-                    try:
-                        payload = encoder.encode(chunk)
-                    except Exception as exc:
-                        self._opus_errors += 1
-                        self._peer_opus = False
-                        if self._opus_errors == 1:
-                            try:
-                                self.log(f"Кодер Opus отказал, звук пойдёт "
-                                         f"несжатым: {exc}")
-                            except Exception:
-                                pass
+                if encoder is None:
+                    opus_send_broken = True
+                    pending.clear()
+                    break
+                try:
+                    payload = encoder.encode(chunk)
+                except Exception as exc:
+                    self._opus_errors += 1
+                    opus_send_broken = True
+                    pending.clear()
+                    if not opus_send_fail_logged:
+                        opus_send_fail_logged = True
+                        try:
+                            self.log(f"Кодер Opus отказал: {exc}")
+                        except Exception:
+                            pass
+                    break
+                # Несжатым не откатываемся: неполный кадр просто теряется,
+                # следующий блок уйдёт сжатым — AAC или Opus.
                 if not payload:
-                    self._send_audio(sock, stereo, chunk, opus=False)
                     continue
                 self._send_audio(sock, stereo, payload, opus=True)
                 if not opus_logged:
@@ -3243,6 +3424,12 @@ class AudioEngine:
                     except Exception:
                         pass
         for encoder in encoders.values():
+            if encoder is not None:
+                try:
+                    encoder.close()
+                except Exception:
+                    pass
+        for encoder in aac_cache.values():
             if encoder is not None:
                 try:
                     encoder.close()
@@ -3264,7 +3451,7 @@ class AudioEngine:
             if not self._opus_fail_logged:
                 self._opus_fail_logged = True
                 try:
-                    self.log(f"Opus недоступен, звук пойдёт без сжатия: "
+                    self.log(f"Opus недоступен, звук пойдёт кодеком AAC: "
                              f"{exc}")
                 except Exception:
                     pass
@@ -3272,14 +3459,47 @@ class AudioEngine:
         cache[key] = encoder
         return encoder
 
+    def _aac_encoder(self, cache: dict):
+        """AAC-кодировщик моно; None — этот компьютер сжать не смог."""
+        key = "mono"
+        if key in cache:
+            return cache[key]
+        try:
+            encoder = aac_codec.Encoder()
+        except Exception as exc:
+            cache[key] = None
+            try:
+                self.log(f"AAC недоступен: {exc}")
+            except Exception:
+                pass
+            return None
+        cache[key] = encoder
+        return encoder
+
+    @staticmethod
+    def _mono_pcm(stereo: bool, pcm: bytes) -> bytes:
+        """Стерео PCM -> моно: AAC у нас всегда одноканальный."""
+        if not stereo:
+            return pcm
+        data = np.frombuffer(pcm, np.int16)
+        if data.size < 2:
+            return b""
+        pairs = data[:data.size - data.size % 2].reshape(-1, 2)
+        # int32, чтобы сумма двух int16 не переполнилась.
+        mono = (pairs.astype(np.int32).sum(axis=1) // 2).astype(np.int16)
+        return mono.tobytes()
+
     def _send_audio(self, sock, stereo: bool, payload: bytes,
-                    opus: bool) -> None:
+                    opus: bool, aac: bool = False) -> None:
         """Собирает и отправляет один звуковой пакет."""
         if self._peer is None:
             self._tx_nopeer += 1
             return
         self._seq = (self._seq + 1) & 0xFFFFFFFF
-        if opus:
+        if aac:
+            # AAC у нас всегда моно, метка одна, без варианта со стерео.
+            magic = MAGIC_AUDIO_AAC
+        elif opus:
             magic = (MAGIC_AUDIO_OPUS_STEREO if stereo
                      else MAGIC_AUDIO_OPUS)
         else:

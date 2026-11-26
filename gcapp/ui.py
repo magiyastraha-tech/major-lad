@@ -156,7 +156,6 @@ class Announcer(QLabel):
         # Доступное имя меняем сразу: диктор может прочитать его в любой
         # момент, а вот событие отправляем очередью.
         self.setAccessibleName(text)
-        self.setAccessibleDescription(text)
         self._queued.emit(text, polite)
 
     def _collect(self, text: str, polite: bool) -> None:
@@ -222,7 +221,8 @@ def announce(widget: QWidget, text: str) -> None:
             return
     except Exception:
         pass
-    widget.setAccessibleDescription(text)
+    # Описание элемента не трогаем: диктор прочитал бы его ещё раз, когда
+    # фокус снова попадёт на элемент. Объявления хватает.
     if _announcer is not None:
         _announcer.say(text)
         return
@@ -429,10 +429,6 @@ class ShortcutDialog(QDialog):
 
         self.edit = _KeyCapture(combo, self)
         self.edit.setAccessibleName("Новое сочетание клавиш")
-        self.edit.setAccessibleDescription(
-            "Нажмите сочетание: Control, Alt, Нумлок или клавиша цифрового "
-            "блока, или клавиша с F1 по F12. Потом Tab до кнопки «Принять» "
-            "и Пробел.")
         layout.addWidget(label_for("Новое сочетание", self.edit))
         layout.addWidget(self.edit)
         self.edit.setFocus()
@@ -551,7 +547,6 @@ class SettingsDialog(QDialog):
             return
         index = self.tree.indexOfTopLevelItem(current)
         self.stack.setCurrentIndex(index)
-        announce(self.stack.currentWidget(), f"Раздел {current.text(0)}")
 
     # -- страницы -----------------------------------------------------------
 
@@ -869,10 +864,6 @@ class SettingsDialog(QDialog):
         driver_form = QFormLayout(driver_page)
         self.driver_combo = QComboBox()
         self.driver_combo.setAccessibleName("Драйвер звука")
-        self.driver_combo.setAccessibleDescription(
-            "WASAPI — обычные драйверы Windows: карта работает не только в "
-            "этой программе. ASIO — драйвер звуковой карты с низкой "
-            "задержкой: пока программа запущена, карту видят только она.")
         for key, title in audio.list_audio_drivers():
             self.driver_combo.addItem(title, key)
         index = self.driver_combo.findData(
@@ -883,9 +874,6 @@ class SettingsDialog(QDialog):
 
         self.asio_combo = QComboBox()
         self.asio_combo.setAccessibleName("Звуковая карта ASIO")
-        self.asio_combo.setAccessibleDescription(
-            "Карта, которую программа забирает через ASIO. Пока идёт урок, "
-            "другие программы её не видят.")
         self.asio_card_label = label_for("Звуковая карта",
                                          self.asio_combo)
         driver_form.addRow(self.asio_card_label, self.asio_combo)
@@ -895,9 +883,6 @@ class SettingsDialog(QDialog):
         self.asio_in_spin.setValue(max(1, int(
             self.cfg["audio"].get("asio_in_channels", 2) or 2)))
         self.asio_in_spin.setAccessibleName("Сколько входных каналов открыть")
-        self.asio_in_spin.setAccessibleDescription(
-            "Сколько входов звуковой карты программа забирает. Обычно "
-            "хватает двух: стереопара.")
         self.asio_in_label = label_for("Входных каналов", self.asio_in_spin)
         driver_form.addRow(self.asio_in_label, self.asio_in_spin)
 
@@ -906,21 +891,11 @@ class SettingsDialog(QDialog):
         self.asio_out_spin.setValue(max(1, int(
             self.cfg["audio"].get("asio_out_channels", 2) or 2)))
         self.asio_out_spin.setAccessibleName("Сколько выходных каналов открыть")
-        self.asio_out_spin.setAccessibleDescription(
-            "Сколько выходов звуковой карты программа забирает: в них идут "
-            "наушники, метроном и минусовка.")
         self.asio_out_label = label_for("Выходных каналов", self.asio_out_spin)
         driver_form.addRow(self.asio_out_label, self.asio_out_spin)
 
         self.device_buffer_combo = QComboBox()
         self.device_buffer_combo.setAccessibleName("Размер буфера драйвера")
-        self.device_buffer_combo.setAccessibleDescription(
-            "Размер блока, который программа просит у драйвера. Меньше "
-            "блок — меньше задержка, но выше нагрузка: на 32 и 48 может "
-            "появляться треск. У карт ASIO точный размер принадлежит "
-            "драйверу: Focusrite ставит ближайший допустимый, и запрос 32 "
-            "может превратиться в 48. Точный размер виден в панели "
-            "драйвера. «По драйверу» — ничего не просить, как было раньше.")
         for value, title in ((0, "По драйверу"), (32, "32 отсчёта"),
                              (48, "48 отсчётов"), (64, "64 отсчёта"),
                              (96, "96 отсчётов"), (128, "128 отсчётов"),
@@ -1097,9 +1072,6 @@ class SettingsDialog(QDialog):
         self.all_drivers_box = QCheckBox("Показывать устаревшие драйверы")
         self.all_drivers_box.setChecked(show_all)
         self.all_drivers_box.setAccessibleName("Показывать устаревшие драйверы")
-        self.all_drivers_box.setAccessibleDescription(
-            "Обычно в списках только WASAPI — современный драйвер Windows с "
-            "малой задержкой. Включи, если нужного устройства в списке нет.")
         self.all_drivers_box.toggled.connect(self._refresh_device_lists)
         if not IS_MAC:
             layout.addWidget(self.all_drivers_box)
@@ -1135,9 +1107,6 @@ class SettingsDialog(QDialog):
             combo.addItem(_mode_title(current), current)
             index = combo.count() - 1
         combo.setCurrentIndex(index if index >= 0 else 0)
-        combo.setAccessibleDescription(
-            "Стерео берёт оба входа звуковой карты сразу: первый идёт в левое "
-            "ухо, второй — в правое.")
         return combo
 
     def _device_tab(self, combo: QComboBox,
@@ -1157,19 +1126,11 @@ class SettingsDialog(QDialog):
             self.monitor1_box.setChecked(
                 bool(audio_cfg.get("monitor1", False)))
             self.monitor1_box.setAccessibleName("Слышать себя")
-            self.monitor1_box.setAccessibleDescription(
-                "Звук первого входа идёт и в наушники, и ученику. Громкость "
-                "в наушниках — регулятором «Аудиоустройство 1» на главном "
-                "экране.")
             form.addRow(self.monitor1_box)
 
             self.lowcut_box = QCheckBox("Срез низких частот 150 Гц")
             self.lowcut_box.setChecked(bool(audio_cfg.get("lowcut", False)))
             self.lowcut_box.setAccessibleName("Срез низких частот 150 Гц")
-            self.lowcut_box.setAccessibleDescription(
-                "Убирает всё ниже 150 Гц: гул комнаты, стук по корпусу и "
-                "рокот. Голос и гитара становятся чище. Голос звучит почти "
-                "так же, а гудение уходит.")
             form.addRow(self.lowcut_box)
 
             self.compressor_spin = QSpinBox()
@@ -1179,10 +1140,6 @@ class SettingsDialog(QDialog):
             self.compressor_spin.setValue(
                 max(0, min(100, int(audio_cfg.get("compressor", 0) or 0))))
             self.compressor_spin.setAccessibleName("Компрессор")
-            self.compressor_spin.setAccessibleDescription(
-                "Выравнивает громкость: громкие места приглушаются, тихие "
-                "становятся слышнее. Один регулятор: чем больше, тем ровнее "
-                "и громче тихое. 0 — выключен.")
             form.addRow(label_for("Компрессор", self.compressor_spin),
                         self.compressor_spin)
         return page
@@ -1221,10 +1178,6 @@ class SettingsDialog(QDialog):
         # на 96 гитара звучала глухо, а с H.264 на видео канал это тянет.
         self.opus_bitrate_combo = QComboBox()
         self.opus_bitrate_combo.setAccessibleName("Битрейт сжатия звука")
-        self.opus_bitrate_combo.setAccessibleDescription(
-            "Сколько данных уходит собеседнику. 192 кбит/с — по умолчанию, "
-            "96 — если канал слабый. Работает, когда оба конца поддерживают "
-            "сжатие Opus.")
         for kbps in (96, 128, 192, 320):
             self.opus_bitrate_combo.addItem(f"{kbps} кбит/с", kbps)
         index = self.opus_bitrate_combo.findData(
@@ -1245,10 +1198,6 @@ class SettingsDialog(QDialog):
         self.tx_delay_spin.setValue(
             int(self.cfg["audio"].get("tx_delay_ms", 0) or 0))
         self.tx_delay_spin.setAccessibleName("Компенсация задержки")
-        self.tx_delay_spin.setAccessibleDescription(
-            "Ноль — программа сама измеряет задержку микрофона и буфера. "
-            "Если клик у собеседника всё равно опережает хлопок, увеличьте "
-            "значение на 10–30 мс.")
         form.addRow(label_for("Компенсация задержки", self.tx_delay_spin),
                     self.tx_delay_spin)
 
@@ -1304,9 +1253,6 @@ class SettingsDialog(QDialog):
                 self.cam_combo.addItem(f"Камера {index + 1}", index)
             self.cam_combo.setCurrentIndex(
                 min(saved_camera, self.cam_combo.count() - 1))
-        self.cam_combo.setAccessibleDescription(
-            "Список подключённых камер. Если нужной камеры нет, подключите "
-            "её до открытия настроек.")
         if IS_MAC:
             form.addRow(QLabel("На Маке программа сама берёт встроенную камеру."))
         else:
@@ -1935,8 +1881,6 @@ class MainWindow(QMainWindow):
         self._effects_cache_bytes = 0
         # Скорость, с которой сейчас звучит загруженный трек.
         self._effects_applied_speed = 1.0
-        # Что сказать диктору о кнопках сброса при следующем отчёте.
-        self._effects_hint = ""
         # Какую сторону регулируют ползунки: local — что слышу я,
         # peer — что слышит собеседник.
         self.volume_mode = str(cfg["audio"].get("volume_mode") or "local")
@@ -2052,7 +1996,6 @@ class MainWindow(QMainWindow):
         # на главном окне, программа работает как обычно.
         self.video_button = QPushButton("Развернуть видео")
         self.video_button.setAccessibleName("Развернуть видео на весь экран")
-        self.video_button.setToolTip("Открыть видео отдельным окном на весь экран")
         self.video_button.clicked.connect(self._toggle_video_window)
         # Кнопка появляется вместе с первым кадром: пока видео нет,
         # разворачивать нечего.
@@ -2263,12 +2206,9 @@ class MainWindow(QMainWindow):
         self.send_button = QPushButton("Отправить")
         self.send_button.setAccessibleName("Отправить сообщение")
         self.file_button = QPushButton("Отправить файл")
-        self.file_button.setAccessibleName("Отправить файл собеседнику")
+        self.file_button.setAccessibleName("Отправить файл")
         self.download_button = QPushButton("Скачать")
-        self.download_button.setAccessibleName(
-            "Скачать файл из выбранного сообщения в папку Media")
-        self.download_button.setToolTip(
-            "Сохраняет файл из выбранного сообщения в папку Media")
+        self.download_button.setAccessibleName("Скачать файл")
         input_row.addWidget(label_for("Сообщение", self.message_edit))
         input_row.addWidget(self.message_edit, 1)
         input_row.addWidget(self.send_button)
@@ -2279,8 +2219,8 @@ class MainWindow(QMainWindow):
 
         # Кнопки внизу
         bottom = QHBoxLayout()
-        self.settings_button = QPushButton("Настройки (Control+P)")
-        self.settings_button.setAccessibleName("Настройки, Control P")
+        self.settings_button = QPushButton("Настройки")
+        self.settings_button.setAccessibleName("Настройки")
         self.connect_button = QPushButton("Открыть кабинет" if self.is_teacher else "Подключиться")
         self.connect_button.setAccessibleName(self.connect_button.text())
         self.mic_button = QPushButton("Микрофон включён")
@@ -2936,17 +2876,14 @@ class MainWindow(QMainWindow):
 
     def _update_cam_button(self) -> None:
         # На кнопке — состояние, а не действие: диктор, попав на неё,
-        # сразу говорит, работает камера или нет. Что сделает нажатие,
-        # объясняет описание.
+        # сразу говорит, работает камера или нет. Больше ничего не
+        # добавляем: лишний текст диктор читает поверх и мешает.
         if self._cam_on:
-            text, action = "Камера включена", "Нажмите, чтобы выключить камеру"
+            text = "Камера включена"
         else:
-            text, action = "Камера выключена", "Нажмите, чтобы включить камеру"
-        hint = self._hint("camera")
+            text = "Камера выключена"
         self.cam_button.setText(text)
         self.cam_button.setAccessibleName(text)
-        self.cam_button.setAccessibleDescription(
-            action + (f". Сочетание клавиш{hint}" if hint else ""))
 
     def _toggle_camera(self) -> None:
         if self._cam_on or self.video_sender is not None:
@@ -3006,21 +2943,13 @@ class MainWindow(QMainWindow):
     # -- микрофон -----------------------------------------------------------
 
     def _update_mic_button(self) -> None:
-        # Так же, как у камеры: на кнопке состояние, действие — в описании.
+        # Так же, как у камеры: на кнопке только состояние.
         if self._mic_muted:
             text = "Микрофон выключен"
-            action = "Нажмите, чтобы включить микрофон"
-            if not IS_MAC:
-                action += (". Для короткой фразы можно просто удерживать "
-                           "правый Control: нажал — говоришь, отпустил — "
-                           "микрофон снова выключен")
         else:
-            text, action = "Микрофон включён", "Нажмите, чтобы выключить микрофон"
-        hint = self._hint("mic")
+            text = "Микрофон включён"
         self.mic_button.setText(text)
         self.mic_button.setAccessibleName(text)
-        self.mic_button.setAccessibleDescription(
-            action + (f". Сочетание клавиш{hint}" if hint else ""))
 
     def _toggle_mic(self) -> None:
         self._mic_muted = not self._mic_muted
@@ -3516,8 +3445,6 @@ class MainWindow(QMainWindow):
         box.setText("Вы уверены, что хотите удалить этот трек?")
         box.setInformativeText(f"Трек: {name}. Файл удалится из папки Media.")
         box.setAccessibleName("Удаление трека")
-        box.setAccessibleDescription(
-            "Вы уверены, что хотите удалить этот трек? Да или нет.")
         delete = box.addButton("Да", QMessageBox.DestructiveRole)
         cancel = box.addButton("Нет", QMessageBox.RejectRole)
         box.setDefaultButton(cancel)
@@ -3713,8 +3640,7 @@ class MainWindow(QMainWindow):
         self.effects_row.setVisible(self._effects_shown and self._tracks_available)
         if self._effects_shown:
             text = f"Эффекты показаны. {self._effects_word().capitalize()}."
-            hint = self._resets_word()
-            self._set_status(f"{text} {hint}" if hint else text)
+            self._set_status(text)
         else:
             self._set_status("Эффекты скрыты.")
 
@@ -3725,18 +3651,6 @@ class MainWindow(QMainWindow):
         if self._pitch:
             parts.append(_pitch_word(self._pitch))
         return ", ".join(parts) if parts else "обычные скорость и тон"
-
-    def _resets_word(self) -> str:
-        """Подсказка про кнопки сброса для диктора."""
-        speed = abs(self._speed - 1.0) > 1e-6
-        pitch = self._pitch != 0
-        if speed and pitch:
-            return "Доступны кнопки Сброс скорости и Сброс тона."
-        if speed:
-            return "Доступна кнопка Сброс скорости."
-        if pitch:
-            return "Доступна кнопка Сброс тона."
-        return ""
 
     def _effects_active(self) -> bool:
         return abs(self._speed - 1.0) > 1e-6 or self._pitch != 0
@@ -3781,29 +3695,18 @@ class MainWindow(QMainWindow):
         self._pitch = 0
         self._apply_effects()
 
-    def _update_effects_buttons(self) -> str:
-        """Кнопки сброса появляются, только когда есть что сбрасывать.
-
-        Возвращает фразу для диктора: появление и исчезновение кнопки
-        само по себе не проговаривается, а знать о ней нужно.
-        """
+    def _update_effects_buttons(self) -> None:
+        """Кнопки сброса появляются, только когда есть что сбрасывать."""
         speed = abs(self._speed - 1.0) > 1e-6
         pitch = self._pitch != 0
-        notes = []
         if speed != (not self.speed_reset_button.isHidden()):
             self.speed_reset_button.setVisible(speed)
-            notes.append("Появилась кнопка Сброс скорости." if speed
-                         else "Кнопка Сброс скорости убрана.")
         if pitch != (not self.pitch_reset_button.isHidden()):
             self.pitch_reset_button.setVisible(pitch)
-            notes.append("Появилась кнопка Сброс тона." if pitch
-                         else "Кнопка Сброс тона убрана.")
-        return " ".join(notes)
 
     def _apply_effects(self) -> None:
         """Пересчитывает трек под текущие скорость и тон."""
-        hint = self._update_effects_buttons()
-        self._effects_hint = hint
+        self._update_effects_buttons()
         # Новый номер настройки: результат прошлого пересчёта уже не нужен.
         self._effects_gen += 1
         player = self.engine.player
@@ -3815,9 +3718,7 @@ class MainWindow(QMainWindow):
                         "Эффект применится, когда включите трек.")
             else:
                 text = "Эффекты вернулись к обычным."
-            # Подсказку про кнопки сброса уже сказали — второй раз не надо.
-            self._effects_hint = ""
-            self._set_status(f"{text} {hint}" if hint else text)
+            self._set_status(text)
             return
         self._effects_path = path
         if not self._effects_active():
@@ -3837,8 +3738,7 @@ class MainWindow(QMainWindow):
             # нужна уже другая, и пересчитает её сам.
             text = (f"{self._effects_word().capitalize()}. "
                     "Применю, когда закончится текущий пересчёт.")
-            self._effects_hint = ""
-            self._set_status(f"{text} {hint}" if hint else text)
+            self._set_status(text)
             return
         self._set_status("Применяю эффект…")
         self._start_effects_worker()
@@ -3868,8 +3768,6 @@ class MainWindow(QMainWindow):
     def _place_effects(self, data, speed_used: float) -> None:
         """Ставит готовый вариант трека в плеер, сохраняя место."""
         path = self._effects_path
-        hint = self._effects_hint
-        self._effects_hint = ""
         if data is None or not path or path != self._selected_track():
             return
         player = self.engine.player
@@ -3878,8 +3776,6 @@ class MainWindow(QMainWindow):
         if not (player.has_track and player.path == path):
             # Трек ещё не был загружен: включаем сразу с нужным звуком.
             prefix = f"{self._effects_word().capitalize()}."
-            if hint:
-                prefix = f"{prefix} {hint}"
             self._start_playing_loaded(path, data, prefix=prefix,
                                        applied_speed=speed_used,
                                        play=self._load_play)
@@ -3898,7 +3794,7 @@ class MainWindow(QMainWindow):
         self.track_position_label.setText(f"{_clock(position)} из {duration}")
         text = (f"{self._effects_word().capitalize()}. "
                 f"Позиция {_clock(position)} из {duration}.")
-        self._set_status(f"{text} {hint}" if hint else text)
+        self._set_status(text)
 
     def _remember_effects(self, key: tuple[float, int], data) -> None:
         """Держит последние варианты трека, чтобы возврат был мгновенным."""
@@ -3958,9 +3854,7 @@ class MainWindow(QMainWindow):
     def _on_effects_error(self, text: str, gen: int = 0) -> None:
         if gen == self._effects_job_gen:
             self._effects_busy = False
-        hint = self._effects_hint
-        self._effects_hint = ""
-        self._set_status(f"{text} {hint}" if hint else text)
+        self._set_status(text)
 
     def _seek(self, direction: int) -> None:
         player = self.engine.player
@@ -4053,19 +3947,6 @@ class MainWindow(QMainWindow):
             "metronome": bool(self.cfg.get("metronome", {}).get("enabled")),
             "player": bool(self._tracks_available),
         }
-        # Первый вход в «Моей громкости» звучит только при включённом
-        # самопрослушивании: подсказываем это диктору, чтобы регулятор не
-        # выглядел немым.
-        slider = self.sliders.get("in1")
-        if slider is not None:
-            if peer:
-                slider.setAccessibleDescription(
-                    "Насколько громко первый вход слышит собеседник.")
-            else:
-                slider.setAccessibleDescription(
-                    "Громкость самопрослушивания: насколько громко вы "
-                    "слышите себя в наушниках, если включено «Слышать "
-                    "себя».")
         appeared: list[str] = []
         for key, row in self.slider_rows.items():
             visible = active.get(key, True)
@@ -4541,11 +4422,6 @@ class MainWindow(QMainWindow):
 
     # -- сочетания клавиш ---------------------------------------------------
 
-    def _hint(self, action_id: str) -> str:
-        """Сочетание в скобках — для подписи кнопки."""
-        combo = shortcuts.resolved(self.cfg.get("shortcuts") or {}, action_id)
-        return f" ({combo})" if combo else ""
-
     def _apply_shortcuts(self) -> None:
         """Собирает карту «сочетание — действие» из настроек."""
         saved = self.cfg.get("shortcuts") or {}
@@ -4564,15 +4440,12 @@ class MainWindow(QMainWindow):
             ", ".join(f"{action}={combo}"
                       for combo, action in sorted(mapping.items()))
             or "ни одного"))
-        self.settings_button.setText(f"Настройки{self._hint('settings')}")
-        self.settings_button.setAccessibleName(self.settings_button.text())
         self._update_mic_button()
         self._update_cam_button()
 
     def _focus_message_edit(self) -> None:
         """Ставит курсор в поле сообщения, не трогая уже набранный текст."""
         self.message_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
-        announce(self.message_edit, "Поле сообщения")
 
     def _run_shortcut(self, action_id: str) -> None:
         """Выполняет действие, назначенное на сочетание клавиш."""

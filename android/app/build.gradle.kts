@@ -11,8 +11,8 @@ android {
         applicationId = "tech.magiyastraha.majorlad"
         minSdk = 24
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.7.0"
+        versionCode = 10
+        versionName = "0.7.2"
     }
 
     buildFeatures {

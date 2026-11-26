@@ -13,8 +13,7 @@ import java.nio.ByteOrder
  * для видео. На Android Opus появился не сразу: декодер есть с Android 5,
  * кодировщик — только с Android 10. Поэтому обе возможности проверяются на
  * этом конкретном телефоне, а не по номеру версии системы: список кодеков
- * честнее. Нет кодировщика — шлём несжатый звук, как раньше, и ничего не
- * ломается.
+ * честнее. Нет кодировщика — звук идёт AAC-LC (`AacCodec`), он есть всюду.
  */
 object OpusSupport {
     const val MIME = "audio/opus"
@@ -23,8 +22,143 @@ object OpusSupport {
     /** Телефон умеет раскодировать Opus — об этом сообщаем собеседнику. */
     val decoderAvailable: Boolean by lazy { probe(false) }
 
-    /** Телефон умеет и закодировать; иначе отправляем несжатый звук. */
+    @Volatile
+    private var decoderBroken = false
+    private var selfTested = false
+    private var selfTestOk = false
+
+    /**
+     * Можно ли честно обещать собеседнику Opus прямо сейчас.
+     * Железо есть, пробный пакет реально раскодировался, и декодер ещё
+     * не срывался на живом звуке. Список кодеков сам по себе ничего не
+     * доказывает: на части прошивок декодер открывается и сразу умирает.
+     */
+    fun decoderUsable(): Boolean {
+        if (!decoderAvailable || decoderBroken) return false
+        synchronized(this) {
+            if (!selfTested) {
+                selfTestOk = probeDecode()
+                selfTested = true
+                RunLog.write(
+                    "audio",
+                    if (selfTestOk) {
+                        "Opus: пробный пакет раскодирован"
+                    } else {
+                        "Opus: пробный пакет не раскодировался — сжатый звук не предлагаем"
+                    }
+                )
+            }
+        }
+        return selfTestOk
+    }
+
+    /** Заявка снимается до конца занятия: собеседник сам перейдёт на AAC. */
+    fun markDecoderBroken() {
+        decoderBroken = true
+    }
+
+    /** Тишина в Opus: кодируем нули и пробуем раскодировать обратно. */
+    private fun probeDecode(): Boolean {
+        // Свой кодировщик не завёлся — пробуем готовым кадром тишины.
+        val packet = probePacket()
+            ?: byteArrayOf(0xF8.toByte(), 0xFF.toByte(), 0xFE.toByte())
+        return try {
+            val format = MediaFormat.createAudioFormat(MIME, AudioEngine.SAMPLE_RATE, 1)
+            val name = softwareDecoderName()
+            val c = if (name != null) {
+                MediaCodec.createByCodecName(name)
+            } else {
+                MediaCodec.createDecoderByType(MIME)
+            }
+            try {
+                c.configure(format, null, null, 0)
+                c.start()
+                val info = MediaCodec.BufferInfo()
+                var queued = false
+                val deadline = System.currentTimeMillis() + 500
+                while (System.currentTimeMillis() < deadline) {
+                    if (!queued) {
+                        val i = c.dequeueInputBuffer(5_000)
+                        if (i >= 0) {
+                            val buf = c.getInputBuffer(i) ?: return false
+                            buf.clear()
+                            buf.put(packet)
+                            c.queueInputBuffer(i, 0, packet.size, 0, 0)
+                            queued = true
+                        }
+                    } else {
+                        val o = c.dequeueOutputBuffer(info, 5_000)
+                        if (o >= 0) {
+                            c.releaseOutputBuffer(o, false)
+                            return true
+                        }
+                    }
+                }
+                false
+            } finally {
+                try {
+                    c.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    c.release()
+                } catch (_: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+            RunLog.write("audio", "Opus: проба декодера не прошла: ${e.message}")
+            false
+        }
+    }
+
+    private fun probePacket(): ByteArray? {
+        if (!encoderAvailable) return null
+        var packet: ByteArray? = null
+        val enc = OpusEncoder({ p -> if (packet == null) packet = p }, {}, quiet = true)
+        if (!enc.start()) return null
+        try {
+            val silence = ShortArray(960)
+            var tries = 0
+            while (packet == null && tries < 50) {
+                enc.encode(silence, silence.size)
+                if (packet == null) Thread.sleep(5)
+                tries++
+            }
+            return packet
+        } catch (_: Exception) {
+            return null
+        } finally {
+            enc.release()
+        }
+    }
+
+    /**
+     * Предпочитаем штатный софтверный декодер AOSP: вендорские декодеры
+     * на части прошивок открываются и сразу умирают (Released state).
+     */
+    fun softwareDecoderName(): String? = try {
+        val format = MediaFormat.createAudioFormat(MIME, AudioEngine.SAMPLE_RATE, 1)
+        val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        val infos = list.codecInfos
+        val preferred = listOf("c2.android.opus.decoder", "OMX.google.opus.decoder")
+        preferred.firstOrNull { name -> infos.any { it.isDecoder && it.name == name } }
+            ?: list.findDecoderForFormat(format)
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Телефон умеет и закодировать; иначе отправляем AAC. */
     val encoderAvailable: Boolean by lazy { probe(true) }
+
+    @Volatile
+    private var encoderBroken = false
+
+    /** Кодировщик Opus сорвался на живом звуке — больше не пробуем. */
+    fun encoderUsable(): Boolean = encoderAvailable && !encoderBroken
+
+    fun markEncoderBroken() {
+        encoderBroken = true
+    }
 
     private fun probe(encode: Boolean): Boolean = try {
         val format = MediaFormat.createAudioFormat(MIME, AudioEngine.SAMPLE_RATE, 1)
@@ -44,13 +178,15 @@ object OpusSupport {
 class OpusEncoder(
     private val onPacket: (ByteArray) -> Unit,
     private val onLog: (String) -> Unit,
+    // Пробный кодировщик не должен засорять журнал: он живёт полсекунды.
+    private val quiet: Boolean = false,
 ) {
     private var codec: MediaCodec? = null
     private val info = MediaCodec.BufferInfo()
     private var pts = 0L
     private var broken = false
 
-    /** Кодировщик сломался: звук надо вернуть на несжатый поток. */
+    /** Кодировщик сломался: звук надо передать другому формату. */
     val isBroken: Boolean get() = broken
 
     fun start(): Boolean {
@@ -66,10 +202,11 @@ class OpusEncoder(
             c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             c.start()
             codec = c
-            RunLog.write("audio", "Opus: кодировщик открыт, 192 кбит/с")
+            if (!quiet) RunLog.write("audio", "Opus: кодировщик открыт, 192 кбит/с")
             true
         } catch (e: Exception) {
             broken = true
+            OpusSupport.markEncoderBroken()
             RunLog.write("audio", "Opus: кодировщик не открылся: ${e.message}")
             onLog("Opus-кодировщик не открылся: ${e.message}")
             false
@@ -98,6 +235,7 @@ class OpusEncoder(
             drain(c)
         } catch (e: Exception) {
             broken = true
+            OpusSupport.markEncoderBroken()
             RunLog.write("audio", "Opus: кодировщик сломался: ${e.message}")
             onLog("Opus-кодировщик сломался: ${e.message}")
         }
@@ -136,7 +274,7 @@ class OpusEncoder(
             c.release()
         } catch (_: Exception) {
         }
-        RunLog.write("audio", "Opus: кодировщик закрыт")
+        if (!quiet) RunLog.write("audio", "Opus: кодировщик закрыт")
     }
 }
 
@@ -151,25 +289,52 @@ class OpusDecoder(
     private var pts = 0L
     private var broken = false
 
+    /** Декодер сорвался на живом звуке — этот экземпляр больше не годится. */
+    val isBroken: Boolean
+        get() = broken
+
     fun start(): Boolean {
         if (codec != null) return true
-        if (broken || !OpusSupport.decoderAvailable) return false
-        return try {
-            val format = MediaFormat.createAudioFormat(
-                OpusSupport.MIME, AudioEngine.SAMPLE_RATE, channels
-            )
-            val c = MediaCodec.createDecoderByType(OpusSupport.MIME)
-            c.configure(format, null, null, 0)
-            c.start()
-            codec = c
-            RunLog.write("audio", "Opus: декодер открыт, каналов: $channels")
-            true
-        } catch (e: Exception) {
-            broken = true
-            RunLog.write("audio", "Opus: декодер не открылся: ${e.message}")
-            onLog("Opus-декодер не открылся: ${e.message}")
-            false
+        if (broken || !OpusSupport.decoderUsable()) return false
+        val format = MediaFormat.createAudioFormat(
+            OpusSupport.MIME, AudioEngine.SAMPLE_RATE, channels
+        )
+        // Сначала штатный софтверный декодер AOSP, затем системный по типу.
+        // Вендорские декодеры на части прошивок открываются и сразу умирают.
+        val swName = OpusSupport.softwareDecoderName()
+        val names = if (swName != null) listOf(swName) else emptyList()
+        var last: Exception? = null
+        for (name in names + listOf("")) {
+            var candidate: MediaCodec? = null
+            try {
+                candidate = if (name.isEmpty()) {
+                    MediaCodec.createDecoderByType(OpusSupport.MIME)
+                } else {
+                    MediaCodec.createByCodecName(name)
+                }
+                candidate.configure(format, null, null, 0)
+                candidate.start()
+                codec = candidate
+                val how = if (name.isEmpty()) "системный" else name
+                RunLog.write("audio", "Opus: декодер открыт ($how), каналов: $channels")
+                return true
+            } catch (e: Exception) {
+                last = e
+                RunLog.write(
+                    "audio",
+                    "Opus: декодер «${name.ifEmpty { "системный" }}» не открылся: ${e.message}"
+                )
+                try {
+                    candidate?.release()
+                } catch (_: Exception) {
+                }
+            }
         }
+        broken = true
+        OpusSupport.markDecoderBroken()
+        RunLog.write("audio", "Opus: декодер не открылся: ${last?.message}")
+        onLog("Opus на этом телефоне не пошёл — перехожу на AAC")
+        return false
     }
 
     fun decode(packet: ByteArray) {
@@ -192,8 +357,10 @@ class OpusDecoder(
             drain(c)
         } catch (e: Exception) {
             broken = true
+            OpusSupport.markDecoderBroken()
             RunLog.write("audio", "Opus: декодер сломался: ${e.message}")
-            onLog("Opus-декодер сломался: ${e.message}")
+            release()
+            onLog("Opus на этом телефоне не пошёл — перехожу на AAC")
         }
     }
 

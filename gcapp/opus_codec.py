@@ -45,6 +45,11 @@ _SET_SIGNAL = 4024
 _SIGNAL_MUSIC = 3002
 
 _MAX_PACKET = 4000
+# Самый длинный кадр Opus — 120 мс. Буфер под раскодированный звук берём
+# с этим запасом: кадр задаёт сам пакет, а libopus на маленький буфер
+# отвечает «неверный пакет» (-2). Телефон шлёт кадры по 20 мс, и с буфером
+# на 10 мс весь его звук молча пропадал.
+_MAX_FRAME = SAMPLE_RATE * 120 // 1000
 
 
 class OpusUnavailable(RuntimeError):
@@ -242,10 +247,22 @@ class Decoder:
         if not handle or err.value != 0:
             raise OpusUnavailable(f"Opus не создал декодер (код {err.value})")
         self._handle = ctypes.c_void_p(handle)
+        # Сколько отсчётов было в последнем настоящем пакете: по этой
+        # длине предсказываем потерянные кадры.
+        self._last_samples = 0
 
     def decode(self, packet: bytes, fec: bool = False,
-               frame_size: int = FRAME) -> bytes:
+               frame_size: int | None = None) -> bytes:
         """Пакет в int16. Пустой пакет — предсказание потерянного кадра."""
+        if frame_size is None:
+            # Настоящий пакет сам скажет, сколько в нём звука, — буферу
+            # нужен только запас. Предсказание и восстановление потерянного
+            # кадра длятся столько же, сколько шёл предыдущий пакет: иначе
+            # каждая потеря на 20-мс потоке растянулась бы на 120 мс.
+            if packet and not fec:
+                frame_size = _MAX_FRAME
+            else:
+                frame_size = self._last_samples or FRAME
         buf = ctypes.create_string_buffer(frame_size * self.channels * 2)
         result = self._lib.opus_decode(
             self._handle, packet, len(packet),
@@ -253,6 +270,8 @@ class Decoder:
             1 if fec else 0)
         if result < 0:
             raise OpusUnavailable(f"Opus не раскодировал пакет (код {result})")
+        if packet and not fec:
+            self._last_samples = result
         return buf.raw[:result * self.channels * 2]
 
     def close(self) -> None:

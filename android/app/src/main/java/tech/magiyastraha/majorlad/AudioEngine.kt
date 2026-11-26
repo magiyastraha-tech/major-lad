@@ -51,6 +51,8 @@ class AudioEngine(
         const val CAPS_OPUS = 0x02
         /** Обмен возможностями: я понимаю видео H.264. */
         const val CAPS_H264 = 0x04
+        /** Обмен возможностями: я понимаю звук AAC-LC. */
+        const val CAPS_AAC = 0x08
     }
 
     private val isServer = serverHost == null
@@ -102,12 +104,17 @@ class AudioEngine(
     private var lastVideoId = -1
     private val videoFrames = HashMap<Int, VideoAccum>()
 
-    // Что умеет собеседник. До обмена возможностями считаем, что он на
-    // старой версии: шлём несжатый звук и JPEG — это понимает всякий.
+    // Что умеет собеседник. Пока его заявка не пришла, сжатый звук не шлём:
+    // пара секунд несжатого потока в начале занятия как раз и забивает канал.
     @Volatile private var peerOpus = false
+    @Volatile private var peerAac = false
     @Volatile private var peerH264 = false
+    @Volatile private var peerCapsAt = 0L
+    /** Когда открыли звук: по этому времени ждём заявку собеседника. */
+    @Volatile private var startedAt = 0L
     private var opusMono: OpusDecoder? = null
     private var opusStereo: OpusDecoder? = null
+    private var aacDec: AacDecoder? = null
     @Volatile private var h264Decoder: H264Decoder? = null
     /** Номер последнего пакета своего звука: один счётчик на PCM и Opus. */
     private var txSeq = 0
@@ -120,6 +127,8 @@ class AudioEngine(
     fun start() {
         if (running) return
         running = true
+        startedAt = System.currentTimeMillis()
+        peerCapsAt = 0L
         try {
             val s = if (isServer) {
                 DatagramSocket(null).apply {
@@ -178,6 +187,8 @@ class AudioEngine(
         opusMono = null
         opusStereo?.release()
         opusStereo = null
+        aacDec?.release()
+        aacDec = null
         h264Decoder?.release()
         h264Decoder = null
         synchronized(videoFrames) {
@@ -256,13 +267,14 @@ class AudioEngine(
 
     private fun helloLoop() {
         val hello = "GCH1".toByteArray() + byteArrayOf(0, 0, 0, 0)
-        // Что умеет этот телефон: Opus и H.264 проверяются по списку
-        // кодеков, а не по версии Android. Неизвестные биты собеседник
-        // игнорирует, поэтому старым версиям этот пакет не мешает.
-        val flags = (if (OpusSupport.decoderAvailable) CAPS_OPUS else 0) or
-            (if (H264Support.decoderAvailable) CAPS_H264 else 0)
-        val caps = "GCC2".toByteArray() + byteArrayOf(flags.toByte())
+        val magic = "GCC2".toByteArray()
         while (running) {
+            // Заявку пересчитываем каждую секунду: если декодер сорвался,
+            // его бит снимается и собеседник сам переходит на другой формат.
+            val flags = (if (OpusSupport.decoderUsable()) CAPS_OPUS else 0) or
+                (if (AacSupport.decoderUsable()) CAPS_AAC else 0) or
+                (if (H264Support.decoderAvailable) CAPS_H264 else 0)
+            val caps = magic + byteArrayOf(flags.toByte())
             val p = peer
             val s = socket
             if (p != null && s != null) {
@@ -307,6 +319,7 @@ class AudioEngine(
                 "GCA2" -> deliverPcm(packet, true)
                 "GCA5" -> deliverOpus(packet, false)
                 "GCA6" -> deliverOpus(packet, true)
+                "GCA7" -> deliverAac(packet)
                 "GCV1" -> feedVideo(packet, false)
                 "GCV2" -> feedVideo(packet, true)
                 "GCC2" -> readCaps(packet)
@@ -354,17 +367,34 @@ class AudioEngine(
         pcmQueue.add(out)
     }
 
+    /**
+     * Можно ли слать несжатый звук. Да — только очень старому собеседнику:
+     * заявка пришла, а про Opus и AAC в ней нет ничего. Пока заявки нет
+     * вовсе, пять секунд ждём: голый PCM в начале занятия — это и есть тот
+     * самый треск. Если заявки так и нет, собеседник древнее механизма
+     * возможностей, и другого способа ему что-то передать нет.
+     */
+    private fun pcmAllowed(): Boolean {
+        val seen = peerCapsAt
+        if (seen == 0L) return System.currentTimeMillis() - startedAt > 5_000
+        return !peerOpus && !peerAac
+    }
+
     private fun readCaps(packet: DatagramPacket) {
         if (packet.length < 5) return
+        peerCapsAt = System.currentTimeMillis()
         val flags = packet.data[4].toInt() and 0xff
         val opus = (flags and CAPS_OPUS) != 0
+        val aac = (flags and CAPS_AAC) != 0
         val h264 = (flags and CAPS_H264) != 0
-        if (opus != peerOpus || h264 != peerH264) {
+        if (opus != peerOpus || aac != peerAac || h264 != peerH264) {
             peerOpus = opus
+            peerAac = aac
             peerH264 = h264
             RunLog.write(
                 "audio",
                 "возможности собеседника: Opus=${if (opus) "да" else "нет"}, " +
+                    "AAC=${if (aac) "да" else "нет"}, " +
                     "H.264=${if (h264) "да" else "нет"}"
             )
         }
@@ -379,12 +409,12 @@ class AudioEngine(
         if (end <= 8) return
         val dec = opusDecoder(stereo)
         if (dec == null) {
-            // Декодера нет — говорим об этом один раз, а не десять раз в
-            // секунду; собеседника это не чинит, но в журнале видно.
+            // Декодер не открылся или сорвался: заявка уже снята, через
+            // секунду собеседник сам перейдёт на AAC. В журнал — один раз,
+            // чтобы не заливать его десять раз в секунду.
             if (lastNoOpusLog == 0L) {
                 lastNoOpusLog = System.currentTimeMillis()
-                RunLog.write("audio", "пришёл Opus, но на телефоне нет декодера — звука не будет")
-                onLog("Телефон не умеет сжатый звук Opus — пусть собеседник выключит сжатие")
+                RunLog.write("audio", "пришёл Opus, но декодер не работает — ждём смены формата")
             }
             return
         }
@@ -394,13 +424,17 @@ class AudioEngine(
 
     private fun opusDecoder(stereo: Boolean): OpusDecoder? {
         if (stereo) {
-            opusStereo?.let { return it }
+            val cached = opusStereo
+            if (cached != null && !cached.isBroken) return cached
+            opusStereo = null
             val d = OpusDecoder(2, ::enqueuePcm, onLog)
             if (!d.start()) return null
             opusStereo = d
             return d
         }
-        opusMono?.let { return it }
+        val cached = opusMono
+        if (cached != null && !cached.isBroken) return cached
+        opusMono = null
         val d = OpusDecoder(1, ::enqueuePcm, onLog)
         if (!d.start()) return null
         opusMono = d
@@ -413,6 +447,51 @@ class AudioEngine(
         val s = socket ?: return
         val packet = ByteArray(8 + data.size)
         packet[0] = 0x47; packet[1] = 0x43; packet[2] = 0x41; packet[3] = 0x35 // GCA5
+        val seq = txSeq++
+        packet[4] = ((seq shr 24) and 0xff).toByte()
+        packet[5] = ((seq shr 16) and 0xff).toByte()
+        packet[6] = ((seq shr 8) and 0xff).toByte()
+        packet[7] = (seq and 0xff).toByte()
+        System.arraycopy(data, 0, packet, 8, data.size)
+        try {
+            s.send(DatagramPacket(packet, packet.size, p))
+            txAudioPackets++
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Пакет AAC-LC -> звук в наушники. */
+    private fun deliverAac(packet: DatagramPacket) {
+        val end = packet.length
+        if (end <= 8) return
+        val dec = aacDecoder()
+        if (dec == null) {
+            if (lastNoOpusLog == 0L) {
+                lastNoOpusLog = System.currentTimeMillis()
+                RunLog.write("audio", "пришёл AAC, но декодер не работает")
+            }
+            return
+        }
+        rxAudioPackets++
+        dec.decode(packet.data.copyOfRange(8, end))
+    }
+
+    private fun aacDecoder(): AacDecoder? {
+        val cached = aacDec
+        if (cached != null && !cached.isBroken) return cached
+        aacDec = null
+        val d = AacDecoder(::enqueuePcm, onLog)
+        if (!d.start()) return null
+        aacDec = d
+        return d
+    }
+
+    /** Свой звук сжатым пакетом AAC-LC. */
+    private fun sendAac(data: ByteArray) {
+        val p = peer ?: return
+        val s = socket ?: return
+        val packet = ByteArray(8 + data.size)
+        packet[0] = 0x47; packet[1] = 0x43; packet[2] = 0x41; packet[3] = 0x37 // GCA7
         val seq = txSeq++
         packet[4] = ((seq shr 24) and 0xff).toByte()
         packet[5] = ((seq shr 16) and 0xff).toByte()
@@ -600,12 +679,14 @@ class AudioEngine(
     }
 
     /**
-     * Источники перебираем по очереди: на части телефонов «громкая связь»
-     * не открывается или отдаёт одну тишину, а обычный микрофон работает.
+     * Первым идёт обычный микрофон: «громкая связь» включает эхоподавление
+     * и шумодав, которые губят гитару, а на части прошивок вообще отдаёт
+     * одну тишину до конца занятия (Xiaomi, Android 16 — ровно этот случай).
+     * Остальные источники — запасные, на случай если микрофон не открылся.
      */
     private val micSources = listOf(
-        MediaRecorder.AudioSource.VOICE_COMMUNICATION to "громкая связь",
         MediaRecorder.AudioSource.MIC to "микрофон",
+        MediaRecorder.AudioSource.VOICE_COMMUNICATION to "громкая связь",
         MediaRecorder.AudioSource.DEFAULT to "по умолчанию",
     )
 
@@ -682,9 +763,11 @@ class AudioEngine(
         val packet = ByteArray(8 + BLOCK * 2)
         "GCA1".toByteArray().copyInto(packet, 0)
         var seq = 0
-        // Opus включаем, только когда собеседник сообщил, что понимает его,
-        // и сам телефон умеет кодировать. Иначе — несжатый звук, как раньше.
+        // Сжатый звук обязателен: несжатый поток забивает канал и трещит.
+        // Сначала Opus — он жмёт лучше всех. Если телефон не может в Opus,
+        // идёт AAC-LC: он есть в системе на любом Android.
         var opus: OpusEncoder? = null
+        var aac: AacEncoder? = null
         // Подряд идущие пустые чтения. Захват умирает после переключения
         // выхода на громкую связь или после смены устройства: поток жив,
         // а данных нет. Тогда сессию надо переоткрыть, а не крутиться в
@@ -721,7 +804,7 @@ class AudioEngine(
                 mixClicks(local, micClock, read, metroVolumeOut)
             }
             var enc = opus
-            if (enc == null && peerOpus && OpusSupport.encoderAvailable) {
+            if (enc == null && peerOpus && OpusSupport.encoderUsable()) {
                 val fresh = OpusEncoder({ data -> sendOpus(data) }, onLog)
                 if (fresh.start()) {
                     opus = fresh
@@ -729,16 +812,33 @@ class AudioEngine(
                 }
             }
             if (enc != null && enc.isBroken) {
-                // Кодировщик сломался — возвращаемся к несжатому звуку,
-                // чтобы урок не остался без голоса.
+                // Кодировщик сломался — пробуем AAC, чтобы урок не остался
+                // без голоса.
                 enc.release()
                 opus = null
                 enc = null
             }
-            val active = enc
-            if (active != null) {
-                active.encode(local, read)
-            } else {
+            var aacEnc = if (enc == null) aac else null
+            if (enc == null && aacEnc == null && peerAac && AacSupport.encoderUsable()) {
+                val fresh = AacEncoder({ data -> sendAac(data) }, onLog)
+                if (fresh.start()) {
+                    aac = fresh
+                    aacEnc = fresh
+                }
+            }
+            if (aacEnc != null && aacEnc.isBroken) {
+                aacEnc.release()
+                aac = null
+                aacEnc = null
+            }
+            if (enc != null) {
+                enc.encode(local, read)
+            } else if (aacEnc != null) {
+                aacEnc.encode(local, read)
+            } else if (pcmAllowed()) {
+                // Несжатый звук остался только для очень старого собеседника,
+                // который про сжатие вообще не знает. Иначе молчим: поток
+                // в 768 кбит/с забил бы канал и трещал.
                 var off = 8
                 for (i in 0 until read) {
                     val v = local[i].toInt()
@@ -763,6 +863,7 @@ class AudioEngine(
             micClock += read
         }
         opus?.release()
+        aac?.release()
         try {
             rec.stop()
         } catch (_: Exception) {
@@ -846,8 +947,16 @@ class AudioEngine(
                 // запас попыток на будущее снова полный.
                 if (myPeak > 0) micRotations = 0
             }
+            // Собеседник шлёт сжатый звук, а раскодировать его здесь нечем:
+            // тишина наша, не его — предупреждения про его микрофон были бы
+            // ложью. Глухи только если не работает ни один из форматов,
+            // которые он предлагает.
+            val canHearPeer = (!peerOpus && !peerAac) ||
+                (peerOpus && OpusSupport.decoderUsable()) ||
+                (peerAac && AacSupport.decoderUsable())
+            val deafToPeer = !canHearPeer
             // Звук идёт, но в нём одни нули — у собеседника выключен микрофон.
-            if (dRxAudio > 0 && theirPeak == 0) {
+            if (dRxAudio > 0 && theirPeak == 0 && !deafToPeer) {
                 peerSilentRounds++
                 if (peerSilentRounds >= 2 && !peerSilentWarned) {
                     peerSilentWarned = true
@@ -859,7 +968,7 @@ class AudioEngine(
             }
             // Собеседник есть, а звука от него нет совсем — у него не
             // открылся микрофон.
-            if (peer != null && dRxAudio == 0) {
+            if (peer != null && dRxAudio == 0 && !deafToPeer) {
                 noAudioRounds++
                 if (noAudioRounds >= 3 && !noAudioWarned) {
                     noAudioWarned = true
