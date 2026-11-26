@@ -1384,6 +1384,10 @@ class AudioEngine:
         self._recv_adapt = 0
         self._recv_starve = 0
         self._recv_clean_t = 0.0
+        # Уровень, на котором приём уже голодал: ниже него запас не
+        # опускается, иначе «уменьшил — снова рвётся» ходит по кругу.
+        self._recv_floor = 0
+        self._recv_floor_t = 0.0
         self._recv_note = ""
         self._recv_note_t = 0.0
         # Счётчики сбоев драйвера вывода.
@@ -1392,6 +1396,12 @@ class AudioEngine:
         self._opus_errors = 0
         self._opus_fail_logged = False
         self.sources: dict[str, Source] = {}
+        # Снимок источников для звукового потока. Поток колбэка не имеет
+        # права перебирать словарь, пока его меняет start()/stop(): Python
+        # бросает «dictionary changed size during iteration», и блок звука
+        # пропадает. Кортеж присваивается одним движением — колбэк видит
+        # либо старый набор, либо новый.
+        self._sources_seq: tuple[tuple[str, Source], ...] = ()
         # Две независимые громкости: что слышу я и что слышит собеседник.
         self.volumes = {"student": 0.8, "in1": 1.0, "in2": 1.0,
                         "usb": 1.0, "midi": 0.8, "metronome": 0.6,
@@ -1618,6 +1628,8 @@ class AudioEngine:
         self._recv_adapt = 0
         self._recv_starve = 0
         self._recv_clean_t = 0.0
+        self._recv_floor = 0
+        self._recv_floor_t = 0.0
         self._recv_note = ""
         self._recv_note_t = 0.0
         self._peer_live = False
@@ -1691,6 +1703,7 @@ class AudioEngine:
 
         # Компенсация задержки считается по уже открытым устройствам:
         # до этого задержка входа неизвестна.
+        self._sync_sources()
         delay = self._apply_tx_delay()
         if self.sources:
             how = ("авто, дальше по фактическому буферу"
@@ -1925,7 +1938,7 @@ class AudioEngine:
             if status and getattr(status, "output_underflow", False):
                 self._out_underflow += 1
             if status and getattr(status, "input_overflow", False):
-                for source in list(self.sources.values()):
+                for _key, source in self._sources_seq:
                     source.status_overflows += 1
         except Exception:
             pass
@@ -1938,7 +1951,7 @@ class AudioEngine:
             else:
                 self._out_measured += (out_stamp - self._out_measured) * 0.1
         in_stamp = _stamp_latency(time_info, "in")
-        for source in list(self.sources.values()):
+        for _key, source in self._sources_seq:
             source.note_latency(in_stamp)
         try:
             self._out_callback_inner(outdata, frames, indata)
@@ -2069,6 +2082,7 @@ class AudioEngine:
         for source in self.sources.values():
             source.close()
         self.sources.clear()
+        self._sync_sources()
         if self.midi is not None:
             self.midi.close()
             self.midi = None
@@ -2322,13 +2336,22 @@ class AudioEngine:
                 except Exception:
                     pass
 
+    def _sync_sources(self) -> None:
+        """Обновляет снимок источников для звукового потока.
+
+        Вызывается только там, где набор источников реально меняется —
+        при открытии входов и при остановке. Колбэк перебирает кортеж,
+        а не живой словарь.
+        """
+        self._sources_seq = tuple(self.sources.items())
+
     def _out_callback_inner(self, outdata, frames, indata=None) -> None:
         self._last_cb = time.monotonic()
         self._out_frames += frames
         if indata is not None:
             # ASIO: вход пришёл тем же блоком, что и выход. Раскладываем его
             # по кольцам источников — дальше всё как у обычных драйверов.
-            for source in list(self.sources.values()):
+            for _key, source in self._sources_seq:
                 try:
                     source.feed(indata)
                 except Exception:
@@ -2437,7 +2460,7 @@ class AudioEngine:
         # сдвиг — иначе расчётная цифра расходится с буфером на десятки
         # миллисекунд, и метроном у собеседника не совпадает.
         fill = 0
-        for source in self.sources.values():
+        for _key, source in self._sources_seq:
             fill = max(fill, source.fill())
         target = self._tx_target(fill)
         # Задержка меняется плавно и дробно. Целое чтение с задержкой,
@@ -2472,7 +2495,7 @@ class AudioEngine:
         mix_r = mix_l.copy()
         stereo_out = False
         fx = self.input_fx
-        for key, source in self.sources.items():
+        for key, source in self._sources_seq:
             left, right = source.read(frames)
             if source.stereo:
                 stereo_out = True
@@ -2646,8 +2669,9 @@ class AudioEngine:
 
         Постоянный запас из start() учитывает медленный драйвер, но не
         сеть. Если приём всё равно голодал, добавляем буфер: треск хуже
-        лишних ста миллисекунд задержки. Через десять секунд чистого
-        приёма запас уменьшается — по шагу, чтобы не устроить новый провал.
+        лишних ста миллисекунд задержки. После двух секунд чистого приёма
+        запас уменьшается — но не ниже уровня, на котором приём уже
+        голодал: иначе «уменьшил → снова рвётся» ходит по кругу.
         """
         # Собеседника нет — приём голодает не по вине сети: пустое кольцо
         # после обрыва связи не должно раздувать запас и писать в журнал
@@ -2659,19 +2683,32 @@ class AudioEngine:
         if self._recv_starve > 0:
             deficit = self._recv_starve
             self._recv_starve = 0
-            add = min(BLOCK * 8, max(BLOCK, deficit * 2))
+            # Шаг не меньше 40 мс. Прежний шаг в 10 мс отпускание
+            # (40 мс за две секунды) съедало быстрее, чем приём успевал
+            # стать устойчивым, и запас ходил по кругу 0 ↔ 400 мс.
+            add = min(BLOCK * 8, max(BLOCK * 4, deficit * 2))
             self._recv_adapt = min(BLOCK * 40, self._recv_adapt + add)
+            self._recv_floor = self._recv_adapt
+            self._recv_floor_t = 0.0
             self._apply_recv_reserve(True)
             self._recv_clean_t = 0.0
             return
         # Отпускаем быстрее, чем раньше: запас в 400 мс после одного
-        # сбоя держался минутами. Теперь 40 мс за каждые две секунды
-        # чистого приёма — путь с 400 до 60 мс занимает секунд двадцать.
+        # сбоя держался минутами. Но только до уровня, на котором приём
+        # уже голодал, — иначе круг повторяется. Сам уровень медленно
+        # снижается: 20 мс за каждые 30 секунд чистого приёма, чтобы
+        # задержка вернулась, когда сеть выправилась.
         self._recv_clean_t += frames / SAMPLE_RATE
+        self._recv_floor_t += frames / SAMPLE_RATE
+        if self._recv_floor_t >= 30.0:
+            self._recv_floor_t = 0.0
+            if self._recv_floor > 0:
+                self._recv_floor = max(0, self._recv_floor - BLOCK * 2)
         if self._recv_clean_t >= 2.0:
             self._recv_clean_t = 0.0
-            if self._recv_adapt > 0:
-                self._recv_adapt = max(0, self._recv_adapt - BLOCK * 4)
+            if self._recv_adapt > self._recv_floor:
+                self._recv_adapt = max(self._recv_floor,
+                                       self._recv_adapt - BLOCK * 4)
                 self._apply_recv_reserve(False)
 
     def _apply_recv_reserve(self, grow: bool) -> None:
@@ -2704,9 +2741,13 @@ class AudioEngine:
         self._peer_gap = True
         self._recv_starve = 0
         self._recv_clean_t = 0.0
-        if self._recv_adapt:
-            self._recv_adapt = 0
-            set_recv_reserve(self._recv_base)
+        # Уровень голодания переживает обрыв: путь до собеседника тот же,
+        # и начинать заново круг «ноль → голод → сорок миллисекунд»
+        # незачем. Отдаём запас до него, но не ниже.
+        self._recv_floor_t = 0.0
+        if self._recv_adapt != self._recv_floor:
+            self._recv_adapt = self._recv_floor
+            set_recv_reserve(self._recv_base + self._recv_adapt)
 
     def _write_peer(self, samples: np.ndarray, stereo: bool) -> None:
         """Кладёт пришедший звук в буферы воспроизведения."""
@@ -2877,7 +2918,14 @@ class AudioEngine:
             f"переполнений драйвера {status_ovf}",
             f"сбоев потока {st['_cb_errors']}",
         ]
-        return f"{head} за {seconds:.0f} с: " + ", ".join(parts) + "."
+        # Ниже 97 % карта не успевает выводить звук вовремя: обратный
+        # вызов срывает срок и драйвер молча выбрасывает буферы. Это
+        # лечится размером блока, поэтому подсказываем прямо в журнале.
+        hint = ""
+        if realtime < 97.0:
+            hint = (" Драйвер не успевает выводить звук вовремя: поднимите "
+                    "«Буфер драйвера» в настройках до 128–256 отсчётов.")
+        return f"{head} за {seconds:.0f} с: " + ", ".join(parts) + "." + hint
 
     def _maybe_log_stats(self, now: float) -> None:
         # Сообщение об изменении запаса приёма пишем один раз, даже если

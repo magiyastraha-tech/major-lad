@@ -31,18 +31,22 @@ jobs:
       - name: Collect APKs
         run: |
           mkdir -p out
-          cp android/app/build/outputs/apk/teacher/debug/*.apk out/MajorLad-Teacher.apk
-          cp android/app/build/outputs/apk/student/debug/*.apk out/MajorLad-Student.apk
+          version=$(grep -oP 'versionName = "\K[^"]+' android/app/build.gradle.kts)
+          echo "Версия: $version"
+          cp android/app/build/outputs/apk/teacher/debug/*.apk \
+             "out/MajorLad-Teacher-$version.apk"
+          cp android/app/build/outputs/apk/student/debug/*.apk \
+             "out/MajorLad-Student-$version.apk"
           ls -l out
 
       - name: Upload teacher APK
         uses: actions/upload-artifact@v4
         with:
           name: major-lad-android-teacher
-          path: out/MajorLad-Teacher.apk
+          path: out/MajorLad-Teacher-*.apk
 
       - name: Upload student APK
         uses: actions/upload-artifact@v4
         with:
           name: major-lad-android-student
-          path: out/MajorLad-Student.apk
+          path: out/MajorLad-Student-*.apk

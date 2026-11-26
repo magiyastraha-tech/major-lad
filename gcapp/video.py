@@ -102,6 +102,7 @@ class VideoSender:
         capacity = budget * 3 if budget else 0.0
         tokens = capacity
         last = time.monotonic()
+        last_sent = 0.0
         # Статистика за окно — чтобы в журнале было видно, что реально
         # уходит в канал, а не что задумано настройками.
         stat_at = last
@@ -141,15 +142,30 @@ class VideoSender:
                             if self.quality > self.QUALITY_FLOOR:
                                 self.quality = max(
                                     self.QUALITY_FLOOR, self.quality - 4)
-                            elif self._scale > 0.4:
-                                self._scale = max(0.35, self._scale - 0.1)
+                            elif self._scale > 0.26:
+                                self._scale = max(0.25, self._scale - 0.1)
                         elif size < budget * 0.5:
                             if self.quality < 95:
                                 self.quality += 1
                             elif self._scale < 0.999:
                                 self._scale = min(1.0, self._scale + 0.05)
-                        if size <= tokens:
-                            tokens -= size
+                        send_it = size <= tokens
+                        floor = (self.quality <= self.QUALITY_FLOOR
+                                 and self._scale <= 0.26)
+                        if not send_it and floor:
+                            # Кадр не влезает в бюджет ни при каком
+                            # качестве и размере. Молчать навсегда — это
+                            # чёрный экран у собеседника (0.0 кадров/с
+                            # весь урок при пределе 128 кбит/с). Отдаём
+                            # реже, но отдаём: ждём, пока копилка наберёт
+                            # ровно этот кадр, — средний поток остаётся
+                            # у предела.
+                            if started - last_sent >= size / rate:
+                                send_it = True
+                                tokens = 0.0
+                        if send_it:
+                            tokens = max(0.0, tokens - size)
+                            last_sent = started
                             stat_bytes += size
                             stat_frames += 1
                             self._send(data, interval, started + interval)

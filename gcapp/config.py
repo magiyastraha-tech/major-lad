@@ -337,6 +337,16 @@ def load() -> dict:
         if int(cfg.get("server_port", 0) or 0) == 45800:
             cfg["server_port"] = 45801
         cfg["settings_version"] = 9
+    # 0.5.14: на ASIO маленький блок не успевает: обратный вызов каждые
+    # 0,67 мс (32 отсчёта) срывает срок, и карта молча выбрасывает звук —
+    # выведено 91–96 % вместо 100 %. Ставим 128 один раз; кто захочет
+    # меньшую задержку, вернёт своё значение в настройках.
+    if int(cfg.get("settings_version", 1) or 1) < 10:
+        audio_cfg = cfg.setdefault("audio", {})
+        if str(audio_cfg.get("driver", "")) == "asio":
+            if int(audio_cfg.get("device_buffer", 0) or 0) < 128:
+                audio_cfg["device_buffer"] = 128
+        cfg["settings_version"] = 10
     return cfg
 
 

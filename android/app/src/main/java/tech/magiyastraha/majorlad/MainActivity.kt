@@ -182,6 +182,8 @@ class MainActivity : AppCompatActivity() {
         chatInput = findViewById(R.id.chatInput)
 
         findViewById<TextView>(R.id.headerTitle).text = "Мажорный лад"
+        findViewById<TextView>(R.id.versionText).text =
+            "Версия " + BuildConfig.VERSION_NAME
     }
 
     private fun setupTabs() {

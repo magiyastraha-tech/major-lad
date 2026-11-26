@@ -39,10 +39,8 @@ class AudioEngine(
         const val BLOCK = 480
         private const val CLICK_MS = 30
         private const val VIDEO_CHUNK = 1000
-        /** Сколько пакетов копим перед воспроизведением, чтобы рывки сети не давали щелчков. */
+        /** Сколько пакетов копим перед самым первым звуком, чтобы рывки сети не давали щелчков. */
         private const val PREBUFFER = 3
-        /** Потолок запаса: на плохой сети копим больше, но не выше 80 мс. */
-        private const val MAX_PREBUFFER = 8
         /** Потолок очереди приёма; выше — звук уже отстал на 160 мс, режем. */
         private const val MAX_QUEUE = 16
         /** Длина плавного входа после провала, в отсчётах. */
@@ -374,14 +372,14 @@ class AudioEngine(
         val out = ShortArray(BLOCK)
         var pending: ShortArray? = null
         var pendingPos = 0
-        var primed = false
+        // Запас ждём только перед самым первым звуком. Дальше цикл пишет
+        // всегда: пауза на провале опустошала буфер звуковой дорожки, и
+        // новый запас вычерпывался в неё разом — звук шёл рывками по 80 мс
+        // с провалом между ними. Запасом теперь служит сама очередь
+        // пакетов, а недостающий кусок — это ровно один короткий провал.
+        var started = false
         var fadeIn = false
         var lastValue = 0
-        // Запас растёт только по факту провала и потом сам сползает
-        // обратно: на хорошей сети задержка остаётся 30 мс, на плохой
-        // звук не рвётся каждые пару секунд.
-        var preTarget = PREBUFFER
-        var cleanBlocks = 0
         while (running) {
             val t = ensureTrack()
             if (t == null) {
@@ -395,11 +393,11 @@ class AudioEngine(
             // Ждём запас только когда слушаем собеседника. Если тикает свой
             // метроном, ждать нечего — иначе такт сорвался бы.
             val needPrebuffer = !(metroOn && !peerMetroOn)
-            if (!primed && needPrebuffer && pcmQueue.size < preTarget) {
+            if (!started && needPrebuffer && pcmQueue.size < PREBUFFER) {
                 sleep(5)
                 continue
             }
-            primed = true
+            started = true
             var filled = 0
             while (filled < BLOCK) {
                 var chunk = pending
@@ -422,19 +420,7 @@ class AudioEngine(
                 }
                 lastValue = v
                 fadeIn = true
-                primed = false
-                // Провал на пустой очереди — значит её мало. Добавляем
-                // один блок запаса, чтобы следующий разрыв был позже.
-                if (preTarget < MAX_PREBUFFER) preTarget++
-                cleanBlocks = 0
             } else {
-                cleanBlocks++
-                // Пять секунд без единого провала — запас можно
-                // отпустить на блок: задержка важнее перестраховки.
-                if (cleanBlocks >= 500 && preTarget > PREBUFFER) {
-                    cleanBlocks = 0
-                    preTarget--
-                }
                 if (fadeIn) {
                     val n = min(BLOCK, FADE_IN)
                     for (i in 0 until n) {
@@ -456,13 +442,13 @@ class AudioEngine(
                 if (t.write(out, 0, BLOCK) < 0) {
                     releaseTrack()
                     fadeIn = true
-                    primed = false
+                    started = false
                     sleep(50)
                 }
             } catch (_: Exception) {
                 releaseTrack()
                 fadeIn = true
-                primed = false
+                started = false
                 sleep(100)
             }
         }

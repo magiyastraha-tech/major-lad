@@ -927,8 +927,13 @@ class SettingsDialog(QDialog):
                              (192, "192 отсчёта"), (256, "256 отсчётов"),
                              (512, "512 отсчётов")):
             self.device_buffer_combo.addItem(title, value)
-        buf_index = self.device_buffer_combo.findData(
-            int(self.cfg["audio"].get("device_buffer", 0) or 0))
+        buf_value = int(self.cfg["audio"].get("device_buffer", 0) or 0)
+        # На ASIO «по драйверу» кончается блоком в 32 отсчёта: обратный
+        # вызов каждые 0,67 мс не успевает, и карта молча теряет звук.
+        # Показываем 128 — безопасный размер для такой карты.
+        if buf_value == 0 and str(self.cfg["audio"].get("driver", "")) == "asio":
+            buf_value = 128
+        buf_index = self.device_buffer_combo.findData(buf_value)
         self.device_buffer_combo.setCurrentIndex(
             buf_index if buf_index >= 0 else 0)
         driver_form.addRow(label_for("Буфер драйвера",

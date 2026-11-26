@@ -47,6 +47,12 @@ def _install_crash_log() -> None:
     try:
         _crash_file = open(config.data_dir() / "crash.log", "a",
                            encoding="utf-8")
+        # Без этой строки по дампу нельзя понять, какая версия упала:
+        # faulthandler пишет только стек.
+        _crash_file.write(
+            f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} | "
+            f"версия {__version__} =====\n")
+        _crash_file.flush()
         faulthandler.enable(file=_crash_file, all_threads=True)
     except Exception:
         _crash_file = None
