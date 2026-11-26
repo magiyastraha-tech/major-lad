@@ -39,6 +39,10 @@ class AudioEngine(
         const val BLOCK = 480
         private const val CLICK_MS = 30
         private const val VIDEO_CHUNK = 1000
+        /** Сколько пакетов копим перед воспроизведением, чтобы рывки сети не давали щелчков. */
+        private const val PREBUFFER = 3
+        /** Длина плавного входа после провала, в отсчётах. */
+        private const val FADE_IN = 96
     }
 
     private val isServer = serverHost == null
@@ -63,10 +67,29 @@ class AudioEngine(
 
     @Volatile private var micVersion = 0
     @Volatile private var micDevice: AudioDeviceInfo? = null
+    // Если микрофон открылся, но молчит, пробуем другой источник: на части
+    // телефонов «громкая связь» отдаёт тишину, а обычный микрофон работает.
+    @Volatile private var micSourceShift = 0
+    @Volatile private var micRotations = 0
     @Volatile private var outDevice: AudioDeviceInfo? = null
     private var track: AudioTrack? = null
     @Volatile private var playClock = 0L
     @Volatile private var micClock = 0L
+
+    // Счётчики для лога: по ним видно, доходит ли звук в обе стороны,
+    // открылся ли микрофон и насколько громкий сигнал он отдаёт.
+    @Volatile private var rxPackets = 0
+    @Volatile private var rxAudioPackets = 0
+    @Volatile private var txAudioPackets = 0
+    @Volatile private var underruns = 0
+    @Volatile private var micPeak = 0
+    @Volatile private var peerPeak = 0
+    @Volatile private var micLabel = "нет"
+    @Volatile private var micActive = false
+    private var lastMicError = ""
+    private var lastMicErrorAt = 0L
+    private var lastCompressedLog = 0L
+    private var lastOutErrorAt = 0L
     private var videoId = 0
     private val videoFrames = HashMap<Int, VideoAccum>()
 
@@ -100,10 +123,20 @@ class AudioEngine(
             } catch (_: Exception) {
             }
         }
+        RunLog.write(
+            "audio",
+            (if (isServer) "режим преподавателя" else "режим ученика") +
+                ", порт $udpPort, собеседник: " + (peer?.let { "${it.address.hostAddress}:${it.port}" } ?: "узнаём из пакета")
+        )
+        // Новый сеанс начинает с обычного источника и полным запасом
+        // переключений: прошлое занятие ничего не должно тянуть за собой.
+        micSourceShift = 0
+        micRotations = 0
         launch("gca-hello") { helloLoop() }
         launch("gca-recv") { recvLoop() }
         launch("gca-mic") { micLoop() }
         launch("gca-play") { playLoop() }
+        launch("gca-stats") { statsLoop() }
     }
 
     fun stop() {
@@ -116,6 +149,7 @@ class AudioEngine(
         peer = null
         pcmQueue.clear()
         releaseTrack()
+        RunLog.write("audio", "звук остановлен")
     }
 
     fun hasPeer(): Boolean = peer != null
@@ -204,12 +238,14 @@ class AudioEngine(
                 continue
             }
             if (packet.length < 4) continue
+            rxPackets++
             if (isServer) {
                 val cur = peer
                 val addr = packet.address
                 val port = packet.port
                 if (cur == null || cur.address != addr || cur.port != port) {
                     peer = if (addr == null) null else InetSocketAddress(addr, port)
+                    RunLog.write("audio", "собеседник: ${addr?.hostAddress}:$port")
                     addr?.hostAddress?.let { onLog("Звук от $it") }
                 }
             }
@@ -218,7 +254,15 @@ class AudioEngine(
                 "GCA1" -> deliverPcm(packet, false)
                 "GCA2" -> deliverPcm(packet, true)
                 "GCV1" -> feedVideo(packet)
-                "GCA5", "GCA6" -> onLog("Собеседник шлёт сжатый звук — на телефоне пока не поддерживается")
+                "GCA5", "GCA6" -> {
+                    // Не засоряем лог: собеседник шлёт такой пакет десять раз в секунду.
+                    val now = System.currentTimeMillis()
+                    if (now - lastCompressedLog > 5000) {
+                        lastCompressedLog = now
+                        RunLog.write("audio", "пришёл сжатый звук $magic — на телефоне пока не поддерживается")
+                        onLog("Собеседник шлёт сжатый звук — на телефоне пока не поддерживается")
+                    }
+                }
             }
         }
     }
@@ -245,6 +289,14 @@ class AudioEngine(
                 o++
             }
         }
+        if (out.isEmpty()) return
+        rxAudioPackets++
+        var peak = 0
+        for (v in out) {
+            val a = if (v < 0) -v.toInt() else v.toInt()
+            if (a > peak) peak = a
+        }
+        if (peak > peerPeak) peerPeak = peak
         while (pcmQueue.size > 8) pcmQueue.poll()
         pcmQueue.add(out)
     }
@@ -255,7 +307,9 @@ class AudioEngine(
         return try {
             val minBuf = AudioTrack.getMinBufferSize(
                 SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val size = max(minBuf, BLOCK * 2 * 4)
+            // Запас побольше: на маленьком буфере телефон не успевает
+            // проигрывать сглаженные провалы и звук трещит.
+            val size = max(minBuf, BLOCK * 2 * 8)
             val created = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -275,9 +329,15 @@ class AudioEngine(
             outDevice?.let { created.setPreferredDevice(it) }
             created.play()
             track = created
+            RunLog.write("audio", "вывод звука открыт, буфер $size байт")
             created
         } catch (e: Exception) {
-            onLog("Нет вывода звука: ${e.message}")
+            val now = System.currentTimeMillis()
+            if (now - lastOutErrorAt > 4000) {
+                lastOutErrorAt = now
+                RunLog.write("audio", "вывод звука не открылся: ${e.message}")
+                onLog("Нет вывода звука: ${e.message}")
+            }
             null
         }
     }
@@ -294,10 +354,18 @@ class AudioEngine(
         track = null
     }
 
+    /**
+     * Воспроизведение. Копим небольшой запас, а на провале не обрываем
+     * звук в ноль (это слышно как щелчок), а плавно гасим и так же плавно
+     * возвращаем. Свой метроном в это время продолжает тикать.
+     */
     private fun playLoop() {
         val out = ShortArray(BLOCK)
         var pending: ShortArray? = null
         var pendingPos = 0
+        var primed = false
+        var fadeIn = false
+        var lastValue = 0
         while (running) {
             val t = ensureTrack()
             if (t == null) {
@@ -308,6 +376,14 @@ class AudioEngine(
                 t.setVolume(playVolume)
             } catch (_: Exception) {
             }
+            // Ждём запас только когда слушаем собеседника. Если тикает свой
+            // метроном, ждать нечего — иначе такт сорвался бы.
+            val needPrebuffer = !(metroOn && !peerMetroOn)
+            if (!primed && needPrebuffer && pcmQueue.size < PREBUFFER) {
+                sleep(5)
+                continue
+            }
+            primed = true
             var filled = 0
             while (filled < BLOCK) {
                 var chunk = pending
@@ -321,7 +397,26 @@ class AudioEngine(
                 filled += n
                 pendingPos += n
             }
-            if (filled < BLOCK) java.util.Arrays.fill(out, filled, BLOCK, 0.toShort())
+            if (filled < BLOCK) {
+                underruns++
+                var v = lastValue
+                for (i in filled until BLOCK) {
+                    v = (v * 15) / 16
+                    out[i] = v.toShort()
+                }
+                lastValue = v
+                fadeIn = true
+                primed = false
+            } else {
+                if (fadeIn) {
+                    val n = min(BLOCK, FADE_IN)
+                    for (i in 0 until n) {
+                        out[i] = ((out[i].toInt() * i) / n).toShort()
+                    }
+                    fadeIn = false
+                }
+                lastValue = out[BLOCK - 1].toInt()
+            }
             if (metroOn && !peerMetroOn && metroVolume > 0.01f) {
                 mixClicks(out, playClock, BLOCK, metroVolume)
             }
@@ -357,40 +452,92 @@ class AudioEngine(
     private fun micLoop() {
         while (running) {
             runMicSession()
-            sleep(150)
+            // Микрофон не открылся — не дёргаем телефон двадцать раз в
+            // секунду, ждём подольше и пробуем снова.
+            sleep(if (micLabel == "нет") 1000 else 150)
         }
+        micActive = false
+    }
+
+    /**
+     * Источники перебираем по очереди: на части телефонов «громкая связь»
+     * не открывается или отдаёт одну тишину, а обычный микрофон работает.
+     */
+    private val micSources = listOf(
+        MediaRecorder.AudioSource.VOICE_COMMUNICATION to "громкая связь",
+        MediaRecorder.AudioSource.MIC to "микрофон",
+        MediaRecorder.AudioSource.DEFAULT to "по умолчанию",
+    )
+
+    private fun openMic(size: Int): AudioRecord? {
+        var lastError = ""
+        for (n in micSources.indices) {
+            val (source, label) = micSources[(n + micSourceShift) % micSources.size]
+            if (!running) return null
+            var rec: AudioRecord? = null
+            try {
+                rec = AudioRecord.Builder()
+                    .setAudioSource(source)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(SAMPLE_RATE)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                            .build())
+                    .setBufferSizeInBytes(size)
+                    .build()
+                if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                    throw IllegalStateException("микрофон занят другой программой")
+                }
+                val dev = micDevice
+                if (dev != null) {
+                    val ok = try {
+                        rec.setPreferredDevice(dev)
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (!ok) RunLog.write("audio", "выбранный микрофон недоступен — беру обычный")
+                }
+                rec.startRecording()
+                if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    throw IllegalStateException("запись не началась")
+                }
+                micLabel = label
+                micActive = true
+                RunLog.write("audio", "микрофон открыт: $label, буфер $size байт")
+                if (lastMicError.isNotEmpty()) {
+                    lastMicError = ""
+                    onLog("Микрофон заработал")
+                }
+                return rec
+            } catch (e: Exception) {
+                lastError = e.message ?: e.javaClass.simpleName
+                try {
+                    rec?.release()
+                } catch (_: Exception) {
+                }
+            }
+        }
+        micActive = false
+        micLabel = "нет"
+        val now = System.currentTimeMillis()
+        // Одно и то же сообщение не чаще раза в 4 секунды: иначе экран
+        // и лог забиваются повторами.
+        if (lastError != lastMicError || now - lastMicErrorAt > 4000) {
+            lastMicError = lastError
+            lastMicErrorAt = now
+            RunLog.write("audio", "микрофон не открылся: $lastError")
+            onLog("Нет микрофона: $lastError")
+        }
+        return null
     }
 
     private fun runMicSession() {
         val myVersion = micVersion
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val size = max(minBuf, BLOCK * 2 * 8)
-        var rec: AudioRecord? = null
-        try {
-            rec = AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                        .build())
-                .setBufferSizeInBytes(size)
-                .build()
-            micDevice?.let { rec.setPreferredDevice(it) }
-            if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                throw IllegalStateException("микрофон занят другой программой")
-            }
-            rec.startRecording()
-        } catch (e: Exception) {
-            onLog("Нет микрофона: ${e.message}")
-            try {
-                rec?.release()
-            } catch (_: Exception) {
-            }
-            return
-        }
+        val size = max(if (minBuf > 0) minBuf else BLOCK * 2 * 8, BLOCK * 2 * 8)
+        val rec = openMic(size) ?: return
         val local = ShortArray(BLOCK)
         val packet = ByteArray(8 + BLOCK * 2)
         "GCA1".toByteArray().copyInto(packet, 0)
@@ -405,6 +552,13 @@ class AudioEngine(
                 sleep(10)
                 continue
             }
+            var peak = 0
+            for (i in 0 until read) {
+                val raw = local[i].toInt()
+                val a = if (raw < 0) -raw else raw
+                if (a > peak) peak = a
+            }
+            if (peak > micPeak) micPeak = peak
             // Сначала усиление голоса, потом щелчки. Иначе при выключенном
             // микрофоне вместе с голосом пропадал бы и метроном для собеседника.
             val gain = if (micOn) micGain else 0f
@@ -432,6 +586,7 @@ class AudioEngine(
             if (p != null && s != null) {
                 try {
                     s.send(DatagramPacket(packet, off, p))
+                    txAudioPackets++
                 } catch (_: Exception) {
                 }
             }
@@ -443,6 +598,106 @@ class AudioEngine(
         try {
             rec.release()
         } catch (_: Exception) {
+        }
+        micActive = false
+        RunLog.write("audio", "микрофон закрыт")
+    }
+
+    /**
+     * Раз в две секунды пишем в лог, что происходит со звуком. По этим
+     * строчкам видно, где обрыв: не открывается микрофон, микрофон отдаёт
+     * тишину, пакеты не доходят или не доходит сам звук.
+     */
+    private fun statsLoop() {
+        var lastRx = 0
+        var lastRxAudio = 0
+        var lastTx = 0
+        var lastUnder = 0
+        var silentRounds = 0
+        var peerSilentRounds = 0
+        var peerSilentWarned = false
+        var noAudioRounds = 0
+        var noAudioWarned = false
+        while (running) {
+            sleep(2000)
+            if (!running) break
+            val rx = rxPackets
+            val rxa = rxAudioPackets
+            val tx = txAudioPackets
+            val un = underruns
+            val myPeak = micPeak
+            micPeak = 0
+            val theirPeak = peerPeak
+            peerPeak = 0
+            val dRx = rx - lastRx
+            val dRxAudio = rxa - lastRxAudio
+            val dTx = tx - lastTx
+            RunLog.write(
+                "audio",
+                "за 2 с: принято $dRx пакетов (со звуком $dRxAudio), отправлено звука $dTx, " +
+                    "провалы ${un - lastUnder}, в очереди ${pcmQueue.size}, " +
+                    "мой микрофон ${if (micActive) micLabel else "не открыт"} " +
+                    "на ${myPeak * 100 / 32768}%, звук собеседника на ${theirPeak * 100 / 32768}%, " +
+                    "собеседник ${if (peer != null) "есть" else "нет"}"
+            )
+            lastRx = rx
+            lastRxAudio = rxa
+            lastTx = tx
+            lastUnder = un
+
+            // Микрофон открыт и включён, а сигнала нет — так микрофон не работает.
+            if (micActive && micOn && myPeak == 0) {
+                silentRounds++
+                if (silentRounds == 3) {
+                    RunLog.write("audio", "микрофон открыт, но отдаёт только тишину")
+                }
+                // Двенадцать секунд полной тишины — это уже не пауза в
+                // разговоре, а неработающий источник. Пробуем следующий:
+                // на части телефонов «громкая связь» всегда отдаёт нули.
+                // Выбранный в настройках микрофон остаётся, меняется только
+                // способ его открыть.
+                if (silentRounds >= 6 && micRotations < micSources.size - 1) {
+                    silentRounds = 0
+                    micRotations++
+                    micSourceShift = (micSourceShift + 1) % micSources.size
+                    val next = micSources[micSourceShift].second
+                    RunLog.write(
+                        "audio",
+                        "микрофон молчит 12 секунд — переключаюсь на источник «$next» ($micRotations)"
+                    )
+                    onLog("Микрофон молчит — переключаюсь на другой источник")
+                    micVersion++
+                }
+            } else {
+                silentRounds = 0
+                // Сигнал слышен — значит текущий источник рабочий, и
+                // запас попыток на будущее снова полный.
+                if (myPeak > 0) micRotations = 0
+            }
+            // Звук идёт, но в нём одни нули — у собеседника выключен микрофон.
+            if (dRxAudio > 0 && theirPeak == 0) {
+                peerSilentRounds++
+                if (peerSilentRounds >= 2 && !peerSilentWarned) {
+                    peerSilentWarned = true
+                    onLog("У собеседника выключен микрофон — попросите включить звук")
+                }
+            } else {
+                peerSilentRounds = 0
+                if (theirPeak > 0) peerSilentWarned = false
+            }
+            // Собеседник есть, а звука от него нет совсем — у него не
+            // открылся микрофон.
+            if (peer != null && dRxAudio == 0) {
+                noAudioRounds++
+                if (noAudioRounds >= 3 && !noAudioWarned) {
+                    noAudioWarned = true
+                    RunLog.write("audio", "собеседник подключён, но звук от него не идёт")
+                    onLog("Звук от собеседника не идёт — проверьте, что у него работает микрофон")
+                }
+            } else {
+                noAudioRounds = 0
+                if (dRxAudio > 0) noAudioWarned = false
+            }
         }
     }
 

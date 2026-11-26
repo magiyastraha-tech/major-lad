@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Версия для ученика: вместо подписей — крупные картинки-кнопки.
-     Буква внутри кнопки и есть картинка: З — звук, В — видео, М — метроном.
-     Включено — ярко-красная, выключено — бледно-серая. -->
+<!-- Версия для ученика: кнопки с обычными подписями, как у преподавателя.
+     Картинки-значки убраны: подпись понятнее и читается вслух. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -14,33 +13,14 @@
         android:layout_height="wrap_content"
         android:orientation="vertical">
 
-        <EditText
-            android:id="@+id/editHost"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Адрес преподавателя, например 192.168.1.42"
-            android:importantForAutofill="no"
-            android:inputType="text"
-            android:singleLine="true"
-            android:textSize="17sp" />
-
-        <EditText
-            android:id="@+id/editPort"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:hint="Порт"
-            android:importantForAutofill="no"
-            android:inputType="number"
-            android:singleLine="true"
-            android:text="45801"
-            android:textSize="17sp" />
-
+        <!-- Адрес и порт живут только в настройках: на главной они
+             занимали место и путались под рукой. Имя остаётся здесь —
+             его называют преподавателю в начале занятия. -->
         <EditText
             android:id="@+id/editName"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:contentDescription="Ваше имя"
             android:hint="Как вас зовут"
             android:importantForAutofill="no"
             android:inputType="textPersonName"
@@ -102,43 +82,31 @@
         <Button
             android:id="@+id/btnMic"
             android:layout_width="0dp"
-            android:layout_height="96dp"
+            android:layout_height="72dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_pic_off"
-            android:contentDescription="Микрофон"
-            android:minWidth="0dp"
-            android:text="З"
-            android:textColor="#ffffff"
-            android:textSize="30sp"
-            android:textStyle="bold" />
+            android:contentDescription="Микрофон выключен"
+            android:text="Звук\nвыкл"
+            android:textSize="16sp" />
 
         <Button
             android:id="@+id/btnExpand"
             android:layout_width="0dp"
-            android:layout_height="96dp"
+            android:layout_height="72dp"
             android:layout_marginStart="8dp"
             android:layout_marginEnd="8dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_pic_off"
-            android:contentDescription="Развернуть видео на весь экран"
-            android:minWidth="0dp"
-            android:text="В"
-            android:textColor="#ffffff"
-            android:textSize="30sp"
-            android:textStyle="bold" />
+            android:contentDescription="Развернуть видео"
+            android:text="Видео\nна весь экран"
+            android:textSize="15sp" />
 
         <Button
             android:id="@+id/btnMetro"
             android:layout_width="0dp"
-            android:layout_height="96dp"
+            android:layout_height="72dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_pic_off"
-            android:contentDescription="Метроном"
-            android:minWidth="0dp"
-            android:text="М"
-            android:textColor="#ffffff"
-            android:textSize="30sp"
-            android:textStyle="bold" />
+            android:contentDescription="Метроном выключен"
+            android:text="Метроном\nвыкл"
+            android:textSize="16sp" />
     </LinearLayout>
 
     <LinearLayout

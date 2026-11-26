@@ -13,15 +13,6 @@
         android:textColor="#e6e6ef"
         android:textSize="17sp" />
 
-    <TextView
-        android:id="@+id/addressText"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="Мой адрес в вайфае: определяется"
-        android:textColor="#b9b9c6"
-        android:textSize="16sp" />
-
     <FrameLayout
         android:id="@+id/videoBox"
         android:layout_width="match_parent"

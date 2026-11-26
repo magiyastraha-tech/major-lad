@@ -11,8 +11,8 @@ android {
         applicationId = "tech.magiyastraha.majorlad"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.6.2"
+        versionCode = 5
+        versionName = "0.6.3"
     }
 
     buildFeatures {
@@ -32,9 +32,9 @@ android {
         }
     }
 
-    // Две версии из одного кода: для преподавателя — обычные кнопки с
-    // подписями, для ученика — кнопки-картинки. Пакеты разные, поэтому
-    // обе версии могут стоять на одном телефоне рядом.
+    // Две версии из одного кода: для преподавателя и для ученика. Кнопки
+    // в обеих подписаны словами. Пакеты разные, поэтому обе версии могут
+    // стоять на одном телефоне рядом.
     flavorDimensions += "role"
     productFlavors {
         create("teacher") {

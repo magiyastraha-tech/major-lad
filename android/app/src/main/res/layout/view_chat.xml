@@ -22,17 +22,16 @@
         android:orientation="horizontal"
         android:padding="8dp">
 
+        <!-- Подпись вместо значка скрепки: её читает и видит каждый. -->
         <Button
             android:id="@+id/btnAttach"
-            android:layout_width="52dp"
+            android:layout_width="wrap_content"
             android:layout_height="52dp"
             android:layout_marginEnd="6dp"
-            android:background="@drawable/bg_pic_off"
             android:contentDescription="Прикрепить файл"
             android:minWidth="0dp"
-            android:minHeight="0dp"
-            android:text="📎"
-            android:textSize="22sp" />
+            android:text="Файл"
+            android:textSize="15sp" />
 
         <EditText
             android:id="@+id/chatInput"

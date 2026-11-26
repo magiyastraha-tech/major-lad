@@ -2,6 +2,7 @@ package tech.magiyastraha.majorlad
 
 import android.Manifest
 import android.app.AlertDialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.media.AudioDeviceInfo
@@ -33,7 +34,9 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.google.android.material.tabs.TabLayout
+import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
@@ -62,7 +65,6 @@ class MainActivity : AppCompatActivity() {
     private var peerMode = false
 
     private var statusText: TextView? = null
-    private var addressText: TextView? = null
     private var videoView: ImageView? = null
     private var videoHint: TextView? = null
     private var btnMic: Button? = null
@@ -98,9 +100,19 @@ class MainActivity : AppCompatActivity() {
     private var chatVersion = 0
     private var addingTrack = false
 
+    // Если в разрешении на микрофон отказали, об этом надо сказать вслух:
+    // иначе ученик подключается, а его не слышно, и непонятно почему.
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    ) { granted ->
+        val mic = granted[Manifest.permission.RECORD_AUDIO]
+        if (mic == false) {
+            RunLog.write("perm", "в разрешении на микрофон отказано")
+            setStatus("Без разрешения на микрофон вас не будет слышно. Разрешите его в настройках Android")
+        } else if (mic == true) {
+            RunLog.write("perm", "разрешение на микрофон есть")
+        }
+    }
     private val openDoc = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri -> uri?.let { onDocumentPicked(it) } }
@@ -130,6 +142,7 @@ class MainActivity : AppCompatActivity() {
         holdAwake(false)
         audio?.stop()
         player.release()
+        RunLog.stop()
         super.onDestroy()
     }
 
@@ -137,8 +150,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindViews() {
         statusText = findViewById(R.id.statusText)
-        // У ученика этой надписи в разметке нет, поэтому ищем по имени.
-        addressText = findViewById(viewId("addressText"))
         videoView = findViewById(R.id.videoView)
         videoHint = findViewById(R.id.videoHint)
         btnMic = findViewById(R.id.btnMic)
@@ -245,11 +256,6 @@ class MainActivity : AppCompatActivity() {
         return stored?.takeIf { it in 1..65535 } ?: Proto.APP_PORT
     }
 
-    /** Порт, введённый руками: старый 45800 тоже заменяется на текущий. */
-    private fun enteredPort(text: String): Int =
-        text.toIntOrNull()?.takeIf { it in 1..65535 && it != Proto.LEGACY_PORT }
-            ?: Proto.APP_PORT
-
     /**
      * Пока кабинет открыт, телефон не должен засыпать. Иначе экран гаснет,
      * Wi-Fi уходит в экономию энергии и ученик с компьютера не достучится:
@@ -313,21 +319,12 @@ class MainActivity : AppCompatActivity() {
         server = srv
         srv.start()
         holdAwake(true)
-        val ip = ownWifiAddress()
-        addressText?.text = if (ip != null) {
-            "Мой адрес в вайфае: $ip, порт $port"
-        } else {
-            "Вайфай не найден. Включите его — ученик подключится по адресу телефона."
-        }
     }
 
+    /** На главной у ученика осталось только имя; адрес и порт — в настройках. */
     private fun restoreStudentFields() {
-        val host = findViewById<View>(R.id.editHost) as? EditText
-        val port = findViewById<View>(R.id.editPort) as? EditText
-        val name = findViewById<View>(R.id.editName) as? EditText
-        host?.setText(prefs.getString("host", ""))
-        port?.setText(savedPort().toString())
-        name?.setText(prefs.getString("name", ""))
+        (findViewById<View>(R.id.editName) as? EditText)
+            ?.setText(prefs.getString("name", ""))
     }
 
     private fun connectStudent() {
@@ -344,17 +341,17 @@ class MainActivity : AppCompatActivity() {
             refreshAll()
             return
         }
-        val host = (findViewById<View>(R.id.editHost) as? EditText)?.text?.toString()?.trim().orEmpty()
-        val portText = (findViewById<View>(R.id.editPort) as? EditText)?.text?.toString()?.trim().orEmpty()
+        // Адрес и порт берутся из настроек: на главной их больше нет.
+        val host = prefs.getString("host", "").orEmpty().trim()
+        val port = savedPort()
         val name = (findViewById<View>(R.id.editName) as? EditText)?.text?.toString()?.trim().orEmpty()
+            .ifEmpty { prefs.getString("name", "").orEmpty().trim() }
             .ifEmpty { "Ученик" }
-        val port = enteredPort(portText)
         if (host.isEmpty()) {
-            setStatus("Впишите адрес преподавателя, например 192.168.1.42")
+            setStatus("Адрес преподавателя не указан — откройте настройки и впишите его")
             return
         }
-        prefs.edit().putString("host", host).putString("port", port.toString())
-            .putString("name", name).apply()
+        prefs.edit().putString("name", name).apply()
         val c = NetClient(
             handler, name, host, port,
             { text -> setStatus(text) },
@@ -381,7 +378,17 @@ class MainActivity : AppCompatActivity() {
         connected = true
         attachAudio(10)
         updateButtons()
-        setStatus(if (isTeacher) "$peer подключился" else "Связь с преподавателем есть")
+        // Выключенный микрофон — самая частая причина «меня не слышно»:
+        // говорим об этом сразу, а не оставляем человека гадать.
+        val micOff = prefs.getBoolean("micOn", true) == false
+        setStatus(
+            when {
+                micOff -> "Связь есть, но ваш микрофон выключен — нажмите «Звук выкл»"
+                isTeacher -> "$peer подключился"
+                else -> "Связь с преподавателем есть"
+            }
+        )
+        if (micOff) announce("Внимание: ваш микрофон выключен")
         startCameraIfPossible()
     }
 
@@ -489,27 +496,26 @@ class MainActivity : AppCompatActivity() {
         val engine = audio
         val micOn = engine?.micOn ?: prefs.getBoolean("micOn", true)
         val metroOn = engine?.metroOn ?: false
+        // Подписи одинаковые в обеих версиях: картинки-иконки без подписи
+        // непонятны и на слух не читаются.
         btnMic?.apply {
-            text = if (isTeacher) {
-                if (micOn) "Звук\nвкл" else "Звук\nвыкл"
-            } else {
-                "З"
-            }
+            text = if (micOn) "Звук\nвкл" else "Звук\nвыкл"
             contentDescription = if (micOn) "Микрофон включён" else "Микрофон выключен"
-            setBackgroundResource(if (micOn) R.drawable.bg_pic_on else R.drawable.bg_pic_off)
         }
         btnMetro?.apply {
-            text = if (isTeacher) {
-                if (metroOn) "Метроном\nвкл" else "Метроном\nвыкл"
-            } else {
-                "М"
-            }
+            text = if (metroOn) "Метроном\nвкл" else "Метроном\nвыкл"
             contentDescription = if (metroOn) "Метроном включён" else "Метроном выключен"
-            setBackgroundResource(if (metroOn) R.drawable.bg_pic_on else R.drawable.bg_pic_off)
         }
         btnExpand?.apply {
-            if (isTeacher) text = "Видео\nна весь экран"
+            text = "Видео\nна весь экран"
             contentDescription = "Развернуть видео на весь экран"
+        }
+        // У ученика кнопка подключения — единственный способ понять, есть
+        // ли связь, не заглядывая в строку состояния глазами.
+        (findViewById<View>(viewId("btnConnect")) as? Button)?.apply {
+            text = if (connected) "Отключиться" else "Подключиться"
+            contentDescription =
+                if (connected) "Отключиться от преподавателя" else "Подключиться к преподавателю"
         }
     }
 
@@ -609,6 +615,12 @@ class MainActivity : AppCompatActivity() {
         chatVersion++
         chatAdapter?.notifyDataSetChanged()
         chatList?.post { chatList?.setSelection((chatAdapter?.count ?: 1) - 1) }
+        // Новое сообщение собеседника иначе останется незамеченным: список
+        // сам себя вслух не читает.
+        if (!msg.mine && msg.text.isNotEmpty()) {
+            val who = msg.from.trim().ifEmpty { "Собеседник" }
+            announce("Сообщение от $who: ${msg.text}")
+        }
     }
 
     private fun onHistory(list: List<ChatMsg>) {
@@ -803,6 +815,8 @@ class MainActivity : AppCompatActivity() {
                 player.play()
                 refreshTrackList()
                 updatePlayButton()
+                // Список сам не сообщает, что трек пошёл: говорим вслух.
+                announce("Играю: ${player.currentName()}")
             }
         }
         findViewById<Button>(R.id.btnAdd).setOnClickListener {
@@ -823,6 +837,7 @@ class MainActivity : AppCompatActivity() {
         btnPlay?.setOnClickListener {
             player.toggle()
             updatePlayButton()
+            announce(if (player.playing) "Играю" else "Пауза")
         }
         seekTrack?.setOnSeekBarChangeListener(simple { v, fromUser ->
             val dur = player.duration()
@@ -867,12 +882,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePlayButton() {
-        btnPlay?.text = if (player.playing) (if (isTeacher) "Стоп" else "⏹")
-        else (if (isTeacher) "Играть" else "▶")
+        btnPlay?.text = if (player.playing) "Стоп" else "Играть"
         btnPlay?.contentDescription = if (player.playing) "Остановить" else "Играть"
-        btnPlay?.setBackgroundResource(
-            if (player.playing) R.drawable.bg_pic_on else R.drawable.bg_pic_off
-        )
     }
 
     private fun startSeekTicker() {
@@ -910,12 +921,27 @@ class MainActivity : AppCompatActivity() {
         val hostEdit = view.findViewById<EditText>(R.id.editHost)
         val portEdit = view.findViewById<EditText>(R.id.editPort)
         val ipRow = view.findViewById<View>(R.id.ipRow)
+        val ownAddressRow = view.findViewById<View>(R.id.ownAddressRow)
+        val ownAddressEdit = view.findViewById<EditText>(R.id.editOwnAddress)
+        val ownAddressInfo = view.findViewById<TextView>(R.id.ownAddressInfo)
         nameEdit.setText(prefs.getString("name", ""))
         hostEdit.setText(prefs.getString("host", ""))
         portEdit.setText(savedPort().toString())
-        // Адрес преподавателя нужен только ученику, а порт —
-        // обоим: преподаватель открывает на нём кабинет.
+        // Адрес преподавателя нужен только ученику, порт — обоим:
+        // преподаватель открывает на нём кабинет.
         if (isTeacher) ipRow.visibility = View.GONE
+        // Свой адрес нужен только преподавателю — его он называет ученику.
+        if (isTeacher) {
+            ownAddressEdit.setText(prefs.getString("ownAddress", ""))
+            val found = ownWifiAddress().orEmpty()
+            ownAddressInfo.text = if (found.isEmpty()) {
+                "Автоматически адрес не найден — впишите вручную."
+            } else {
+                "Похоже, адрес этого телефона: $found"
+            }
+        } else {
+            ownAddressRow.visibility = View.GONE
+        }
 
         val devices = audioDevices()
         val micDevices = devices.first
@@ -929,6 +955,38 @@ class MainActivity : AppCompatActivity() {
         micSpinner.setSelection(indexOfType(micDevices, prefs.getInt("micType", -1)))
         outSpinner.setSelection(indexOfType(outDevices, prefs.getInt("outType", -1)))
 
+        // Запись лога: включить, выключить, отправить файл в Telegram.
+        val logState = view.findViewById<TextView>(R.id.logState)
+        val btnLogStart = view.findViewById<Button>(R.id.btnLogStart)
+        val btnLogStop = view.findViewById<Button>(R.id.btnLogStop)
+        val btnLogShare = view.findViewById<Button>(R.id.btnLogShare)
+        fun refreshLogState() {
+            val current = RunLog.current()
+            logState.text = if (RunLog.isRunning && current != null) {
+                "Идёт запись: ${current.name}"
+            } else {
+                "Запись выключена"
+            }
+            btnLogStart.isEnabled = !RunLog.isRunning
+            btnLogStop.isEnabled = RunLog.isRunning
+            btnLogShare.isEnabled = current != null || RunLog.lastFile(logDir()) != null
+        }
+        refreshLogState()
+        btnLogStart.setOnClickListener {
+            val started = startRunLog() != null
+            refreshLogState()
+            val msg = if (started) "Запись лога пошла" else "Не удалось начать запись лога"
+            logState.announceForAccessibility(msg)
+            setStatus(msg)
+        }
+        btnLogStop.setOnClickListener {
+            stopRunLog()
+            refreshLogState()
+            logState.announceForAccessibility("Запись лога остановлена")
+            setStatus("Запись остановлена. Файл можно отправить кнопкой «Отправить лог»")
+        }
+        btnLogShare.setOnClickListener { shareRunLog() }
+
         AlertDialog.Builder(this)
             .setTitle("Настройки, версия ${BuildConfig.VERSION_NAME}")
             .setView(view)
@@ -940,6 +998,10 @@ class MainActivity : AppCompatActivity() {
                     .putString("name", nameEdit.text.toString().trim())
                     .putString("host", hostEdit.text.toString().trim())
                     .putString("port", (newPort ?: Proto.APP_PORT).toString())
+                    .putString(
+                        "ownAddress",
+                        if (isTeacher) ownAddressEdit.text.toString().trim() else ""
+                    )
                     .putInt("micType", micDevices.getOrNull(micSpinner.selectedItemPosition)?.first ?: -1)
                     .putInt("outType", outDevices.getOrNull(outSpinner.selectedItemPosition)?.first ?: -1)
                     .apply()
@@ -947,9 +1009,6 @@ class MainActivity : AppCompatActivity() {
                 val n = nameEdit.text.toString().trim()
                 if (n.isNotEmpty()) t.text = "Мажорный лад — $n"
                 audio?.let { applyDevices(it) }
-                // У ученика порт ещё и в окошке на главном экране.
-                (findViewById<View>(R.id.editPort) as? EditText)
-                    ?.setText((newPort ?: Proto.APP_PORT).toString())
                 if (isTeacher) {
                     // Кабинет слушает порт с запуска — переоткрываем его,
                     // иначе новый порт начнёт работать только после
@@ -966,6 +1025,77 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("Отмена", null)
             .show()
+    }
+
+    // ---- лог ----
+
+    private fun logDir(): File = File(filesDir, "logs")
+
+    /** Начать запись: в начало файла идёт всё, что важно для разбора звука. */
+    private fun startRunLog(): File? {
+        val ip = prefs.getString("ownAddress", "").orEmpty().trim()
+            .ifEmpty { ownWifiAddress().orEmpty() }
+        val mic = audio?.let { if (it.micOn) "включён" else "выключен" } ?: "нет звука"
+        val header = buildString {
+            append("Мажорный лад ")
+            append(BuildConfig.VERSION_NAME)
+            append(if (BuildConfig.IS_TEACHER) ", преподаватель" else ", ученик")
+            append(", Android ")
+            append(Build.VERSION.RELEASE)
+            append(" (API ")
+            append(Build.VERSION.SDK_INT)
+            append(")")
+            append(", ")
+            append(Build.MANUFACTURER)
+            append(" ")
+            append(Build.MODEL)
+            append(", имя: ")
+            append(prefs.getString("name", "").orEmpty().ifEmpty { "не задано" })
+            append(", адрес: ")
+            append(ip.ifEmpty { "неизвестен" })
+            append(":")
+            append(savedPort())
+            append(", микрофон: ")
+            append(mic)
+            append(", собеседник: ")
+            append(if (connected) "есть" else "нет")
+        }
+        val file = RunLog.start(logDir(), header)
+        RunLog.write("ui", "запись лога начата")
+        return file
+    }
+
+    private fun stopRunLog() {
+        RunLog.write("ui", "запись лога остановлена из настроек")
+        RunLog.stop()
+    }
+
+    /** Отправить файл во внешнюю программу — обычно в Telegram преподавателю. */
+    private fun shareRunLog() {
+        RunLog.flush()
+        val file = RunLog.current() ?: RunLog.lastFile(logDir())
+        if (file == null || !file.exists()) {
+            setStatus("Логов пока нет. Сначала нажмите «Начать запись»")
+            return
+        }
+        val uri = try {
+            FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        } catch (_: Exception) {
+            setStatus("Не удалось подготовить файл лога к отправке")
+            return
+        }
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, "Лог Мажорного лада: ${file.name}")
+            putExtra(Intent.EXTRA_TEXT, "Лог работы «Мажорного лада» за занятие.")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(Intent.createChooser(send, "Отправить лог"))
+        } catch (_: Exception) {
+            setStatus("На телефоне нет программы, которой можно отправить файл")
+        }
     }
 
     private fun audioDevices(): Pair<List<Pair<Int, String>>, List<Pair<Int, String>>> {
@@ -1043,14 +1173,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setStatus(text: String) {
+        // Всё, что видно на экране, попадает и в лог: по нему видно порядок
+        // событий занятия.
+        RunLog.write("status", text)
         handler.post {
             statusText?.text = text
-            statusText?.announceForAccessibility(text)
+            speakNow(text)
         }
     }
 
     private fun announce(text: String) {
-        handler.post { statusText?.announceForAccessibility(text) }
+        handler.post { speakNow(text) }
+    }
+
+    /**
+     * Объявление вслух. Говорим от корня окна, а не от строки состояния:
+     * домашняя страница скрыта, когда открыта другая вкладка, а сообщение
+     * должно прозвучать с любой из них.
+     */
+    private fun speakNow(text: String) {
+        findViewById<View>(android.R.id.content)?.announceForAccessibility(text)
     }
 
     private fun askPermissions() {

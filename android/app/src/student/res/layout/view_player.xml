@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Версия для ученика: перемотка и играть — картинками.
-     ⏪ назад, ▶ играть / ⏹ стоп, ⏩ вперёд. -->
+<!-- Версия для ученика: кнопки с подписями, как у преподавателя. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -69,40 +68,31 @@
         <Button
             android:id="@+id/btnBack"
             android:layout_width="0dp"
-            android:layout_height="80dp"
+            android:layout_height="60dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_pic_off"
             android:contentDescription="Перемотка назад"
-            android:minWidth="0dp"
-            android:text="⏪"
-            android:textColor="#ffffff"
-            android:textSize="26sp" />
+            android:text="Назад"
+            android:textSize="16sp" />
 
         <Button
             android:id="@+id/btnPlay"
             android:layout_width="0dp"
-            android:layout_height="80dp"
+            android:layout_height="60dp"
             android:layout_marginStart="8dp"
             android:layout_marginEnd="8dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_pic_off"
             android:contentDescription="Играть"
-            android:minWidth="0dp"
-            android:text="▶"
-            android:textColor="#ffffff"
-            android:textSize="26sp" />
+            android:text="Играть"
+            android:textSize="16sp" />
 
         <Button
             android:id="@+id/btnForward"
             android:layout_width="0dp"
-            android:layout_height="80dp"
+            android:layout_height="60dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_pic_off"
             android:contentDescription="Перемотка вперёд"
-            android:minWidth="0dp"
-            android:text="⏩"
-            android:textColor="#ffffff"
-            android:textSize="26sp" />
+            android:text="Вперёд"
+            android:textSize="16sp" />
     </LinearLayout>
 
     <SeekBar
