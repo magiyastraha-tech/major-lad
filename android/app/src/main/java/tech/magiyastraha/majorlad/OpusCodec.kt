@@ -141,7 +141,7 @@ object OpusSupport {
         val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
         val infos = list.codecInfos
         val preferred = listOf("c2.android.opus.decoder", "OMX.google.opus.decoder")
-        preferred.firstOrNull { name -> infos.any { it.isDecoder && it.name == name } }
+        preferred.firstOrNull { name -> infos.any { !it.isEncoder && it.name == name } }
             ?: list.findDecoderForFormat(format)
     } catch (_: Exception) {
         null

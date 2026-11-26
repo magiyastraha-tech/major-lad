@@ -71,54 +71,56 @@ object AacSupport {
         decoderBroken = true
     }
 
-    private fun probeDecode(): Boolean = try {
-        val format = MediaFormat.createAudioFormat(MIME, AudioEngine.SAMPLE_RATE, 1).apply {
-            setByteBuffer("csd-0", ByteBuffer.wrap(ASC_MONO))
-        }
-        val name = softwareDecoderName()
-        val c = if (name != null) {
-            MediaCodec.createByCodecName(name)
-        } else {
-            MediaCodec.createDecoderByType(MIME)
-        }
-        try {
-            c.configure(format, null, null, 0)
-            c.start()
-            val info = MediaCodec.BufferInfo()
-            var queued = false
-            val deadline = System.currentTimeMillis() + 500
-            while (System.currentTimeMillis() < deadline) {
-                if (!queued) {
-                    val i = c.dequeueInputBuffer(5_000)
-                    if (i >= 0) {
-                        val buf = c.getInputBuffer(i) ?: return false
-                        buf.clear()
-                        buf.put(PROBE_FRAME)
-                        c.queueInputBuffer(i, 0, PROBE_FRAME.size, 0, 0)
-                        queued = true
-                    }
-                } else {
-                    val o = c.dequeueOutputBuffer(info, 5_000)
-                    if (o >= 0) {
-                        c.releaseOutputBuffer(o, false)
-                        return true
+    private fun probeDecode(): Boolean {
+        return try {
+            val format = MediaFormat.createAudioFormat(MIME, AudioEngine.SAMPLE_RATE, 1).apply {
+                setByteBuffer("csd-0", ByteBuffer.wrap(ASC_MONO))
+            }
+            val name = softwareDecoderName()
+            val c = if (name != null) {
+                MediaCodec.createByCodecName(name)
+            } else {
+                MediaCodec.createDecoderByType(MIME)
+            }
+            try {
+                c.configure(format, null, null, 0)
+                c.start()
+                val info = MediaCodec.BufferInfo()
+                var queued = false
+                val deadline = System.currentTimeMillis() + 500
+                while (System.currentTimeMillis() < deadline) {
+                    if (!queued) {
+                        val i = c.dequeueInputBuffer(5_000)
+                        if (i >= 0) {
+                            val buf = c.getInputBuffer(i) ?: return false
+                            buf.clear()
+                            buf.put(PROBE_FRAME)
+                            c.queueInputBuffer(i, 0, PROBE_FRAME.size, 0, 0)
+                            queued = true
+                        }
+                    } else {
+                        val o = c.dequeueOutputBuffer(info, 5_000)
+                        if (o >= 0) {
+                            c.releaseOutputBuffer(o, false)
+                            return true
+                        }
                     }
                 }
+                false
+            } finally {
+                try {
+                    c.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    c.release()
+                } catch (_: Exception) {
+                }
             }
+        } catch (e: Exception) {
+            RunLog.write("audio", "AAC: проба декодера не прошла: ${e.message}")
             false
-        } finally {
-            try {
-                c.stop()
-            } catch (_: Exception) {
-            }
-            try {
-                c.release()
-            } catch (_: Exception) {
-            }
         }
-    } catch (e: Exception) {
-        RunLog.write("audio", "AAC: проба декодера не прошла: ${e.message}")
-        false
     }
 
     /** Штатный софтверный декодер AOSP надёжнее вендорского. */
@@ -127,7 +129,7 @@ object AacSupport {
         val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
         val infos = list.codecInfos
         val preferred = listOf("c2.android.aac.decoder", "OMX.google.aac.decoder")
-        preferred.firstOrNull { name -> infos.any { it.isDecoder && it.name == name } }
+        preferred.firstOrNull { name -> infos.any { !it.isEncoder && it.name == name } }
             ?: list.findDecoderForFormat(format)
     } catch (_: Exception) {
         null
