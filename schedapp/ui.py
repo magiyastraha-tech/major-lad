@@ -172,12 +172,10 @@ class StudentDialog(QDialog):
         first, last = split_name(student.name if student else "")
         self.first_name = QLineEdit(first)
         self.first_name.setAccessibleName("Имя")
-        self.first_name.setPlaceholderText("Андрей")
         form.addRow("Имя", self.first_name)
 
         self.last_name = QLineEdit(last)
         self.last_name.setAccessibleName("Фамилия")
-        self.last_name.setPlaceholderText("Булкин")
         form.addRow("Фамилия", self.last_name)
 
         self.phone = QLineEdit(student.phone if student else "")
@@ -331,12 +329,18 @@ class LessonPayDialog(QDialog):
 
 
 class AddDateDialog(QDialog):
-    """Один урок на выбранный день: день, час, минуты."""
+    """Урок на выбранный день: день, час, минуты.
+
+    Галочка «Двойной урок» ставит второй урок подряд, через столько же
+    времени, сколько длится один урок в программе.
+    """
 
     def __init__(self, store: Store, student: data.Student, parent=None):
         super().__init__(parent)
         self.store = store
         self.student = student
+        self.day_value: date | None = None
+        self.times: list[str] = []
         self.setWindowTitle("Добавить дату урока")
         self.setMinimumWidth(440)
         lay = QVBoxLayout(self)
@@ -372,6 +376,9 @@ class AddDateDialog(QDialog):
         form.addRow("Время", row)
         lay.addLayout(form)
 
+        self.double = QCheckBox("Двойной урок, два урока подряд")
+        lay.addWidget(self.double)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Добавить дату")
@@ -382,11 +389,19 @@ class AddDateDialog(QDialog):
 
     def _add(self) -> None:
         day = self.day.currentData()
-        time = dates.fmt_time(self.hour.value(), int(self.minute.currentText()))
-        self.store.add_lesson(
-            self.student.name, day, time,
-            lesson_format=self.student.lesson_format,
-            direction=self.student.direction)
+        hour = self.hour.value()
+        minute = int(self.minute.currentText())
+        first = datetime(day.year, day.month, day.day, hour, minute)
+        moments = [first]
+        if self.double.isChecked():
+            moments.append(first + LESSON_LENGTH)
+        self.day_value = day
+        self.times = [dates.fmt_time(m.hour, m.minute) for m in moments]
+        for moment, time in zip(moments, self.times):
+            self.store.add_lesson(
+                self.student.name, moment.date(), time,
+                lesson_format=self.student.lesson_format,
+                direction=self.student.direction)
         self.accept()
 
 
@@ -1829,6 +1844,11 @@ class StudentCard(QDialog):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             announce(self, "Дата не добавлена.")
             return
+        if len(dialog.times) > 1:
+            when = dates.human_date(dialog.day_value)
+            self._done(f"Двойной урок добавлен. {when}, "
+                       f"{' и '.join(dialog.times)}.")
+            return
         near = self.store.nearest_lesson(self.student.name)
         when = (f"{dates.human_date(near.day)} в {near.time}"
                 if near else "")
@@ -2727,9 +2747,6 @@ class MainWindow(QMainWindow):
         # когда ученик пришёл раньше или чуть позже. От нажатия
         # отсчитываются подсказки времени и вопрос о конце урока.
         self.start_button = QPushButton("Начать урок")
-        self.start_button.setAccessibleName(
-            "Начать урок для выбранного ученика: отсчёт подсказок времени "
-            "и конца урока пойдёт от нажатия")
         self.start_button.clicked.connect(
             lambda _checked=False: self.start_lesson())
         row.addWidget(self.start_button)
@@ -2743,9 +2760,6 @@ class MainWindow(QMainWindow):
         self.cues_button.clicked.connect(self.toggle_cues)
         row.addWidget(self.cues_button)
         self.block_button = QPushButton("Добавить исключение уроков")
-        self.block_button.setAccessibleName(
-            "Добавить исключение уроков: день или часы, когда уроков не "
-            "будет вовсе")
         self.block_button.clicked.connect(
             lambda _checked=False: self.add_exception())
         row.addWidget(self.block_button)
@@ -2772,16 +2786,10 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         trial_button = QPushButton("Добавить пробный урок")
-        trial_button.setAccessibleName(
-            "Добавить пробный урок: ученик, дата, очно или онлайн, "
-            "направление")
         trial_button.clicked.connect(
             lambda _checked=False: self.add_trial_lesson())
         row.addWidget(trial_button)
         single_button = QPushButton("Добавить разовый урок")
-        single_button.setAccessibleName(
-            "Добавить разовый урок: ученик, дата, очно или онлайн, "
-            "направление и цена")
         single_button.clicked.connect(
             lambda _checked=False: self.add_single_lesson())
         row.addWidget(single_button)
@@ -3185,16 +3193,10 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         if one_off:
             trial_button = QPushButton("Добавить пробный урок")
-            trial_button.setAccessibleName(
-                "Добавить пробный урок: ученик, дата, очно или онлайн, "
-                "направление")
             trial_button.clicked.connect(
                 lambda _checked=False: self.add_trial_lesson())
             row.addWidget(trial_button)
             single_button = QPushButton("Добавить разовый урок")
-            single_button.setAccessibleName(
-                "Добавить разовый урок: ученик, дата, очно или онлайн, "
-                "направление и цена")
             single_button.clicked.connect(
                 lambda _checked=False: self.add_single_lesson())
             row.addWidget(single_button)
@@ -3207,9 +3209,6 @@ class MainWindow(QMainWindow):
         done_button = QPushButton(
             "Отметить урок проведённым" if one_off
             else "Добавить проведённый урок")
-        if one_off:
-            done_button.setAccessibleName(
-                "Отметить выбранный разовый или пробный урок проведённым")
         done_button.clicked.connect(
             lambda _checked=False: self.add_done_lesson())
         row.addWidget(done_button)
@@ -3354,15 +3353,12 @@ class MainWindow(QMainWindow):
         announce(self, f"Списки разложены {self.order_words()}.")
 
     def _update_order_buttons(self) -> None:
-        """Кнопка называет текущий порядок; диктор скажет, что изменится."""
+        """Кнопка называет текущий порядок списков."""
         text = "Порядок: " + self.ORDER_SHORT.get(
             self.subs_order, self.ORDER_SHORT[settings.SUBS_ORDER_DATE])
-        name = (f"Списки разложены {self.order_words()}. Нажми, чтобы "
-                f"разложить {self.ORDER_SHORT[self.next_order()]}")
         for button in (self.active_order_button, self.finished_order_button,
                        self.one_off_order_button, self.future_order_button):
             button.setText(text)
-            button.setAccessibleName(name)
 
     def open_sub_card(self, item: QListWidgetItem) -> None:
         """Из списка абонементов — в карточку его ученика."""
@@ -3387,6 +3383,8 @@ class MainWindow(QMainWindow):
             lst = self.finished_subs_list
         elif page is self.one_off_subs_page:
             lst = self.one_off_subs_list
+        elif page is self.future_subs_page:
+            lst = self.future_subs_list
         else:
             return None
         item = lst.currentItem()
@@ -3395,10 +3393,67 @@ class MainWindow(QMainWindow):
         return self.store.subscription_by_uid(
             item.data(Qt.ItemDataRole.UserRole))
 
+    def person_lessons(self) -> tuple[str | None, list]:
+        """Уроки того, на кого стоит выбор: ученика или абонемента.
+
+        В списке учеников — все уроки выбранного ученика, в абонементах —
+        уроки выбранной записи. Имя None — выбор ни на ком не стоит.
+        """
+        page = self.tabs.currentWidget()
+        if page is self.students_page:
+            student = self.selected_student()
+            if student is None:
+                return None, []
+            return (student.name,
+                    [l for l in self.store.lessons
+                     if l.student == student.name])
+        sub = self.selected_subscription()
+        if sub is None:
+            return None, []
+        return sub.student, self.store.subscription_lessons(sub)
+
+    @staticmethod
+    def _lesson_days(lessons) -> str:
+        """«3 ноября вторник, 6 ноября пятница» — без лишней запятой."""
+        days = sorted({lesson.day for lesson in lessons})
+        return ", ".join(
+            f"{d.day} {dates.MONTHS[d.month - 1]} {dates.WEEKDAYS[d.weekday()]}"
+            for d in days)
+
+    def speak_past_lessons(self) -> None:
+        """F7: прошедшие уроки выбранного ученика или абонемента."""
+        name, lessons = self.person_lessons()
+        if name is None:
+            announce(self, "Ничего не выбрано.", assertive=True)
+            return
+        past = [l for l in lessons if l.status == LESSON_DONE]
+        if not past:
+            announce(self, "Прошедших уроков нет.", assertive=True)
+            return
+        announce(self, f"Прошедшие уроки, {self._lesson_days(past)}.",
+                 assertive=True)
+
+    def speak_planned_lessons(self) -> None:
+        """F8: запланированные уроки выбранного ученика или абонемента."""
+        name, lessons = self.person_lessons()
+        if name is None:
+            announce(self, "Ничего не выбрано.", assertive=True)
+            return
+        planned = [l for l in lessons if l.status == LESSON_WAIT]
+        sub = self.selected_subscription()
+        if not planned:
+            if sub is not None and sub.finished:
+                announce(self, "Все уроки проведены.", assertive=True)
+            else:
+                announce(self, "Запланированных уроков нет.", assertive=True)
+            return
+        announce(self, f"Запланированные уроки, "
+                       f"{self._lesson_days(planned)}.", assertive=True)
+
     def select_subscription(self, sub: data.Subscription) -> None:
         """Поставить выбор на запись в том списке, где она лежит."""
         for lst in (self.active_subs_list, self.finished_subs_list,
-                    self.one_off_subs_list):
+                    self.one_off_subs_list, self.future_subs_list):
             for row in range(lst.count()):
                 item = lst.item(row)
                 if item.data(Qt.ItemDataRole.UserRole) == sub.uid:
@@ -3947,86 +4002,19 @@ class MainWindow(QMainWindow):
     # --- клавиши и настройки ---------------------------------------------
 
     def update_hints(self) -> None:
-        """Подсказки и кнопки называют те клавиши, что стоят сейчас."""
-        pieces = []
-        for code, title, _keys in settings.ACTIONS:
-            keys = norm_keys(self.bindings.get(code, ""))
-            if keys:
-                pieces.append(f"{keys} — {title.casefold()}")
-        tail = " ".join(pieces)
-        tab_keys = norm_keys(self.bindings.get("tab_students", ""))
-        tab_tip = (f"Вкладки переключаются сочетанием {tab_keys} и дальше "
-                   "по цифрам по порядку. " if tab_keys else "")
+        """Кнопки называют свои клавиши; длинных подсказок внизу нет.
+
+        Всё на экране и так подписано, диктор читает название элемента.
+        Абзацы под списками он читал поверх этого и только путал.
+        """
+        for hint in (self.students_hint, self.schedule_hint,
+                     self.active_subs_hint, self.finished_subs_hint,
+                     self.future_subs_hint, self.one_off_subs_hint,
+                     self.services_hint, self.blocks_hint):
+            hint.setText("")
         start_keys = norm_keys(self.bindings.get("start", ""))
-        start_tip = (f"{start_keys} — начать урок. " if start_keys else "")
-        self.students_hint.setText(
-            "Стрелки вверх и вниз — переход по ученикам. " + tab_tip
-            + start_tip
-            + "Урок начинается сам по расписанию; кнопка «Начать урок» — "
-            "если ученик пришёл раньше или чуть позже. " + tail)
         self.start_button.setText(
             f"Начать урок ({start_keys})" if start_keys else "Начать урок")
-        self.schedule_hint.setText(
-            "Стрелки вверх и вниз — уроки по порядку. Кнопки под списком "
-            "и меню по правому щелчку или клавише «Меню» добавляют "
-            "пробный или разовый урок, которого в расписании ещё не "
-            "было. Правый щелчок или клавиша «Меню» на уроке открывают "
-            "меню урока: редактировать — перенести один урок на любую "
-            "дату, перенести — увести урок в конец графика на привычный "
-            "день занятий ученика, отметить урок проведённым, открыть "
-            "карточку ученика, удалить. Двойной щелчок открывает "
-            "карточку ученика. " + tail)
-        sub_keys = norm_keys(self.bindings.get("subexport", ""))
-        sub_tip = (f"{sub_keys} — выгрузить выбранный абонемент "
-                   f"в текстовый файл." if sub_keys
-                   else "Выгрузка абонемента в текстовый файл без клавиши.")
-        sub_menu = ("Кнопки под списком и меню по правому щелчку или "
-                    "клавише «Меню»: добавить абонемент, отметить "
-                    "проведённый урок в выбранном абонементе, "
-                    "редактировать, удалить. Выгрузить можно из меню.")
-        order = f"Сейчас — {self.order_words()}. "
-        self.active_subs_hint.setText(
-            "Все действующие абонементы. " + order + sub_tip + " "
-            + sub_menu + " Кнопка «Порядок» переключает раскладку: по "
-            "дате добавления, по алфавиту, по дате покупки и по дню "
-            "первого урока.")
-        self.finished_subs_hint.setText(
-            "Все законченные абонементы. Пробные и разовые уроки — на "
-            "отдельной вкладке «Разовые и пробные уроки». " + order
-            + sub_tip + " " + sub_menu + " Кнопка «Порядок» переключает "
-            "раскладку: по дате добавления, по алфавиту, по дате покупки "
-            "и по дню первого урока.")
-        self.future_subs_hint.setText(
-            "Абонементы, купленные заранее. Когда действующий закончится, "
-            "самый ранний из них станет действующим, а эта вкладка "
-            "спрячется. " + order + sub_tip + " " + sub_menu)
-        one_off_menu = ("Кнопки под списком и меню по правому щелчку или "
-                        "клавише «Меню»: добавить пробный или разовый "
-                        "урок, отметить урок проведённым, редактировать, "
-                        "удалить. Выгрузить можно из меню.")
-        self.one_off_subs_hint.setText(
-            "Все пробные и разовые уроки. " + order
-            + "Пробный или разовый урок добавляется кнопками «Добавить "
-            "пробный урок» и «Добавить разовый урок» здесь или на "
-            "вкладке «Расписание»: ученик, дата, очно или онлайн, "
-            "направление, у разового ещё цена. " + sub_tip + " "
-            + one_off_menu + " Двойной щелчок открывает карточку "
-            "ученика. Кнопка «Порядок» переключает раскладку: по дате "
-            "добавления, по алфавиту, по дате покупки и по дню первого "
-            "урока.")
-        self.services_hint.setText(
-            "Оплаченные услуги, новые сверху. Кнопки под списком и меню по "
-            "правому щелчку или клавише «Меню»: добавить, редактировать, "
-            "удалить услугу. Двойной щелчок открывает карточку ученика. "
-            "За три дня и за день до конца аренды гитары или гарантии на "
-            "настройку программа напомнит об этом вслух.")
-        self.blocks_hint.setText(
-            "Дни и часы, когда уроков нет: уехал, заболел, день рождения. "
-            "«Добавить день» закрывает день целиком, «Добавить время» — "
-            "промежуток, например с 12:00 до 16:00. Записаться на это "
-            "время будет нельзя, а причину ученик не увидит. Кнопка "
-            "«Удалить исключение» убирает выбранную запись из списка. "
-            "Стрелки вверх и вниз — переход по списку.")
         card_keys = norm_keys(self.bindings.get("card", ""))
         self.card_button.setText(
             f"Карточка ученика ({card_keys})" if card_keys
@@ -4039,16 +4027,9 @@ class MainWindow(QMainWindow):
 
     def update_cues_button(self) -> None:
         """Кнопка называет своё состояние словами — диктор прочитает его."""
-        if self.cues:
-            text = "Подсказки времени: включены"
-            name = ("Звуковые подсказки времени урока включены. Нажми, "
-                    "чтобы выключить")
-        else:
-            text = "Подсказки времени: выключены"
-            name = ("Звуковые подсказки времени урока выключены. Нажми, "
-                    "чтобы включить")
+        text = ("Подсказки времени: включены" if self.cues
+                else "Подсказки времени: выключены")
         self.cues_button.setText(text)
-        self.cues_button.setAccessibleName(name)
 
     def install_shortcuts(self) -> None:
         """Собрать горячие клавиши заново по текущим настройкам.
@@ -4356,6 +4337,10 @@ class MainWindow(QMainWindow):
             self.export_text()
         elif action == "subexport":
             self.export_subscription()
+        elif action == "past_lessons":
+            self.speak_past_lessons()
+        elif action == "planned_lessons":
+            self.speak_planned_lessons()
         elif action == "settings":
             self.open_settings()
         # Кнопки на вкладках — то же самое, что щелчок по кнопке.
@@ -4497,8 +4482,11 @@ class MainWindow(QMainWindow):
         Всё, что не подтвердили, остаётся на вкладке «Уведомления».
         """
         announce(self, text, assertive=True)
+        # Сообщение трея — только когда окно не на экране. Иначе диктор
+        # читал одно и то же дважды: объявление и всплывающую подсказку.
         tray = getattr(self, "tray", None)
-        if tray is not None and tray.isVisible():
+        hidden = self.isMinimized() or not self.isVisible()
+        if tray is not None and tray.isVisible() and hidden:
             tray.showMessage("Мажорный лад Расписание", text,
                              QSystemTrayIcon.MessageIcon.Information, 8000)
         self.refresh_notifications()
@@ -4564,26 +4552,19 @@ class MainWindow(QMainWindow):
         self.blocks_hint.setWordWrap(True)
         lay.addWidget(self.blocks_hint)
         self.blocks_list = QListWidget()
-        self.blocks_list.setAccessibleName(
-            "Исключения: дни и часы, когда уроков нет")
+        self.blocks_list.setAccessibleName("Исключения")
         lay.addWidget(self.blocks_list, 1)
 
         row = QHBoxLayout()
         self.block_day_button = QPushButton("Добавить день")
-        self.block_day_button.setAccessibleName(
-            "Добавить день, в который уроков не будет")
         self.block_day_button.clicked.connect(
             lambda _checked=False: self.add_block_day())
         row.addWidget(self.block_day_button)
         self.block_time_button = QPushButton("Добавить время")
-        self.block_time_button.setAccessibleName(
-            "Добавить промежуток времени, в который уроков не будет")
         self.block_time_button.clicked.connect(
             lambda _checked=False: self.add_block_time())
         row.addWidget(self.block_time_button)
         self.block_remove_button = QPushButton("Удалить исключение")
-        self.block_remove_button.setAccessibleName(
-            "Удалить выбранное исключение — записаться снова станет можно")
         self.block_remove_button.clicked.connect(
             lambda _checked=False: self.remove_block())
         row.addWidget(self.block_remove_button)
@@ -4702,13 +4683,10 @@ class MainWindow(QMainWindow):
         self.notifications_hint.setWordWrap(True)
         lay.addWidget(self.notifications_hint)
         self.notifications_list = QListWidget()
-        self.notifications_list.setAccessibleName(
-            "Список неподтверждённых уведомлений")
+        self.notifications_list.setAccessibleName("Уведомления")
         lay.addWidget(self.notifications_list, 1)
         row = QHBoxLayout()
         self.confirm_button = QPushButton("Подтвердить")
-        self.confirm_button.setAccessibleName(
-            "Подтвердить выбранное уведомление — оно исчезнет из списка")
         self.confirm_button.clicked.connect(
             lambda _checked=False: self.confirm_notification())
         row.addWidget(self.confirm_button)
@@ -4798,14 +4776,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(
             index, "Уведомления" if not pending
             else f"Уведомления ({len(pending)})")
-        if pending:
-            self.notifications_hint.setText(
-                "Здесь всё, что ещё не подтверждено: напоминания об "
-                "уроках, вопросы о конце урока и сроки услуг. Выбери "
-                "строку и нажми «Подтвердить» — она исчезнет.")
-        else:
-            self.notifications_hint.setText(
-                "Неподтверждённых уведомлений нет.")
+        self.notifications_hint.setText("")
         self.update_tab_visibility()
 
     def confirm_notification(self) -> None:
@@ -4883,8 +4854,8 @@ class MainWindow(QMainWindow):
         self._cue_done.clear()
         self.refresh_notifications()
         announce(self, f"Сейчас {now:%H:%M}. Урок начат. {student.name}, "
-                       f"по расписанию в {lesson.time}. Через сорок минут "
-                       f"спрошу, прошёл ли урок.", assertive=True)
+                       f"по расписанию в {lesson.time}. Через сорок пять "
+                       f"минут спрошу, прошёл ли урок.", assertive=True)
 
     # --- трей -------------------------------------------------------------
 
