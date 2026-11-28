@@ -118,10 +118,10 @@ DEFAULTS = {
         "beats": 4,
     },
     "video": {
-        # Видео по умолчанию — по роли: у преподавателя включено (он
-        # показывает, что играет), у ученика выключено (ему нужно
-        # смотреть). Ставится в main.py, когда роль уже известна.
+        # Видео идёт в обе стороны. Ученик может отключить его целиком
+        # галочкой «Отключить видео»: тогда кнопки камеры у него нет.
         "enabled": False,
+        "disabled": False,
         "camera": 0,
         "fps": 20,
         "quality": 60,
@@ -380,6 +380,15 @@ def load() -> dict:
         elif role == "student":
             cfg.setdefault("video", {})["enabled"] = False
         cfg["settings_version"] = 12
+    # 0.7.4: видео снова в обе стороны — камера есть и у ученика. Прежние
+    # миграции гасили её у ученика; включаем один раз. Отключить целиком
+    # можно галочкой «Отключить видео» в настройках — тогда кнопки камеры
+    # нет вовсе.
+    if int(cfg.get("settings_version", 1) or 1) < 13:
+        video = cfg.setdefault("video", {})
+        video["enabled"] = True
+        video.setdefault("disabled", False)
+        cfg["settings_version"] = 13
     return cfg
 
 

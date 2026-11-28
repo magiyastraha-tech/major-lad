@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Версия для ученика: кнопки с обычными подписями, как у преподавателя.
-     Картинки-значки убраны: подпись понятнее и читается вслух. -->
+     Картинки-значки убраны: подпись понятнее и читается вслух.
+     Видео в обе стороны: у ученика тоже есть кнопка камеры. Если в
+     настройках включено «Отключить видео», кнопка камеры не показывается. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -83,16 +85,32 @@
             android:id="@+id/btnMic"
             android:layout_width="0dp"
             android:layout_height="72dp"
+            android:layout_marginEnd="8dp"
             android:layout_weight="1"
             android:contentDescription="Микрофон выключен"
             android:text="Звук\nвыкл"
             android:textSize="16sp" />
 
         <Button
+            android:id="@+id/btnCamera"
+            android:layout_width="0dp"
+            android:layout_height="72dp"
+            android:layout_weight="1"
+            android:contentDescription="Камера выключена"
+            android:text="Камера\nвыкл"
+            android:textSize="16sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
+
+        <Button
             android:id="@+id/btnExpand"
             android:layout_width="0dp"
             android:layout_height="72dp"
-            android:layout_marginStart="8dp"
             android:layout_marginEnd="8dp"
             android:layout_weight="1"
             android:contentDescription="Развернуть видео на весь экран"

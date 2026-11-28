@@ -163,7 +163,28 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="Ваше видео передаётся ученику. У ученика камеры нет: видео от него не идёт."
+            android:text="Видео идёт в обе стороны: вы видите собеседника, а он видит вас."
+            android:textColor="#8f8f9c"
+            android:textSize="15sp" />
+
+        <!-- Только у ученика: отключает видео целиком и убирает кнопку
+             камеры с главного экрана. У преподавателя прячется в коде. -->
+        <CheckBox
+            android:id="@+id/boxVideoDisabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:contentDescription="Отключить видео и убрать кнопку камеры"
+            android:minHeight="48dp"
+            android:text="Отключить видео"
+            android:textSize="17sp" />
+
+        <TextView
+            android:id="@+id/videoDisabledNote"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Если включено, кнопки камеры не будет и видео от вас не пойдёт."
             android:textColor="#8f8f9c"
             android:textSize="15sp" />
 

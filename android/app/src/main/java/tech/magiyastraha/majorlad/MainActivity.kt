@@ -159,13 +159,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindViews() {
         statusText = findViewById(R.id.statusText)
-        // Разметка у версий разная: у ученика есть видео, у преподавателя —
-        // камера. Ищем по имени, чтобы версия без элемента не падала.
+        // Видео и камера есть в обеих версиях. Ищем по имени: так сборка
+        // не падает, если в какой-то версии элемента нет.
         videoView = findViewById(viewId("videoView"))
         videoHint = findViewById(viewId("videoHint"))
         btnMic = findViewById(R.id.btnMic)
         btnExpand = findViewById(viewId("btnExpand"))
-        // Кнопка камеры есть только у преподавателя — по имени.
         btnCamera = findViewById(viewId("btnCamera"))
         videoStatus = findViewById(viewId("videoStatus"))
         btnMetro = findViewById(R.id.btnMetro)
@@ -521,15 +520,22 @@ class MainActivity : AppCompatActivity() {
             text = if (micOn) "Микрофон\nвкл" else "Микрофон\nвыкл"
             contentDescription = if (micOn) "Микрофон включён" else "Микрофон выключен"
         }
-        // У преподавателя есть камера: его видео уходит ученику.
-        val camOn = isTeacher && videoWanted()
+        // Камера есть у обеих сторон, если ученик не отключил видео
+        // целиком в настройках.
+        val camOn = videoWanted()
         btnCamera?.apply {
+            visibility = if (videoDisabled()) View.GONE else View.VISIBLE
             text = if (camOn) "Камера\nвкл" else "Камера\nвыкл"
             contentDescription = if (camOn) "Камера включена" else "Камера выключена"
         }
-        videoStatus?.text =
-            if (camOn) "Камера включена. Видео уходит ученику"
-            else "Камера выключена"
+        videoStatus?.apply {
+            text = when {
+                videoDisabled() -> "Видео отключено в настройках"
+                camOn -> if (isTeacher) "Камера включена. Видео уходит ученику"
+                        else "Камера включена. Видео уходит преподавателю"
+                else -> "Камера выключена"
+            }
+        }
         btnMetro?.apply {
             text = if (metroOn) "Метроном\nвкл" else "Метроном\nвыкл"
             contentDescription = if (metroOn) "Метроном включён" else "Метроном выключен"
@@ -548,7 +554,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun expandVideo() {
-        if (isTeacher) return
         val box = findViewById<View>(R.id.fullVideoBox)
         val full = findViewById<ImageView>(R.id.fullVideo)
         if (box.visibility == View.VISIBLE) {
@@ -562,8 +567,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onFrame(bmp: Bitmap) {
-        // Преподаватель ученика не видит: видео идёт только к ученику.
-        if (isTeacher) return
         frameCounter++
         if (frameCounter % 2 != 0) return // телефону хватает половины кадров
         videoView?.setImageBitmap(bmp)
@@ -575,9 +578,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onVideoState(on: Boolean) {
-        // Старый ученик мог прислать видео — но преподавателю его видеть
-        // не нужно и нечем: экран ему не читается.
-        if (isTeacher) return
         if (!on) {
             clearVideo(if (isTeacher) "Ученик выключил видео" else "Преподаватель выключил видео")
         } else {
@@ -594,15 +594,18 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.fullVideoBox).visibility = View.GONE
     }
 
+    /** Ученик отключил видео целиком: камеры у него нет вовсе. */
+    private fun videoDisabled(): Boolean =
+        !isTeacher && prefs.getBoolean("videoDisabled", false)
+
     /**
-     * Видео отправляет только преподаватель: ученик должен видеть его.
-     * У ученика камеры нет — видео от ученика к преподавателю не идёт.
+     * Видео идёт в обе стороны. Ученик может отключить его галочкой в
+     * настройках — тогда отправка не идёт и кнопки камеры не видно.
      */
     private fun videoWanted(): Boolean =
-        isTeacher && prefs.getBoolean("videoOn", true)
+        !videoDisabled() && prefs.getBoolean("videoOn", true)
 
     private fun toggleCamera() {
-        if (!isTeacher) return
         val on = !videoWanted()
         setVideoSending(on)
         updateButtons()
@@ -610,7 +613,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCameraIfPossible() {
-        if (!isTeacher) return
         if (camera != null) return
         if (!videoWanted()) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -630,8 +632,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Переключить видео на ходу: кнопка камеры или настройки. */
     private fun setVideoSending(on: Boolean) {
-        // У ученика камеры нет: видео от него не отправляется.
-        if (!isTeacher) return
+        if (on && videoDisabled()) return
         prefs.edit().putBoolean("videoOn", on).apply()
         if (on) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -1032,16 +1033,18 @@ class MainActivity : AppCompatActivity() {
         micSpinner.setSelection(indexOfType(micDevices, prefs.getInt("micType", -1)))
         outSpinner.setSelection(indexOfType(outDevices, prefs.getInt("outType", -1)))
 
-        // Камера есть только у преподавателя: его видео уходит ученику.
-        // У ученика этого раздела нет вовсе — ему нечего отправлять.
-        val videoTitle = view.findViewById<View>(R.id.videoTitle)
-        val videoNote = view.findViewById<View>(R.id.videoNote)
+        // Видео идёт в обе стороны. У ученика есть ещё галочка «Отключить
+        // видео»: тогда отправки нет и кнопки камеры на главной не видно.
         val boxVideo = view.findViewById<CheckBox>(R.id.boxVideo)
-        boxVideo.isChecked = videoWanted()
-        if (!isTeacher) {
-            videoTitle.visibility = View.GONE
-            boxVideo.visibility = View.GONE
-            videoNote.visibility = View.GONE
+        val boxVideoDisabled = view.findViewById<CheckBox>(R.id.boxVideoDisabled)
+        val videoDisabledNote = view.findViewById<TextView>(R.id.videoDisabledNote)
+        boxVideo.isChecked = prefs.getBoolean("videoOn", true)
+        boxVideoDisabled.isChecked = videoDisabled()
+        if (isTeacher) {
+            // У преподавателя камера есть всегда: галочку и пояснение
+            // к ней не показываем.
+            boxVideoDisabled.visibility = View.GONE
+            videoDisabledNote.visibility = View.GONE
         }
 
         // Запись лога: включить, выключить, отправить файл в Telegram.
@@ -1093,8 +1096,14 @@ class MainActivity : AppCompatActivity() {
                     )
                     .putInt("micType", micDevices.getOrNull(micSpinner.selectedItemPosition)?.first ?: -1)
                     .putInt("outType", outDevices.getOrNull(outSpinner.selectedItemPosition)?.first ?: -1)
+                    .putBoolean(
+                        "videoDisabled",
+                        !isTeacher && boxVideoDisabled.isChecked
+                    )
                     .apply()
-                if (isTeacher && boxVideo.isChecked != videoWanted()) {
+                if (boxVideoDisabled.isChecked) {
+                    setVideoSending(false)
+                } else if (boxVideo.isChecked != prefs.getBoolean("videoOn", true)) {
                     setVideoSending(boxVideo.isChecked)
                 }
                 val t = findViewById<TextView>(R.id.headerTitle)

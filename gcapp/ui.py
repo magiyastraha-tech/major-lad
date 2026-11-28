@@ -1324,24 +1324,20 @@ class SettingsDialog(QDialog):
         self.show_remote_box.setAccessibleName("Показывать видео собеседника")
         form.addRow(self.show_remote_box)
 
-        if self.is_teacher:
-            # Преподаватель не видит экран: показывать ему видео
-            # собеседника незачем, а ученик его и не отправляет.
-            self.show_remote_box.setVisible(False)
-        else:
-            # У ученика камеры нет: видео идёт только от преподавателя
-            # к ученику. Из настроек убираем всё про отправку, оставляем
-            # только просмотр.
-            for widget in (self.video_box, self.cam_combo, self.fps_spin,
-                           self.quality_spin, self.video_width_spin,
-                           self.video_height_spin, self.video_bitrate_combo,
-                           self.video_codec_combo):
-                widget.setVisible(False)
-                label = form.labelForField(widget)
-                if label is not None:
-                    label.setVisible(False)
-            if mac_hint is not None:
-                mac_hint.setVisible(False)
+        # Видео с камеры идёт в обе стороны. Ученик может отказаться
+        # целиком: тогда кнопка камеры у него пропадает из нижней панели.
+        self.video_disabled_box: QCheckBox | None = None
+        if not self.is_teacher:
+            self.video_disabled_box = QCheckBox("Отключить видео")
+            self.video_disabled_box.setChecked(
+                bool(self.cfg["video"].get("disabled", False)))
+            self.video_disabled_box.setAccessibleName(
+                "Отключить видео и убрать кнопку камеры")
+            form.addRow(self.video_disabled_box)
+            hint = QLabel("Если включено, кнопки камеры не будет, "
+                          "и видео от вас не пойдёт.")
+            hint.setWordWrap(True)
+            form.addRow(hint)
 
         return page
 
@@ -1622,6 +1618,8 @@ class SettingsDialog(QDialog):
         cfg["video"]["bitrate"] = int(
             self.video_bitrate_combo.currentData() or 0)
         cfg["video"]["show_remote"] = self.show_remote_box.isChecked()
+        if self.video_disabled_box is not None:
+            cfg["video"]["disabled"] = self.video_disabled_box.isChecked()
 
         config.save(cfg)
         self.accept()
@@ -2004,15 +2002,13 @@ class MainWindow(QMainWindow):
         global _announcer
         _announcer = self.announcer
 
-        # Видео собеседника нужно только ученику: он смотрит, как играет
-        # преподаватель. Преподаватель не видит экран, а ученик видео не
-        # отправляет — показывать ему нечего.
+        # Видео собеседника видят обе стороны: картинка идёт в обе стороны.
         self.video_label = QLabel()
         self.video_label.setMinimumHeight(240)
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setAccessibleName("Видео преподавателя")
-        self.video_label.setVisible(bool(not self.is_teacher
-                                         and self.cfg["video"].get("show_remote", True)))
+        self.video_label.setAccessibleName("Видео собеседника")
+        self.video_label.setVisible(
+            bool(self.cfg["video"].get("show_remote", True)))
         layout.addWidget(self.video_label, 1)
         # Рядом с видео — кнопка «на весь экран»: ученику смотреть урок
         # в маленьком квадратике неудобно. Свёрнутая картинка остаётся
@@ -2248,17 +2244,15 @@ class MainWindow(QMainWindow):
         self.connect_button.setAccessibleName(self.connect_button.text())
         self.mic_button = QPushButton("Микрофон включён")
         self.mic_button.setAccessibleName("Микрофон включён")
-        # Камера есть только у преподавателя: его видео уходит ученику.
-        # У ученика кнопки камеры нет — видео от ученика к преподавателю
-        # не идёт.
-        self.cam_button: QPushButton | None = None
+        # Видео идёт в обе стороны: кнопка камеры есть у всех. Ученик
+        # может отключить видео в настройках — тогда кнопку прячем.
+        self.cam_button: QPushButton = QPushButton("Камера выключена")
+        self.cam_button.setAccessibleName("Камера выключена")
+        self.cam_button.setVisible(not self._video_disabled())
         bottom.addWidget(self.settings_button)
         bottom.addWidget(self.connect_button)
         bottom.addWidget(self.mic_button)
-        if self.is_teacher:
-            self.cam_button = QPushButton("Камера выключена")
-            self.cam_button.setAccessibleName("Камера выключена")
-            bottom.addWidget(self.cam_button)
+        bottom.addWidget(self.cam_button)
         bottom.addStretch(1)
         layout.addLayout(bottom)
 
@@ -2700,6 +2694,12 @@ class MainWindow(QMainWindow):
         # Новая сторона — новый видеопоток: прежний H.264 сюда не
         # продолжается, ждём ключевой кадр.
         self.reassembler.reset()
+        if not self.is_teacher:
+            # Ученик тоже отправляет видео, если оно не отключено
+            # в настройках.
+            if self.engine.running:
+                self._start_video()
+            return
         if self.is_teacher:
             # Если прошлый урок ещё не закрыт отдельным сигналом (ученика
             # заменили), фиксируем его до начала нового.
@@ -2779,10 +2779,13 @@ class MainWindow(QMainWindow):
                 self._start_video()
         return ok
 
+    def _video_disabled(self) -> bool:
+        """Ученик отключил видео в настройках: камеры у него нет."""
+        return bool(not self.is_teacher
+                    and self.cfg["video"].get("disabled", False))
+
     def _start_video(self, force: bool = False) -> bool:
-        # Видео отправляет только преподаватель. У ученика камеры нет:
-        # его видео к преподавателю не идёт.
-        if not self.is_teacher:
+        if self._video_disabled():
             return False
         if self.video_sender is not None:
             return True
@@ -2907,9 +2910,7 @@ class MainWindow(QMainWindow):
         announce(self.status_label, text)
 
     def _update_cam_button(self) -> None:
-        # У ученика кнопки камеры нет вовсе.
-        if self.cam_button is None:
-            return
+        self.cam_button.setVisible(not self._video_disabled())
         # На кнопке — состояние, а не действие: диктор, попав на неё,
         # сразу говорит, работает камера или нет. Больше ничего не
         # добавляем: лишний текст диктор читает поверх и мешает.
@@ -2921,7 +2922,7 @@ class MainWindow(QMainWindow):
         self.cam_button.setAccessibleName(text)
 
     def _toggle_camera(self) -> None:
-        if not self.is_teacher:
+        if self._video_disabled():
             return
         if self._cam_on or self.video_sender is not None:
             self._stop_video()
@@ -2939,9 +2940,6 @@ class MainWindow(QMainWindow):
 
     def _on_peer_video(self, on: bool) -> None:
         """Собеседник выключил камеру — убираем застывший кадр."""
-        # Преподаватель видео ученика не смотрит.
-        if self.is_teacher:
-            return
         if not on:
             self.video_label.clear()
             self.video_button.setVisible(False)
@@ -4448,10 +4446,6 @@ class MainWindow(QMainWindow):
     # -- видео --------------------------------------------------------------
 
     def _on_video_frame(self, image) -> None:
-        # Преподаватель не смотрит видео ученика: картинка ему не нужна,
-        # а ученик её и не отправляет.
-        if self.is_teacher:
-            return
         if not self.cfg["video"].get("show_remote", True):
             return
         self.video_label.setVisible(True)
@@ -4556,6 +4550,12 @@ class MainWindow(QMainWindow):
         self._apply_volumes()
         # Новые сочетания клавиш действуют сразу.
         self._apply_shortcuts()
+        # Ученик мог отключить видео: тогда кнопки камеры нет, а начатый
+        # поток прекращается и собеседник получает сигнал «камера погасла».
+        video_off_now = self._video_disabled()
+        if video_off_now and self.video_sender is not None:
+            self._stop_video()
+        self._update_cam_button()
         # Размер буфера — общий для обеих сторон обмена, перезапуск не нужен.
         self.engine.set_buffer_preset(
             str(self.cfg["audio"].get("buffer", "normal")))
@@ -4627,6 +4627,8 @@ class MainWindow(QMainWindow):
                 m=(audio.get("volumes", {}) or {}).get("metronome", ""),
                 p=(audio.get("volumes", {}) or {}).get("player", "")))
         message = "Настройки сохранены."
+        if video_off_now:
+            message += " Видео отключено, кнопки камеры нет."
         if devices_changed and self.engine.running:
             message += " Звук перезапущен с новыми устройствами."
         if appeared:

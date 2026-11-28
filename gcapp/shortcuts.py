@@ -60,10 +60,6 @@ BUTTON_ACTIONS = [
 # назначить на него сочетание.
 TEACHER_ONLY = ("join",)
 
-# Действия, которых нет у ученика: камера есть только у преподавателя,
-# его видео уходит ученику. У ученика камеры нет — сочетание ему незачем.
-STUDENT_ONLY_OFF = ("camera",)
-
 # Регуляторы громкости. Для каждого два действия: громче и тише.
 SLIDER_ACTIONS = [
     ("student", "Звук собеседника"),
@@ -111,8 +107,6 @@ def all_actions(is_teacher: bool) -> list[tuple[str, str]]:
     actions: list[tuple[str, str]] = []
     for action_id, title in BUTTON_ACTIONS:
         if is_teacher and action_id in TEACHER_ONLY:
-            continue
-        if not is_teacher and action_id in STUDENT_ONLY_OFF:
             continue
         actions.append((action_id, title))
     for key, _title in SLIDER_ACTIONS:

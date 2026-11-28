@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Версия для преподавателя: кнопки «звук» и «камера». Видео ученика
-     преподавателю не показывается — он его не видит, а картинка идёт
-     только в одну сторону: от преподавателя к ученику. -->
+<!-- Версия для преподавателя: видео в обе стороны — своё он отправляет,
+     видео ученика видит на экране. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -16,15 +15,39 @@
         android:textColor="#e6e6ef"
         android:textSize="17sp" />
 
-    <Space
+    <FrameLayout
+        android:id="@+id/videoBox"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1" />
+        android:layout_marginTop="10dp"
+        android:layout_weight="1"
+        android:background="#000000"
+        android:minHeight="140dp">
+
+        <ImageView
+            android:id="@+id/videoView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="Видео ученика"
+            android:scaleType="fitCenter" />
+
+        <TextView
+            android:id="@+id/videoHint"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:importantForAccessibility="no"
+            android:padding="12dp"
+            android:text="Видео ученика"
+            android:textColor="#8f8f9c"
+            android:textSize="15sp" />
+    </FrameLayout>
 
     <TextView
         android:id="@+id/videoStatus"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
         android:text="Камера выключена"
         android:textColor="#8f8f9c"
         android:textSize="15sp" />
@@ -39,21 +62,37 @@
             android:id="@+id/btnMic"
             android:layout_width="0dp"
             android:layout_height="72dp"
+            android:layout_marginEnd="8dp"
             android:layout_weight="1"
             android:contentDescription="Микрофон выключен"
-            android:text="Звук\nвыкл"
+            android:text="Микрофон\nвыкл"
             android:textSize="16sp" />
 
         <Button
             android:id="@+id/btnCamera"
             android:layout_width="0dp"
             android:layout_height="72dp"
-            android:layout_marginStart="8dp"
-            android:layout_marginEnd="8dp"
             android:layout_weight="1"
             android:contentDescription="Камера выключена"
             android:text="Камера\nвыкл"
             android:textSize="16sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnExpand"
+            android:layout_width="0dp"
+            android:layout_height="72dp"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1"
+            android:contentDescription="Развернуть видео на весь экран"
+            android:text="Видео\nна весь экран"
+            android:textSize="15sp" />
 
         <Button
             android:id="@+id/btnMetro"
