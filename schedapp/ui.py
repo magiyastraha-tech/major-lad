@@ -335,10 +335,12 @@ class AddDateDialog(QDialog):
     времени, сколько длится один урок в программе.
     """
 
-    def __init__(self, store: Store, student: data.Student, parent=None):
+    def __init__(self, store: Store, student: data.Student, parent=None,
+                 subscription: int = 0):
         super().__init__(parent)
         self.store = store
         self.student = student
+        self.subscription = int(subscription or 0)
         self.day_value: date | None = None
         self.times: list[str] = []
         self.setWindowTitle("Добавить дату урока")
@@ -401,7 +403,10 @@ class AddDateDialog(QDialog):
             self.store.add_lesson(
                 self.student.name, moment.date(), time,
                 lesson_format=self.student.lesson_format,
-                direction=self.student.direction)
+                direction=self.student.direction,
+                subscription=self.subscription)
+        if self.subscription:
+            self.store.promote_waiting(self.student.name)
         self.accept()
 
 
@@ -462,7 +467,8 @@ class WeekGrid(QWidget):
 
 def add_weekly_lessons(store: Store, student: data.Student,
                        picked: list[tuple[int, int, int]],
-                       first: date | None = None) -> int:
+                       first: date | None = None,
+                       subscription: int = 0) -> int:
     """Записать уроки по отмеченным дням недели на четыре недели вперёд.
 
     Начало — сегодня или первый день абонемента, если он позже. Уже
@@ -502,21 +508,25 @@ def add_weekly_lessons(store: Store, student: data.Student,
             store.lessons.append(data.Lesson(
                 uid=uid, day=lesson_day, time=time, student=student.name,
                 lesson_format=student.lesson_format,
-                direction=student.direction))
+                direction=student.direction,
+                subscription=int(subscription or 0)))
             uid += 1
             added += 1
     if added:
         store.save_lessons()
+        store.promote_waiting(student.name)
     return added
 
 
 class ScheduleDialog(QDialog):
     """Постоянное расписание: галочки по дням недели и время каждого дня."""
 
-    def __init__(self, store: Store, student: data.Student, parent=None):
+    def __init__(self, store: Store, student: data.Student, parent=None,
+                 subscription: int = 0):
         super().__init__(parent)
         self.store = store
         self.student = student
+        self.subscription = int(subscription or 0)
         self.added = 0
         self.setWindowTitle("Добавить расписание")
         self.setMinimumWidth(520)
@@ -542,7 +552,8 @@ class ScheduleDialog(QDialog):
         if not picked:
             announce(self, "Ни один день не отмечен. Поставь галочки на нужных днях.")
             return
-        self.added = add_weekly_lessons(self.store, self.student, picked)
+        self.added = add_weekly_lessons(self.store, self.student, picked,
+                                        subscription=self.subscription)
         self.accept()
 
 
@@ -580,10 +591,12 @@ class ScheduleEditDialog(QDialog):
     время, а программа перестраивает будущие уроки заново.
     """
 
-    def __init__(self, store: Store, student: data.Student, parent=None):
+    def __init__(self, store: Store, student: data.Student, parent=None,
+                 subscription: int = 0):
         super().__init__(parent)
         self.store = store
         self.student = student
+        self.subscription = int(subscription or 0)
         self.removed = 0
         self.added = 0
         self.setWindowTitle("Редактировать расписание")
@@ -623,8 +636,9 @@ class ScheduleEditDialog(QDialog):
                            "нужных днях или нажми «Отмена».")
             return
         self.removed = self.store.delete_future_waiting_lessons(
-            self.student.name)
-        self.added = add_weekly_lessons(self.store, self.student, picked)
+            self.student.name, subscription=self.subscription)
+        self.added = add_weekly_lessons(self.store, self.student, picked,
+                                        subscription=self.subscription)
         self.accept()
 
 
@@ -824,7 +838,8 @@ class SubscriptionDialog(QDialog):
                 # уже прошло, вперёд не записывается.
                 first = max(date.today(), self.subscription.begins)
                 self.schedule_added = add_weekly_lessons(
-                    self.store, self.student, picked, first=first)
+                    self.store, self.student, picked, first=first,
+                    subscription=self.subscription.uid)
             else:
                 self.schedule_empty = True
         self.accept()
@@ -1051,7 +1066,8 @@ class SubscriptionEditDialog(QDialog):
         if student is None:
             announce(self, "Ученик не найден в списке.", assertive=True)
             return
-        dialog = ScheduleEditDialog(self.store, student, self)
+        dialog = ScheduleEditDialog(self.store, student, self,
+                                    subscription=self.sub.uid)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         announce(
@@ -1238,6 +1254,56 @@ class LessonPickDialog(QDialog):
 
     def chosen(self) -> data.Lesson | None:
         return self.pick.currentData()
+
+
+class LessonListDialog(QDialog):
+    """Список уроков по датам — для клавиш F7 и F8.
+
+    По списку ходят стрелками вверх и вниз, Enter открывает урок на
+    правку. Строки читаются как «24 ноября вторник», время добавляется,
+    если оно у урока есть.
+    """
+
+    def __init__(self, lessons: list[data.Lesson], title: str, parent=None):
+        super().__init__(parent)
+        self.lessons = sorted(lessons, key=lambda l: (l.day, l.time))
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+
+        hint = QLabel("Выбери урок стрелками вверх и вниз и нажми Enter, "
+                      "чтобы открыть его на правку.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.list = QListWidget()
+        self.list.setAccessibleName(title)
+        for lesson in self.lessons:
+            day = lesson.day
+            when = (f"{day.day} {dates.MONTHS[day.month - 1]} "
+                    f"{dates.WEEKDAYS[day.weekday()]}")
+            if lesson.time:
+                when += f", {lesson.time}"
+            item = QListWidgetItem(when)
+            item.setData(Qt.ItemDataRole.UserRole, lesson)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        lay.addWidget(self.list)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Открыть")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.list.itemActivated.connect(lambda _item: self.accept())
+        self.list.setFocus()
+
+    def chosen(self) -> data.Lesson | None:
+        item = self.list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
 
 
 class LessonEditDialog(QDialog):
@@ -1840,7 +1906,9 @@ class StudentCard(QDialog):
         self._done(text)
 
     def add_date(self) -> None:
-        dialog = AddDateDialog(self.store, self.student, self)
+        sub = self.store.target_subscription(self.student.name)
+        dialog = AddDateDialog(self.store, self.student, self,
+                               subscription=sub.uid if sub else 0)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             announce(self, "Дата не добавлена.")
             return
@@ -1856,7 +1924,9 @@ class StudentCard(QDialog):
                    if when else "Дата добавлена.")
 
     def add_schedule(self) -> None:
-        dialog = ScheduleDialog(self.store, self.student, self)
+        sub = self.store.target_subscription(self.student.name)
+        dialog = ScheduleDialog(self.store, self.student, self,
+                                subscription=sub.uid if sub else 0)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             announce(self, "Расписание не добавлено.")
             return
@@ -3043,9 +3113,10 @@ class MainWindow(QMainWindow):
         self.select_uid(student.uid)
         self.open_card()
 
-    def edit_lesson_here(self, lesson: data.Lesson) -> None:
+    def edit_lesson_here(self, lesson: data.Lesson,
+                         allow_future: bool = True) -> None:
         """Перенести урок на другую дату или время из расписания."""
-        dialog = LessonEditDialog(lesson, self, allow_future=True)
+        dialog = LessonEditDialog(lesson, self, allow_future=allow_future)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             announce(self, "Урок не изменён.")
             return
@@ -3300,7 +3371,7 @@ class MainWindow(QMainWindow):
         """
         self._fill_subs(self.active_subs_list,
                         [s for s in self.store.subscriptions
-                         if not s.finished and not s.one_off])
+                         if not s.finished and not s.one_off and not s.future])
         self._fill_subs(self.finished_subs_list,
                         [s for s in self.store.subscriptions
                          if s.finished and not s.one_off])
@@ -3420,6 +3491,17 @@ class MainWindow(QMainWindow):
             f"{d.day} {dates.MONTHS[d.month - 1]} {dates.WEEKDAYS[d.weekday()]}"
             for d in days)
 
+    def open_lesson_list(self, lessons: list[data.Lesson], title: str,
+                         allow_future: bool) -> None:
+        """Список уроков стрелками, Enter — открыть урок на правку."""
+        dialog = LessonListDialog(lessons, title, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        lesson = dialog.chosen()
+        if lesson is None:
+            return
+        self.edit_lesson_here(lesson, allow_future=allow_future)
+
     def speak_past_lessons(self) -> None:
         """F7: прошедшие уроки выбранного ученика или абонемента."""
         name, lessons = self.person_lessons()
@@ -3430,8 +3512,9 @@ class MainWindow(QMainWindow):
         if not past:
             announce(self, "Прошедших уроков нет.", assertive=True)
             return
-        announce(self, f"Прошедшие уроки, {self._lesson_days(past)}.",
-                 assertive=True)
+        word = plural(len(past), "урок", "урока", "уроков")
+        self.open_lesson_list(past, f"Прошедшие уроки, {name}, {len(past)} {word}",
+                              allow_future=False)
 
     def speak_planned_lessons(self) -> None:
         """F8: запланированные уроки выбранного ученика или абонемента."""
@@ -3447,8 +3530,10 @@ class MainWindow(QMainWindow):
             else:
                 announce(self, "Запланированных уроков нет.", assertive=True)
             return
-        announce(self, f"Запланированные уроки, "
-                       f"{self._lesson_days(planned)}.", assertive=True)
+        word = plural(len(planned), "урок", "урока", "уроков")
+        self.open_lesson_list(
+            planned, f"Запланированные уроки, {name}, {len(planned)} {word}",
+            allow_future=True)
 
     def select_subscription(self, sub: data.Subscription) -> None:
         """Поставить выбор на запись в том списке, где она лежит."""

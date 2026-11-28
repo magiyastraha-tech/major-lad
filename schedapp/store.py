@@ -799,6 +799,13 @@ class Store:
         return sorted((l for l in self.lessons if l.subscription == sub.uid),
                       key=lambda l: l.stamp)
 
+    def _has_lessons(self, sub: Subscription) -> bool:
+        """Есть ли в абонементе хотя бы один урок — проведённый или
+        запланированный. Пустой абонемент в действующие не выходит."""
+        return any(l.subscription == sub.uid
+                   and l.status in (LESSON_DONE, LESSON_WAIT)
+                   for l in self.lessons)
+
     def export_subscription(self, sub: Subscription,
                             path: Path | None = None) -> Path:
         """Один абонемент текстом: покупка, начало и все уроки по датам.
@@ -1076,11 +1083,25 @@ class Store:
                 if s.student == student and s.future and not s.finished]
         return sorted(mine, key=lambda s: (s.begins, s.bought, s.uid))
 
+    def target_subscription(self, student: str) -> Subscription | None:
+        """Куда писать новый урок: в действующий, а если его нет — в
+        первый будущий. Совсем без абонемента — None."""
+        current = self.current_subscription(student)
+        if current is not None:
+            return current
+        waiting = self.future_subscriptions(student)
+        return waiting[0] if waiting else None
+
     def finished_subscriptions(self, student: str) -> list[Subscription]:
         """Законченные абонементы ученика, новые сверху."""
         mine = [s for s in self.subscriptions
                 if s.student == student and s.finished]
         return sorted(mine, key=lambda s: (s.begins, s.uid), reverse=True)
+
+    def promote_waiting(self, student: str) -> bool:
+        """Запустить будущий абонемент, если действующего нет, а в нём
+        уже есть хотя бы один урок."""
+        return self._promote_future(student)
 
     def _promote_future(self, student: str, save: bool = True) -> bool:
         """Разбудить ближайший будущий абонемент, если действующего нет.
@@ -1088,6 +1109,9 @@ class Store:
         Действующий кончился и ушёл в историю — следующий по очереди
         (самый ранний по началу) становится действующим. Будущих
         абонементов у ученика может быть несколько: они ждут по порядку.
+        В действующие попадает только тот, где уже стоит хотя бы один
+        урок: пустой абонемент остаётся в «Будущих», пока в нём не
+        появится расписание.
         """
         active = [s for s in self.subscriptions
                   if s.student == student and not s.finished
@@ -1098,7 +1122,13 @@ class Store:
                    if s.student == student and s.future and not s.finished]
         if not waiting:
             return False
-        winner = min(waiting, key=lambda s: (s.begins, s.bought, s.uid))
+        # Старые уроки могли остаться без абонемента — сначала привяжем
+        # их по датам, и только потом решаем, в каком абонементе есть урок.
+        self._link_lessons()
+        ready = [s for s in waiting if self._has_lessons(s)]
+        if not ready:
+            return False
+        winner = min(ready, key=lambda s: (s.begins, s.bought, s.uid))
         winner.future = False
         if save:
             self.save_subscriptions()
@@ -1130,19 +1160,21 @@ class Store:
         return changed
 
     def _link_lessons(self) -> bool:
-        """Привязать старые проведённые уроки к их абонементу по дате.
+        """Привязать уроки без абонемента к их абонементу по дате.
 
         Уроки, внесённые до появления этой связи, лежали без абонемента.
         Берём тот, что действовал в день урока (последний начавшийся не
         позже этого дня); если урок раньше всех — самый ранний абонемент
-        ученика. Так счётчик видит все его уроки, а не только новые.
+        ученика. Привязываются и предстоящие уроки: иначе абонемент не
+        видит своего расписания, а будущий абонемент выглядит пустым.
         """
         by_student: dict[str, list[Subscription]] = {}
         for sub in self.subscriptions:
             by_student.setdefault(sub.student, []).append(sub)
         changed = False
         for lesson in self.lessons:
-            if lesson.subscription or lesson.status != LESSON_DONE:
+            if lesson.subscription or lesson.status not in (
+                    LESSON_DONE, LESSON_WAIT):
                 continue
             subs = by_student.get(lesson.student)
             if not subs:
@@ -1376,11 +1408,14 @@ class Store:
         self.save_lessons()
 
     def delete_future_waiting_lessons(self, student_name: str,
-                                      today: date | None = None) -> int:
+                                      today: date | None = None,
+                                      subscription: int = 0) -> int:
         """Убрать будущие непроведённые уроки ученика перед перестройкой.
 
         Прошедшие и проведённые уроки остаются как есть: расписание меняется
-        вперёд, история назад не переписывается.
+        вперёд, история назад не переписывается. Если указан абонемент,
+        трогаем только его уроки и уроки без абонемента: расписание
+        будущего абонемента при правке действующего не пропадает.
         """
         edge = today or date.today()
         keep: list[Lesson] = []
@@ -1388,7 +1423,9 @@ class Store:
         for lesson in self.lessons:
             if (lesson.student == student_name
                     and lesson.status == LESSON_WAIT
-                    and lesson.day > edge):
+                    and lesson.day > edge
+                    and (not subscription
+                         or lesson.subscription in (0, subscription))):
                 removed += 1
                 continue
             keep.append(lesson)
