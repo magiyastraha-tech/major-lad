@@ -139,6 +139,7 @@
             android:textSize="15sp" />
 
         <TextView
+            android:id="@+id/videoTitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="18dp"
@@ -158,10 +159,11 @@
             android:textSize="17sp" />
 
         <TextView
+            android:id="@+id/videoNote"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="У ученика видео выключено по умолчанию: занятие идёт со звуком, а картинку показывает преподаватель."
+            android:text="Ваше видео передаётся ученику. У ученика камеры нет: видео от него не идёт."
             android:textColor="#8f8f9c"
             android:textSize="15sp" />
 
